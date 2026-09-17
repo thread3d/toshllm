@@ -215,13 +215,15 @@ enum GGUFMetadataCache {
             guard let key = cursor.readString(maxLength: 1 << 20),
                   let valueType = cursor.readUInt32() else { return nil }
 
-            // llama.cpp converters commonly place general.file_type after the
-            // tokenizer. Read that scalar directly without walking every token.
+            // A tokenizer key does not close the block: newer converters emit
+            // tokenizer.chat_template right after general.architecture, and every
+            // architecture key that follows it (expert_count, head dimensions,
+            // general.name) is still needed. The value is skipped, not decoded,
+            // so the giant token and merge arrays cost no allocation. A header
+            // probe that ends inside one keeps what it read instead of falling back.
             if key.hasPrefix("tokenizer.") {
-                if let fileType = cursor.findUInt32MetadataValue(for: "general.file_type") {
-                    integerValues["general.file_type"] = UInt64(fileType)
-                }
-                return GGUFMetadata(strings: strings, integerValues: integerValues)
+                guard cursor.skipValue(type: valueType) else { break }
+                continue
             }
 
             switch valueType {
@@ -460,30 +462,6 @@ private struct GGUFDataCursor {
         guard let rawLength = readUInt64(), rawLength <= UInt64(maxLength),
               let length = Int(exactly: rawLength) else { return false }
         return skip(count: length)
-    }
-
-    func findUInt32MetadataValue(for key: String) -> UInt32? {
-        let needle = Data(key.utf8)
-        var start = offset
-        while start <= data.count - needle.count,
-              let match = data.range(of: needle, in: start..<data.count) {
-            defer { start = match.upperBound }
-            guard match.lowerBound >= 8, match.upperBound + 8 <= data.count else { continue }
-            let keyLength = data.withUnsafeBytes { raw in
-                UInt64(littleEndian: raw.loadUnaligned(
-                    fromByteOffset: match.lowerBound - 8, as: UInt64.self))
-            }
-            let type = data.withUnsafeBytes { raw in
-                UInt32(littleEndian: raw.loadUnaligned(
-                    fromByteOffset: match.upperBound, as: UInt32.self))
-            }
-            guard keyLength == UInt64(needle.count), type == 4 else { continue }
-            return data.withUnsafeBytes { raw in
-                UInt32(littleEndian: raw.loadUnaligned(
-                    fromByteOffset: match.upperBound + 4, as: UInt32.self))
-            }
-        }
-        return nil
     }
 
     mutating func skip(count: Int) -> Bool {

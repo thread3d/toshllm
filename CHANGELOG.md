@@ -3,6 +3,12 @@
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- **LLMs: a GGUF whose header puts a tokenizer key before the architecture block loads with its real geometry again.** Newer converters emit `tokenizer.chat_template` right after `general.architecture`, so the reader stopped there and lost the expert count, the head dimensions, the KV lengths, `general.name` and the file type of every key that followed. Such a model was left without TurboQuant KV, without an MoE plan and with an unknown KV size, and a server that had a TurboQuant KV type selected refused to start. The reader now skips the tokenizer values and keeps reading; a truncated remote header probe keeps what it read before the token list instead of falling back.
+
 ## [0.87.5] - 2026-09-16
 
 ### Improved

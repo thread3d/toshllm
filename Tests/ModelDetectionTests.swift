@@ -352,6 +352,128 @@ final class ModelDetectionTests: XCTestCase {
 
         let metadata = try XCTUnwrap(GGUFMetadataCache.parse(from: data))
         XCTAssertEqual(metadata.fileTypeLabel, "IQ4_NL")
+        XCTAssertEqual(metadata.uint32(forSuffix: "context_length"), 32_768,
+                       "A tokenizer key does not close the metadata block")
+    }
+
+    /// Vision-Exp style headers put `tokenizer.chat_template` right after
+    /// `general.architecture`, before every architecture key. Stopping at the
+    /// tokenizer dropped the expert count, the head dimensions and `general.name`,
+    /// so the model was configured as if its header were empty: no TurboQuant KV,
+    /// no MoE plan and no KV geometry.
+    func testTokenizerChatTemplateBeforeArchitectureKeysDoesNotHideThem() throws {
+        var data = Data("GGUF".utf8)
+        func appendUInt32(_ value: UInt32) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        func appendUInt64(_ value: UInt64) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        func appendString(_ value: String) {
+            appendUInt64(UInt64(value.utf8.count))
+            data.append(contentsOf: value.utf8)
+        }
+
+        appendUInt32(3)
+        appendUInt64(0)
+        appendUInt64(11)
+        appendString("general.architecture")
+        appendUInt32(8)
+        appendString("deepseek4")
+        appendString("tokenizer.chat_template")
+        appendUInt32(8)
+        appendString("{{ bos_token }}")
+        appendString("deepseek4.block_count")
+        appendUInt32(4)
+        appendUInt32(43)
+        appendString("deepseek4.expert_count")
+        appendUInt32(4)
+        appendUInt32(256)
+        appendString("deepseek4.expert_used_count")
+        appendUInt32(4)
+        appendUInt32(6)
+        appendString("deepseek4.attention.head_count_kv")
+        appendUInt32(4)
+        appendUInt32(1)
+        appendString("deepseek4.attention.key_length")
+        appendUInt32(4)
+        appendUInt32(512)
+        appendString("deepseek4.attention.value_length")
+        appendUInt32(4)
+        appendUInt32(512)
+        appendString("general.name")
+        appendUInt32(8)
+        appendString("Huihui DeepSeek V4 Flash Vision Exp")
+        appendString("general.file_type")
+        appendUInt32(4)
+        appendUInt32(38)
+        appendString("tokenizer.ggml.tokens")
+        appendUInt32(9)
+        appendUInt32(8)
+        appendUInt64(2)
+        appendString("one")
+        appendString("two")
+
+        let metadata = try XCTUnwrap(GGUFMetadataCache.parse(from: data))
+        XCTAssertEqual(metadata.uint32(forSuffix: "block_count"), 43)
+        XCTAssertEqual(metadata.uint32(forSuffix: "expert_count"), 256)
+        XCTAssertEqual(metadata.uint32(forSuffix: "expert_used_count"), 6)
+        XCTAssertEqual(metadata.uint32(forSuffix: "attention.key_length"), 512)
+        XCTAssertEqual(metadata.uint32(forSuffix: "attention.value_length"), 512)
+        XCTAssertEqual(metadata.string(for: "general.name"), "Huihui DeepSeek V4 Flash Vision Exp")
+        XCTAssertEqual(metadata.fileTypeLabel, "MXFP4")
+        XCTAssertTrue(metadata.isMoE, "expert_count follows the chat template")
+
+        // The same header on disk is what the app reads when it plans TurboQuant
+        // KV and the KV geometry of the launch.
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("Huihui-DeepSeek-V4-Flash-Vision-Exp-abliterated-bf16.gguf")
+        try data.write(to: url)
+        XCTAssertTrue(ServerSettings.modelSupportsTurboKV(at: url.path))
+        XCTAssertTrue(ServerSettings.modelIsMoE(at: url.path))
+        XCTAssertEqual(ModelSpec.kvBytesPerToken(atPath: url.path), 43 * 1 * (512 + 512) * 2)
+    }
+
+    /// A range probe only covers the first 64 KB. It can end inside the token
+    /// array, and what was read before it (the architecture, the expert count)
+    /// is the answer, not a fallback.
+    func testHeaderProbeTruncatedInsideTokenizerKeepsWhatItRead() throws {
+        var data = Data("GGUF".utf8)
+        func appendUInt32(_ value: UInt32) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        func appendUInt64(_ value: UInt64) {
+            withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) }
+        }
+        func appendString(_ value: String) {
+            appendUInt64(UInt64(value.utf8.count))
+            data.append(contentsOf: value.utf8)
+        }
+
+        appendUInt32(3)
+        appendUInt64(0)
+        appendUInt64(3)
+        appendString("general.architecture")
+        appendUInt32(8)
+        appendString("gemma4")
+        appendString("gemma4.expert_count")
+        appendUInt32(4)
+        appendUInt32(128)
+        appendString("tokenizer.ggml.tokens")
+        appendUInt32(9)
+        appendUInt32(8)
+        appendUInt64(2)
+        appendString("one")
+        appendString("two")
+        // ends mid-array: the second string never arrives
+        let truncated = data.prefix(data.count - 6)
+
+        let metadata = try XCTUnwrap(GGUFMetadataCache.parse(from: Data(truncated)),
+                                     "a probe that ends inside the tokens keeps the header read so far")
+        XCTAssertEqual(metadata.string(for: "general.architecture"), "gemma4")
+        XCTAssertEqual(metadata.uint32(forSuffix: "expert_count"), 128)
+        XCTAssertTrue(metadata.isMoE)
     }
 
     func testIQ4NLFilenameFallbackKeepsFullQuantizationName() {
