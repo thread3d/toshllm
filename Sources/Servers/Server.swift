@@ -305,13 +305,79 @@ struct ServerSettings {
         cacheTypeK.hasPrefix("turbo") || cacheTypeV.hasPrefix("turbo")
     }
 
-    var usesTurboValuesWithoutKeys: Bool {
-        cacheTypeV.hasPrefix("turbo") && !cacheTypeK.hasPrefix("turbo")
+    /// q4_0 and a TurboQuant type cannot share a cache: the dequantize path only
+    /// implements matching sub-byte pairs.
+    nonisolated static func isUnsupportedTurboQ4Mix(keyType: String, valueType: String) -> Bool {
+        (keyType.hasPrefix("turbo") && valueType == "q4_0") ||
+        (valueType.hasPrefix("turbo") && keyType == "q4_0")
     }
 
     var usesUnsupportedTurboQ4Mix: Bool {
-        (cacheTypeK.hasPrefix("turbo") && cacheTypeV == "q4_0") ||
-        (cacheTypeV.hasPrefix("turbo") && cacheTypeK == "q4_0")
+        Self.isUnsupportedTurboQ4Mix(keyType: cacheTypeK, valueType: cacheTypeV)
+    }
+
+    /// Why llama.cpp refuses the selected KV cache types, or nil when they are
+    /// accepted. Mirrors `llama_init_from_model`, which rejects a context with
+    /// `(hparams.is_mla() || arch == LLM_ARCH_DEEPSEEK4) && type_k != type_v`,
+    /// and the TurboQuant head-size and platform limits.
+    enum KVCacheConflict: Equatable {
+        case singleCacheNeedsMatchingTypes
+        case turboNeedsPaddedHeads
+        case turboNeedsDiscreteMemory
+        case turboQ4Mix
+    }
+
+    /// Shared by the fixed-model server, every model the router loads, the
+    /// benchmark runner and the Settings warning, so all four agree with the
+    /// engine instead of each guessing.
+    nonisolated static func kvCacheConflict(keyType: String, valueType: String, modelPath: String,
+                                            appleSilicon: Bool = ServerSettings.isAppleSilicon)
+        -> KVCacheConflict? {
+        // A model whose keys and values share one compressed cache (MLA, and
+        // DeepSeek-V4, whose converter emits plain key_length/value_length) takes
+        // a single type for both; the engine refuses the context otherwise.
+        if modelUsesMLA(at: modelPath), keyType != valueType { return .singleCacheNeedsMatchingTypes }
+        let turbo = keyType.hasPrefix("turbo") || valueType.hasPrefix("turbo")
+        guard turbo else { return nil }
+        if appleSilicon { return .turboNeedsDiscreteMemory }
+        if !modelSupportsTurboKV(at: modelPath) { return .turboNeedsPaddedHeads }
+        if isUnsupportedTurboQ4Mix(keyType: keyType, valueType: valueType) { return .turboQ4Mix }
+        return nil
+    }
+
+    func kvCacheConflict(forModel path: String) -> KVCacheConflict? {
+        Self.kvCacheConflict(keyType: cacheTypeK, valueType: cacheTypeV, modelPath: path)
+    }
+
+    var kvCacheConflict: KVCacheConflict? { kvCacheConflict(forModel: modelPath) }
+
+    /// Bilingual explanation of a conflict, shared by the server, the benchmark
+    /// runner and the Settings warning.
+    nonisolated static func kvCacheConflictMessage(_ conflict: KVCacheConflict, model: String,
+                                                   spanish: Bool) -> String {
+        switch conflict {
+        case .singleCacheNeedsMatchingTypes:
+            return spanish
+                ? "\(model) guarda claves y valores en una sola caché comprimida, y el motor exige el mismo tipo en ambos. Pon claves y valores iguales (por ejemplo q8_0/q8_0 o turbo4/turbo4) y vuelve a intentarlo."
+                : "\(model) keeps keys and values in one compressed cache and the engine requires the same type for both. Set keys and values to the same type (for example q8_0/q8_0 or turbo4/turbo4) and try again."
+        case .turboNeedsPaddedHeads:
+            return spanish
+                ? "TurboQuant KV no es compatible con \(model): requiere cabezas con padding 128, 256, 384, 512 o 640."
+                : "TurboQuant KV is not compatible with \(model): it requires attention heads padded to 128, 256, 384, 512 or 640."
+        case .turboNeedsDiscreteMemory:
+            return spanish
+                ? "TurboQuant KV solo está disponible en tarjetas sin memoria unificada."
+                : "TurboQuant KV is only available on cards without unified memory."
+        case .turboQ4Mix:
+            return spanish
+                ? "q4_0 no se puede mezclar con TurboQuant KV en \(model): usa el mismo tipo en claves y valores."
+                : "q4_0 cannot be mixed with TurboQuant KV on \(model): use the same type for keys and values."
+        }
+    }
+
+    nonisolated static func kvCacheConflictMessage(_ conflict: KVCacheConflict, model: String) -> String {
+        let spanish = (UserDefaults.standard.string(forKey: SettingsKeys.language) ?? "en") == "es"
+        return kvCacheConflictMessage(conflict, model: model, spanish: spanish)
     }
 
     var arguments: [String] {
@@ -849,10 +915,17 @@ struct ServerSettings {
         return [128, 256, 384, 512, 640].contains(sharedPadded)
     }
 
+    /// True when the model keeps keys and values in one compressed cache, so both
+    /// must use the same type. Mirrors llama.cpp's
+    /// `hparams.is_mla() || arch == LLM_ARCH_DEEPSEEK4`: the `*_mla` metadata keys
+    /// mark most of them, but DeepSeek-V4's converter emits plain
+    /// `attention.key_length`/`value_length` and the engine still refuses two
+    /// different cache types for it.
     nonisolated static func modelUsesMLA(at path: String) -> Bool {
         guard let metadata = GGUFMetadataCache.metadata(at: path) else { return false }
-        return metadata.uint32(forSuffix: "attention.key_length_mla") != nil ||
-            metadata.uint32(forSuffix: "attention.value_length_mla") != nil
+        if metadata.uint32(forSuffix: "attention.key_length_mla") != nil ||
+            metadata.uint32(forSuffix: "attention.value_length_mla") != nil { return true }
+        return metadata.string(for: "general.architecture")?.lowercased() == "deepseek4"
     }
 
     var kvNeedsFlashAttention: Bool {
@@ -1827,19 +1900,13 @@ final class ServerController: ObservableObject {
                     : "No models downloaded in the models folder")
                 return
             }
-            if settings.usesTurboKV,
-               let incompatible = models.first(where: { !ServerSettings.modelSupportsTurboKV(at: $0.url.path) }) {
-                failTurboKV(model: incompatible.url.lastPathComponent)
-                return
-            }
-            if settings.usesTurboValuesWithoutKeys,
-               let mla = models.first(where: { ServerSettings.modelUsesMLA(at: $0.url.path) }) {
-                failTurboKV(model: mla.url.lastPathComponent)
-                return
-            }
-            if settings.usesUnsupportedTurboQ4Mix {
-                failTurboKV(model: "router")
-                return
+            // One KV setting serves every preset model, so the first model that
+            // rejects it blocks the whole router.
+            for model in models {
+                if let conflict = settings.kvCacheConflict(forModel: model.url.path) {
+                    failKVCache(conflict, model: model.url.lastPathComponent)
+                    return
+                }
             }
         } else {
             guard FileManager.default.fileExists(atPath: settings.modelPath) else {
@@ -1855,17 +1922,8 @@ final class ServerController: ObservableObject {
                     : "TurboQuant model not supported: TurboQuant weight quantization (tq3_1s/tq4_1s) produces incorrect output on this engine, for both dense and MoE models. Use a standard-quant model (Q4_K, Q5_K, Q6_K, Q8_0…).")
                 return
             }
-            if settings.usesTurboKV &&
-               (ServerSettings.isAppleSilicon || !ServerSettings.modelSupportsTurboKV(at: settings.modelPath)) {
-                failTurboKV(model: URL(fileURLWithPath: settings.modelPath).lastPathComponent)
-                return
-            }
-            if settings.usesTurboValuesWithoutKeys && ServerSettings.modelUsesMLA(at: settings.modelPath) {
-                failTurboKV(model: URL(fileURLWithPath: settings.modelPath).lastPathComponent)
-                return
-            }
-            if settings.usesUnsupportedTurboQ4Mix {
-                failTurboKV(model: URL(fileURLWithPath: settings.modelPath).lastPathComponent)
+            if let conflict = settings.kvCacheConflict {
+                failKVCache(conflict, model: URL(fileURLWithPath: settings.modelPath).lastPathComponent)
                 return
             }
         }
@@ -1896,11 +1954,8 @@ final class ServerController: ObservableObject {
         }
     }
 
-    private func failTurboKV(model: String) {
-        let lang = UserDefaults.standard.string(forKey: SettingsKeys.language) ?? "en"
-        state = .failed(lang == "es"
-            ? "TurboQuant KV no es compatible con \(model) o con la combinación elegida: requiere Metal AMD y cabezas con padding 128, 256, 384, 512 o 640; en MLA, Turbo en valores también requiere Turbo en claves; q4_0 no se puede mezclar con Turbo."
-            : "TurboQuant KV is not compatible with \(model) or the selected combination: it requires AMD Metal and heads padded to 128, 256, 384, 512 or 640; on MLA, Turbo values also require Turbo keys; q4_0 cannot be mixed with Turbo.")
+    private func failKVCache(_ conflict: ServerSettings.KVCacheConflict, model: String) {
+        state = .failed(ServerSettings.kvCacheConflictMessage(conflict, model: model))
     }
 
     /// Header at the top of the server log: version, engine, model, GPUs and the

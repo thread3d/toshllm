@@ -173,6 +173,15 @@ final class BenchmarkController: ObservableObject {
         """
     }
 
+    /// The engine refuses the run before it starts, so say why in the log instead
+    /// of letting llama-bench exit with an empty result.
+    private func kvConflictNote(_ conflict: ServerSettings.KVCacheConflict, model path: String) -> String {
+        let note = "→ " + ServerSettings.kvCacheConflictMessage(
+            conflict, model: URL(fileURLWithPath: path).lastPathComponent) + "\n\n"
+        fileLog.append(note)
+        return note
+    }
+
     func run(settings: ServerSettings) {
         guard !running else { return }
         let benchPath = URL(fileURLWithPath: settings.serverBinary)
@@ -191,6 +200,10 @@ final class BenchmarkController: ObservableObject {
         let head = header(for: settings)
         replaceOutput(head)
         fileLog.append(head)
+        if let conflict = settings.kvCacheConflict {
+            appendOutput(kvConflictNote(conflict, model: settings.modelPath))
+            return
+        }
         running = true
 
         let p = Process()
@@ -257,6 +270,10 @@ final class BenchmarkController: ObservableObject {
         let head = header(for: s).replacingOccurrences(of: "args:", with: "mode:   real generation (llama-server)\nargs:")
         replaceOutput(head)
         fileLog.append(head)
+        if let conflict = s.kvCacheConflict {
+            appendOutput(kvConflictNote(conflict, model: s.modelPath))
+            return
+        }
         running = true
 
         Task {

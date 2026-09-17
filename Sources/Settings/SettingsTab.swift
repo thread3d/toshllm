@@ -82,35 +82,31 @@ struct SettingsView: View {
         for t in [cacheTypeK, cacheTypeV] where !types.contains(t) { types.append(t) }
         return types
     }
-    /// Why the chosen Turbo combination cannot run, so the warning names the actual cause
-    /// instead of listing every reason Turbo might be unavailable.
-    private var turboKVIncompatibleReason: (es: String, en: String)? {
-        guard turboKVSelected else { return nil }
-        if ServerSettings.isAppleSilicon {
-            return ("TurboQuant KV solo está disponible en tarjetas sin memoria unificada.",
-                    "TurboQuant KV is only available on cards without unified memory.")
-        }
-        if !ServerSettings.modelSupportsTurboKV(at: modelPath) {
-            return ("Este modelo no admite TurboQuant KV: sus cabezas de atención no llegan a un múltiplo de 128.",
-                    "This model does not support TurboQuant KV: its attention heads do not pad to a multiple of 128.")
-        }
-        if cacheTypeV.hasPrefix("turbo") && !cacheTypeK.hasPrefix("turbo") &&
-            ServerSettings.modelUsesMLA(at: modelPath) {
-            return ("Este modelo guarda claves y valores en una sola caché, así que ambos deben llevar el mismo tipo.",
-                    "This model keeps keys and values in a single cache, so both must use the same type.")
-        }
-        return nil
+    /// Why the chosen KV combination cannot run, so the warning names the actual
+    /// cause instead of listing every reason a type might be unavailable. Uses the
+    /// same rule as the server and the benchmarks, so the UI never lets through a
+    /// pair the engine will refuse.
+    private var kvIncompatibleReason: (es: String, en: String)? {
+        guard let conflict = ServerSettings.kvCacheConflict(
+            keyType: cacheTypeK, valueType: cacheTypeV, modelPath: modelPath) else { return nil }
+        let model = modelPath.isEmpty ? "" : URL(fileURLWithPath: modelPath).lastPathComponent
+        return (ServerSettings.kvCacheConflictMessage(conflict, model: model, spanish: true),
+                ServerSettings.kvCacheConflictMessage(conflict, model: model, spanish: false))
     }
-    private var turboKVIncompatible: Bool { turboKVIncompatibleReason != nil }
+    private var kvIncompatible: Bool { kvIncompatibleReason != nil }
     private var turboKVSelected: Bool {
         cacheTypeK.hasPrefix("turbo") || cacheTypeV.hasPrefix("turbo")
     }
     /// Quantizing the keys is what costs quality; values tolerate 4 bits. Measured
     /// within 0.5% of f16 on 4B, 8B and 35B, at 25% less cache than q8_0/q8_0.
     private var kvSuggestion: (k: String, v: String)? {
-        guard !ServerSettings.isAppleSilicon, !modelPath.isEmpty,
-              ServerSettings.modelSupportsTurboKV(at: modelPath),
-              !ServerSettings.modelUsesMLA(at: modelPath) else { return nil }
+        guard !ServerSettings.isAppleSilicon, !modelPath.isEmpty else { return nil }
+        // One compressed cache for keys and values: only a matched pair runs, so a
+        // mismatch recovers with the pair that halves both.
+        if ServerSettings.modelUsesMLA(at: modelPath) {
+            return cacheTypeK == cacheTypeV ? nil : ("q8_0", "q8_0")
+        }
+        guard ServerSettings.modelSupportsTurboKV(at: modelPath) else { return nil }
         return ("q8_0", "turbo4")
     }
     private var serverIsStopped: Bool {
@@ -969,7 +965,7 @@ struct SettingsView: View {
                             "Quantization for KV cache values. With the AMD Flash Attention kernel any standard value type (f16/q8_0/q4_0) runs on the GPU at full speed, including the fast long-prompt route. Quantizing values saves more memory; keeping them at f16 (with quantized keys) preserves more quality... both run equally fast.")
                     : loc.t("Cuantización de los valores del KV cache. ⚠️ En GPU AMD (sin el kernel Flash Attention AMD) esto fuerza Flash Attention en CPU: la generación baja ~3× (de ~50 a ~15-19 t/s en un 8B). Úsalo solo cuando necesites contexto enorme; si no, déjalo en f16 y cuantiza solo las claves.",
                             "Quantization for KV cache values. ⚠️ On AMD GPUs (without the AMD Flash Attention kernel) this forces Flash Attention onto the CPU: generation drops ~3× (from ~50 to ~15-19 t/s on an 8B). Use only when you need huge context; otherwise keep f16 and quantize keys only."))
-                if !turboKVIncompatible, let s = kvSuggestion, cacheTypeK != s.k || cacheTypeV != s.v {
+                if !kvIncompatible, let s = kvSuggestion, cacheTypeK != s.k || cacheTypeV != s.v {
                     HStack(alignment: .center, spacing: 12) {
                         Image(systemName: "sparkles")
                             .font(.body)
@@ -994,7 +990,7 @@ struct SettingsView: View {
                     .padding(.vertical, 8)
                     .glassSurface(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
-                if let reason = turboKVIncompatibleReason {
+                if let reason = kvIncompatibleReason {
                     HStack(alignment: .center, spacing: 12) {
                         Label(loc.t(reason.es, reason.en),
                               systemImage: "exclamationmark.triangle.fill")

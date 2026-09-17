@@ -672,6 +672,82 @@ final class ModelDetectionTests: XCTestCase {
         try data.write(to: url)
     }
 
+    /// DeepSeek-V4's converter writes plain `attention.key_length`/`value_length`
+    /// instead of the `*_mla` keys, but llama.cpp still refuses two different K
+    /// and V cache types for it (`hparams.is_mla() || arch == LLM_ARCH_DEEPSEEK4`).
+    /// The app has to refuse them too, before the engine exits with
+    /// "model does not support different K (...) and V (...) cache types".
+    func testDeepSeek4RequiresMatchingKVCacheTypes() throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("Huihui-DeepSeek-V4-Flash-Vision-Exp-abliterated-bf16.gguf")
+        try writeGGUF(to: url, strings: ["general.architecture": "deepseek4"], uint32: [
+            "deepseek4.block_count": 43,
+            "deepseek4.expert_count": 256,
+            "deepseek4.expert_used_count": 6,
+            "deepseek4.attention.head_count_kv": 1,
+            "deepseek4.attention.key_length": 512,
+            "deepseek4.attention.value_length": 512,
+        ])
+
+        XCTAssertTrue(ServerSettings.modelUsesMLA(at: url.path),
+                      "V4 is MLA even without the *_mla metadata keys")
+        XCTAssertTrue(ServerSettings.modelSupportsTurboKV(at: url.path))
+
+        // The pair the engine rejected, and any other mismatch, is a conflict.
+        XCTAssertEqual(try XCTUnwrap(ServerSettings.kvCacheConflict(
+            keyType: "q8_0", valueType: "turbo4", modelPath: url.path, appleSilicon: false)),
+            .singleCacheNeedsMatchingTypes)
+        XCTAssertEqual(try XCTUnwrap(ServerSettings.kvCacheConflict(
+            keyType: "q8_0", valueType: "q4_0", modelPath: url.path, appleSilicon: false)),
+            .singleCacheNeedsMatchingTypes)
+
+        // Matching pairs run, TurboQuant included.
+        XCTAssertNil(ServerSettings.kvCacheConflict(
+            keyType: "q8_0", valueType: "q8_0", modelPath: url.path, appleSilicon: false))
+        XCTAssertNil(ServerSettings.kvCacheConflict(
+            keyType: "f16", valueType: "f16", modelPath: url.path, appleSilicon: false))
+        XCTAssertNil(ServerSettings.kvCacheConflict(
+            keyType: "turbo4", valueType: "turbo4", modelPath: url.path, appleSilicon: false))
+
+        let settings = ServerSettings(
+            serverBinary: "/usr/bin/true", modelPath: url.path, port: 8080,
+            ngl: 99, ncmoe: 20, ctx: 4_096, threads: 6, flashAttn: "auto",
+            noMmap: true, jinja: true, vramReserveMB: 1_024, gpuIndex: -1,
+            extraArgs: "", cacheTypeK: "q8_0", cacheTypeV: "turbo4", mlock: false)
+        XCTAssertEqual(try XCTUnwrap(settings.kvCacheConflict), .singleCacheNeedsMatchingTypes)
+        XCTAssertFalse(ServerSettings.kvCacheConflictMessage(
+            .singleCacheNeedsMatchingTypes, model: "m").isEmpty)
+    }
+
+    /// The rule is architecture-specific: a dense GQA model still takes the
+    /// asymmetric q8_0 keys / turbo4 values pair the app suggests.
+    func testNonMLAModelAllowsAsymmetricCacheTypes() throws {
+        let dir = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("Qwen3-8B-Q4_K_M.gguf")
+        try writeGGUF(to: url, strings: ["general.architecture": "qwen3"], uint32: [
+            "qwen3.attention.head_count_kv": 8,
+            "qwen3.attention.key_length": 128,
+            "qwen3.attention.value_length": 128,
+        ])
+
+        XCTAssertFalse(ServerSettings.modelUsesMLA(at: url.path))
+        XCTAssertNil(ServerSettings.kvCacheConflict(
+            keyType: "q8_0", valueType: "turbo4", modelPath: url.path, appleSilicon: false))
+        XCTAssertNil(ServerSettings.kvCacheConflict(
+            keyType: "q8_0", valueType: "f16", modelPath: url.path, appleSilicon: false))
+    }
+
+    func testKVConflictMessageNamesTheFix() {
+        let message = ServerSettings.kvCacheConflictMessage(
+            .singleCacheNeedsMatchingTypes, model: "model.gguf", spanish: false)
+        XCTAssertTrue(message.contains("same type"), message)
+        let spanish = ServerSettings.kvCacheConflictMessage(
+            .singleCacheNeedsMatchingTypes, model: "model.gguf", spanish: true)
+        XCTAssertTrue(spanish.contains("mismo tipo"), spanish)
+    }
+
     func testTensorSplitIsRefusedOnlyForExpertsWithASeparateScale() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
