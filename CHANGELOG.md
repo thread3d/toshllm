@@ -10,6 +10,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - **LLMs: a GGUF whose header puts a tokenizer key before the architecture block loads with its real geometry again.** Newer converters emit `tokenizer.chat_template` right after `general.architecture`, so the reader stopped there and lost the expert count, the head dimensions, the KV lengths, `general.name` and the file type of every key that followed. Such a model was left without TurboQuant KV, without an MoE plan and with an unknown KV size, and a server that had a TurboQuant KV type selected refused to start. The reader now skips the tokenizer values and keeps reading; a truncated remote header probe keeps what it read before the token list instead of falling back.
 
 - **LLMs: a model whose keys and values share one cache no longer starts with a KV pair the engine refuses.** DeepSeek-V4 uses MLA but its converter writes plain `attention.key_length`/`value_length` instead of the `*_mla` keys, so the app did not recognise it and let `-ctk q8_0 -ctv turbo4` through; llama.cpp then exited with "model does not support different K (q8_0) and V (turbo4) cache types". The server, the router, both benchmark buttons and the Settings warning now use the engine's own rule (`hparams.is_mla() || arch == LLM_DeepSeek4`) before launching, and Settings offers the matching pair in one click.
+## [0.87.6] - 2026-09-17
+
+### Improved
+
+- **LLMs: a model split by tensors across the four dies of two Radeon Pro Vega II Duo cards reads prompts faster.** An 8B goes from 845 to 1196 prompt tokens a second and a 27B from 281 to 359, with generation and output unchanged. Thanks to [Chris Hafey](https://github.com/chafey) for the hardware.
+
+### Fixed
+
+- **LLMs: the engine no longer quits on the first request on the FirePro D500 and D700 of a Mac Pro 6,1.** Reading a prompt now falls back to the generic attention kernels when the driver refuses the AMD ones, the way generating already did. Reported in [#12](https://github.com/engeldlgado/toshllm/issues/12).
+
+- **LLMs: a collective on a split model no longer folds in what the previous round left in its buffers.** Generation across the four dies of two Radeon Pro W6800X Duo cards goes from 32.7 to 43.2 tokens a second, and reading a prompt and generation stay where they were on Radeon Pro Vega II Duo. Contributed in [#104](https://github.com/engeldlgado/toshllm/pull/104).
+
+- **Typing into a settings field and leaving for another tab no longer discards what you typed.** The field wrote its value only when it lost focus, and changing tabs takes it away before that happens.
 
 ## [0.87.5] - 2026-09-16
 
