@@ -141,17 +141,18 @@ A 2021 card holds its own: it trails the M3 Max on short prompts, leads it from 
 
 - macOS 14 or later
 - An Intel Mac with an AMD GPU that supports Metal (developed and tuned on an RX 6700 XT 12 GB)
-- 16 GB RAM minimum — 32 GB recommended for 35B-class MoE models
+- 16 GB RAM minimum — 32 GB recommended for 35B-class MoE models; a 145 GB MoE such as DeepSeek-V4 keeps its experts in system memory and needs RAM of a comparable size
 
 > **Hackintosh note:** AMD RDNA 2 dGPUs work great with the [NootRX](https://github.com/ChefKissInc/NootRX) kext providing Metal support. ToshLLM runs on top of any working Metal setup.
 
 ## Good to know
 
-ToshLLM is **beta** and under active development. It's solid for daily use, but you may still hit rough edges — please report anything you find in [Issues](https://github.com/engeldlgado/toshllm/issues) (you can export diagnostics from **Settings → Server log**). Two limitations are worth knowing up front:
+ToshLLM is **beta** and under active development. It's solid for daily use, but you may still hit rough edges — please report anything you find in [Issues](https://github.com/engeldlgado/toshllm/issues) (you can export diagnostics from **Settings → Server log**). A few limitations are worth knowing up front:
 
 - **External clients (VS Code Copilot, Cline, Continue…):** these send a fixed 15–19k-token prompt (system instructions + tool definitions) with *every* request. On GPUs without Metal Flash Attention that means minutes of prompt processing per cold request, which saturates the GPU and can thermally throttle it. Recent versions mitigate this (single slot with resumable prefill, prompt-cache reuse, inline reasoning) and more is on the way. The built-in chat isn't affected — it only sends your conversation.
 - **Vision cache:** `llama.cpp` does not support saving/restoring slots or cache-reuse while an `mmproj` is loaded. ToshLLM disables those features automatically for vision models; normal in-memory prompt caching still works.
 - **Large MoE models on AMD GPUs:** Mixture-of-Experts models that don't fully fit in VRAM (e.g. 26B/35B with `--n-cpu-moe` offload) cross the CPU↔GPU boundary many times per token. This used to slowly starve the AMD driver and stall generation mid-answer, but **0.81.49 fixed it** with a persistent staging buffer (see [Persistent staging](#persistent-staging-flat-sustained-generation) below) — these models now run flat and stable, confirmed on an RX 6700 XT and on a tester's dual-GPU Mac Pro, with no deadlock observed since. A **watchdog** stays in as a safety net, and dense models are still the simplest choice, but large MoE-with-offload is no longer something to avoid.
+- **DeepSeek-V4 (145 GB MoE):** the largest model validated so far, and the one where keeping **every** expert on the CPU is the fast path. Its 145 GB of MXFP4 experts cross PCIe per token, so spreading them into 96 GB of VRAM measures 0.1 t/s against 2.8 t/s — pin `ncmoe` to the layer count (`43`) and prefer one GPU over a split. On AMD Metal its KV cache stays in system memory, because the GPU write into the sliding-window cache wedges the command queue; MLA gives keys and values one shared cache, so the app refuses a mismatched pair before launch.
 - **Vision (image input):** works across the Qwen3-VL family (Qwen3-VL-2B, Qwen3.5-9B, Qwen3.6-14B/35B), Gemma 3 and Gemma 4. Since 0.82.0 the AMD attention kernel covers the vision encoders too (they attend bidirectionally, with no mask, at head dims 64 and 72), so describing an image costs ~250–360 MB of VRAM instead of 3.4–4.7 GB — the fallback path materializes the whole attention matrix. Note that reasoning models (Qwen 3.5/3.6) place the image description in their thinking output, which the in-app chat shows but some external clients may not.
 
 ## Build from source
@@ -469,7 +470,7 @@ ToshLLM te permite ejecutar modelos LLM modernos **completamente en tu propio Ma
 
 Casi todas las herramientas de LLM locales en macOS apuntan a Apple Silicon; los Macs Intel con GPU AMD dedicada (incluidos los Hackintosh) quedan fuera: los motores estándar producen **texto corrupto** en estas GPUs y leen los pesos por PCIe a una fracción de la velocidad posible.
 
-**ToshLLM lo resuelve.** Empaqueta `llama.cpp` con parches específicos para AMD dentro de una app nativa SwiftUI, de modo que una tarjeta como la RX 6700 XT pasa de inservible a realmente rápida (Qwen3-8B: de 0.6–2.6 t/s a ~61 t/s). Al abrirla detecta tu hardware y te recomienda modelos que correrán bien, sin adivinar.
+**ToshLLM lo resuelve.** Empaqueta `llama.cpp` con parches específicos para AMD dentro de una app nativa SwiftUI, de modo que una tarjeta como la RX 6700 XT pasa de inservible a realmente rápida (Qwen3-8B: de 0.6–2.6 t/s a ~61 t/s). También corre **DeepSeek-V4-Flash**, un MoE de 145 GB con los expertos en RAM: ~24 t/s de prompt y ~2.8 t/s de generación, coherente, medido en un Mac Pro 7,1 (Radeon Pro Vega II + dos W6800X Duo); sin el parche de caché KV en CPU del motor integrado, la GPU AMD se cuelga en el primer decode. Al abrirla detecta tu hardware y te recomienda modelos que correrán bien, sin adivinar.
 
 ### Funciones
 
@@ -509,10 +510,11 @@ Descarga el `.dmg` desde [Releases](https://github.com/engeldlgado/toshllm/relea
 
 ### Requisitos y notas
 
-- macOS 14 o posterior · Mac Intel con GPU AMD compatible con Metal · 16 GB de RAM mínimo (32 GB recomendado para MoE de 35B).
+- macOS 14 o posterior · Mac Intel con GPU AMD compatible con Metal · 16 GB de RAM mínimo (32 GB recomendado para MoE de 35B); un MoE de 145 GB como DeepSeek-V4 mantiene sus expertos en memoria del sistema y necesita RAM del orden del modelo.
 - **Hackintosh:** las GPUs AMD RDNA 2 funcionan muy bien con el kext [NootRX](https://github.com/ChefKissInc/NootRX).
 - **Beta:** funciona para uso diario pero pueden aparecer detalles por pulir; reporta lo que encuentres en [Issues](https://github.com/engeldlgado/toshllm/issues) (exporta diagnósticos desde Ajustes → Registro del servidor).
 - **Limitaciones conocidas:** los clientes externos (VS Code, Cline…) envían un prompt fijo de 15-19k tokens en cada petición, lo que en frío satura la GPU varios minutos (el chat integrado no se ve afectado). Los modelos MoE grandes con offload antes ahogaban al driver AMD y se estancaban a mitad de generación; **0.81.49 lo solucionó** con un buffer de staging persistente y ahora corren estables y planos (confirmado en RX 6700 XT y en el Mac Pro de dos GPUs de un tester). Queda un watchdog como red de seguridad.
+- **DeepSeek-V4 (MoE de 145 GB):** el modelo más grande validado hasta ahora, y el único donde mantener **todos** los expertos en CPU es el camino rápido. Sus 145 GB de expertos MXFP4 cruzan PCIe en cada token: repartirlos en 96 GB de VRAM mide 0.1 t/s frente a 2.8 t/s, así que fija `ncmoe` al número de capas (`43`) y prefiere una GPU antes que un reparto. En Metal AMD su caché KV se queda en memoria del sistema, porque la escritura de la GPU en la caché de ventana deslizante bloquea la cola de comandos; MLA comparte una sola caché para claves y valores, y la app rechaza una pareja distinta antes de lanzar.
 - **Caché con visión:** `llama.cpp` no permite guardar/restaurar slots ni usar cache-reuse mientras hay un `mmproj` cargado. ToshLLM desactiva esas funciones automáticamente para modelos de visión; la caché normal en memoria sigue funcionando.
 
 ### Apoya el proyecto
