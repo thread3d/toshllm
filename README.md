@@ -124,6 +124,22 @@ For scale, the same gpt-oss-20B run against the Apple Silicon numbers posted in 
 
 A 2021 card holds its own: it trails the M3 Max on short prompts, leads it from 8k tokens up, and generates at the same rate as an M4 Max. Two things to keep in mind. The M3 Max `tg128` is low because that run was heat throttled, as the maintainer notes in the linked reply, so the M4 Max figure is the one to compare generation against; both it and the run here measured generation on its own, which is what avoids the throttling. And the file is not the same: theirs is the stock MXFP4 build, ours a `Q4_K_M` repack. That matters less than the name suggests, because **87% of our file is still MXFP4** — the 72 expert tensors keep the model's native format, and only the remaining 13% (attention, embeddings, norms) is repacked to Q8_0/Q5_0/Q4_K, which is why it weighs 10.81 GiB against their 11.27.
 
+A bigger machine makes the *arrangement* the deciding factor. Measured on a **Mac Pro 7,1** (28-core Xeon W, 256 GB, Radeon Pro Vega II + 2× Radeon PRO W6800X Duo), bundled engine 0.87.5, KV f16, same `pp512` / `tg128` workload, one process at a time:
+
+| Model | Type | Radeon Pro Vega II | Radeon PRO W6800X Duo | All three |
+|---|---|---:|---:|---:|
+| gemma-4-26B-A4B Q4_K_M | MoE, all experts in VRAM | 648 / 62.9 | 1507 / 74.6 | 1040 / 67.9 |
+| Ornith-1.5-9B BF16 | dense | 362 / 33.7 | 685 / 26.6 | 546 / 27.4 |
+| Ornith-1.5-35B BF16 | MoE, `--n-cpu-moe` 28 on one card, 0 when split | 44.8 / 11.8 | 47.8 / 11.9 | 611 / 44.7 |
+| gpt-oss-120b MXFP4 | MoE, `--n-cpu-moe` 22 on one card, 0 when split | 125 / 17.3 | 160 / 19.4 | 352 / 69.8 |
+| DeepSeek-V4-Flash BF16 | MoE MLA, experts on the CPU, KV in host memory | 35.7 / 2.5 | 38.8 / 3.5 | 35.6 / 2.3 |
+
+Each cell is prompt / generation in tokens a second. The two W6800X Duo cards tracked each other within 3% on prompts and 9% on generation, so one column stands for both.
+
+The pattern is the point. **A model that fits one card is fastest on one card** — gemma-4-26B gives up 31% of its prompt rate when it is spread across all three. **A MoE that has to offload its experts gains enormously from more devices**: Ornith-1.5-35B goes from 47.8 to 611 prompt tokens a second and gpt-oss-120b from 160 to 352, with generation up 3.7× and 3.6×, because experts that used to cross PCIe on every token now sit in VRAM on the extra cards. The Vega II is the wave64 card and splits the difference differently: on the dense 9B it generates faster than either W6800X (33.7 against 26.6) while reading prompts at roughly half the rate.
+
+DeepSeek-V4-Flash is the exception in both directions. Its 145 GB of experts stay in RAM by design, so the split buys nothing at all — 38.8 to 35.6 prompt and 3.5 to 2.3 generation, the lower number being the three-card one — and a single W6800X Duo is its fastest arrangement. That is the same trade-off described under [Good to know](#good-to-know).
+
 ## Install
 
 1. **[Download the latest `.dmg`](https://github.com/engeldlgado/toshllm/releases/latest)**, open it, and drag **ToshLLM** to Applications.
