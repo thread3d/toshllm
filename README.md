@@ -36,6 +36,9 @@ Most local-LLM tools on macOS only target Apple Silicon. Intel Macs with discret
 | Output | corrupted | correct |
 | Qwen3-8B generation | 0.6–2.6 t/s | **~61 t/s** |
 | Qwen3.6-35B (MoE) generation | unusable | **~29 t/s**, flat on long runs |
+| DeepSeek-V4-Flash (145 GB MoE) | hangs on the first decode with the KV cache on the GPU | **~24 t/s prompt, ~2.8 t/s generation**, coherent |
+
+DeepSeek-V4 is in a different weight class: its 145 GB of MXFP4 experts stay in RAM while the dense weights ride one GPU, so it answers at a few tokens a second rather than tens. Measured on a Mac Pro 7,1 (Radeon Pro Vega II + two Radeon PRO W6800X Duo) with the bundled engine's CPU-KV patch — which keeps the first decode from wedging the AMD command queue — and the app's matching-KV-pair rule for MLA models. The prompt figure is `pp256`; the fastest arrangement keeps every expert on the CPU (`-ncmoe 43`) and uses one GPU rather than a split.
 
 It opens, detects your hardware, and recommends models that will actually run well — no guesswork.
 
