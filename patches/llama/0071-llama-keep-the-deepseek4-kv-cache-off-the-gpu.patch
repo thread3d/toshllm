@@ -1,0 +1,16 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -118,6 +118,12 @@
+     cparams.embeddings_nextn        = false;
+     cparams.embeddings_nextn_masked = false;
+     cparams.offload_kqv             = params.offload_kqv;
++    // DeepSeek-V4: the Metal SET_ROWS write into an offloaded sliding-window KV
++    // cache wedges the AMD command queue, so keep this cache in host memory.
++    if (model.arch == LLM_ARCH_DEEPSEEK4 && cparams.offload_kqv) {
++        LLAMA_LOG_WARN("%s: deepseek4: keeping the KV cache on the CPU (GPU cache writes hang AMD Metal)\n", __func__);
++        cparams.offload_kqv = false;
++    }
+     cparams.no_perf                 = params.no_perf;
+     cparams.warmup                  = false;
+ 
