@@ -414,7 +414,8 @@ struct ImageControls: View {
                         gpuIndex: c.gpuIndex,
                         auxGPUIndex: c.auxGPU(gpuCount: hardware.gpus.count) ?? -1,
                         initImagePath: c.initImagePath, maskPath: c.maskPath,
-                        strength: c.strength)
+                        strength: c.strength, referenceImagePaths: c.referenceImagePaths,
+                        fastMode: c.fastModeValue)
                 }
             } label: {
                 Label(loc.t("Generar", "Generate"), systemImage: "sparkles").frame(maxWidth: .infinity)
@@ -881,7 +882,8 @@ struct ImageInstanceForm: View {
     }
     private var baseSizes: [Int] {
         let sizes = ImageGenLimits.baseSizes(vramGB: targetVRAM, residentGB: model.residentGB,
-                                             attnVRAMSq: model.attnVRAMSq, maxLongEdge: model.maxLongEdge,
+                                             attnVRAMSq: model.attnVRAMSq,
+                                             maxLongEdge: model.maxLongEdge(drivesDisplay: ImageGenLimits.drivesDisplay(gpuIndex: cfg.gpuIndex)),
                                              streamedAttention: ImageGenLimits.streamsAttention(gpuIndex: cfg.gpuIndex))
         return sizes.isEmpty ? [512] : sizes
     }
@@ -936,6 +938,7 @@ struct ImageInstanceForm: View {
                 Text(loc.t("Descripción", "Prompt")).font(.headline)
                 promptEditor
                 negativePromptSection
+                if model.maxReferenceImages > 0 { referenceImagesSection }
                 img2imgSection
                 settingsGrid
                 if !fitsVRAM { vramWarning }
@@ -1131,6 +1134,42 @@ struct ImageInstanceForm: View {
         }
     }
 
+    /// Reference images (edit mode): the model reads them and keeps what they show,
+    /// which is a different thing from img2img seeding the noise with one.
+    private var referenceImagesSection: some View {
+        let tip = loc.t("Imágenes que el modelo mira para editar: describe el cambio en la descripción y menciona cada una como <image1>, <image2>… El motor las escala a \(model.referenceResolution) px de lado.",
+                        "Images the model looks at to edit: describe the change in the prompt and refer to each one as <image1>, <image2>… The engine scales them to \(model.referenceResolution) px a side.")
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(loc.t("Imágenes de referencia", "Reference images")).font(.subheadline).help(tip)
+                Spacer(minLength: 6)
+                Text("\(cfg.referenceImagePaths.count)/\(model.maxReferenceImages)")
+                    .font(.caption).foregroundStyle(.secondary).help(tip)
+            }
+            ForEach(Array(cfg.referenceImagePaths.enumerated()), id: \.offset) { index, path in
+                HStack(spacing: 6) {
+                    Text("<image\(index + 1)>")
+                        .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                    Text((path as NSString).lastPathComponent)
+                        .font(.caption).lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 6)
+                    Button {
+                        cfg.referenceImagePaths.remove(at: index)
+                    } label: { Label(loc.t("Quitar", "Remove"), systemImage: "xmark.circle") }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(GlassIconButtonStyle())
+                        .iconHelp(loc.t("Quitar esta referencia", "Remove this reference"))
+                }
+            }
+            if cfg.referenceImagePaths.count < model.maxReferenceImages {
+                Button {
+                    pickFile(types: ["png", "jpg", "jpeg", "webp"]) { cfg.referenceImagePaths.append($0) }
+                } label: { Label(loc.t("Añadir referencia…", "Add reference…"), systemImage: "photo.badge.plus") }
+                    .font(.caption).help(tip)
+            }
+        }
+    }
+
     private var img2imgSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             filePickRow(loc.t("Imagen inicial (img2img)", "Init image (img2img)"),
@@ -1302,6 +1341,16 @@ struct ImageInstanceForm: View {
                     ForEach(ImageFormat.allCases) { Text($0.rawValue.uppercased()).tag($0.rawValue) }
                 }.labelsHidden().frame(width: 96)
             }
+            row(loc.t("Modo rápido", "Fast mode"),
+                loc.t("Reutiliza pasos del muestreo en vez de recalcularlos. Más rápido, pero cambia el detalle de la imagen. En Qwen-Image 2.1 a 25 pasos, aproximadamente: cache-dit 1.46x, spectrum 1.91x, easycache 2.06x.",
+                      "Reuses sampling steps instead of computing them again. Faster, but it changes the image's detail. On Qwen-Image 2.1 at 25 steps, roughly: cache-dit 1.46x, spectrum 1.91x, easycache 2.06x.")) {
+                Picker("", selection: $cfg.fastMode) {
+                    ForEach(ImageFastMode.allCases.filter { $0.supports(model) }) { mode in
+                        Text(fastModeLabel(mode)).tag(mode.rawValue)
+                            .help(fastModeHelp(mode))
+                    }
+                }.labelsHidden().frame(width: 150)
+            }
             row(loc.t("Descargar a CPU", "Offload to CPU"),
                 loc.t("Mantiene los pesos en RAM y los sube a VRAM por etapas. Más lento; solo si falta VRAM.",
                       "Keeps weights in RAM and streams them to VRAM per stage. Slower; only if VRAM is tight.")) {
@@ -1344,6 +1393,32 @@ struct ImageInstanceForm: View {
             Text(title).font(.callout)
             Spacer(minLength: 8)
             content().help(help)
+        }
+    }
+
+    private func fastModeLabel(_ mode: ImageFastMode) -> String {
+        switch mode {
+        case .off:       return loc.t("Apagado", "Off")
+        case .cacheDit:  return "cache-dit"
+        case .spectrum:  return "spectrum"
+        case .easycache: return "easycache"
+        }
+    }
+
+    private func fastModeHelp(_ mode: ImageFastMode) -> String {
+        switch mode {
+        case .off:
+            return loc.t("Calcula todos los pasos: la imagen de referencia.",
+                         "Computes every step: the reference image.")
+        case .cacheDit:
+            return loc.t("El que menos acelera (alrededor de 1.46x en Qwen-Image 2.1).",
+                         "The smallest speedup (about 1.46x on Qwen-Image 2.1).")
+        case .spectrum:
+            return loc.t("Equilibrio: alrededor de 1.91x en Qwen-Image 2.1, misma composición con cambios de detalle.",
+                         "Balanced: about 1.91x on Qwen-Image 2.1, same composition with changes in detail.")
+        case .easycache:
+            return loc.t("El más rápido (alrededor de 2.06x en Qwen-Image 2.1), con la imagen algo más suave.",
+                         "The fastest (about 2.06x on Qwen-Image 2.1), with a slightly softer image.")
         }
     }
 
@@ -1397,6 +1472,9 @@ private func imageFailureText(_ raw: String, _ loc: Localizer) -> String {
     case "TIMEOUT":
         return loc.t("La GPU agotó el tiempo: la imagen es muy grande. Reduce el tamaño base.",
                      "The GPU timed out: the image is too large. Lower the base size.")
+    case "MISSING_REF":
+        return loc.t("Falta una imagen de referencia (se movió o se borró). Quítala o vuelve a elegirla.",
+                     "A reference image is missing (moved or deleted). Remove it or pick it again.")
     default:
         return loc.t("La generación falló (%@).", "Generation failed (%@).", "\(raw)")
     }

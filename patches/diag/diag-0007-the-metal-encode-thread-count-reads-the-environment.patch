@@ -1,0 +1,40 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index fe7f401c4..a2ac49127 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -688,11 +688,16 @@ ggml_backend_t ggml_backend_metal_init(void) {
+         /* .interface = */ ggml_backend_metal_i,
+         /* .device    = */ dev,
+         /* .context   = */ ctx,
+     };
+ 
+-    ggml_backend_metal_set_n_cb(backend, 1);
++    // diagnostic: how many threads encode the graph beside the main one
++    static const int n_cb_env = []() {
++        const char * e = getenv("TOSH_METAL_N_CB");
++        return e ? atoi(e) : 1;
++    }();
++    ggml_backend_metal_set_n_cb(backend, n_cb_env > 0 ? n_cb_env : 1);
+ 
+     return backend;
+ }
+ 
+ bool ggml_backend_is_metal(ggml_backend_t backend) {
+@@ -787,11 +792,16 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t
+         /* .interface = */ ggml_backend_metal_i,
+         /* .device    = */ dev,
+         /* .context   = */ ctx,
+     };
+ 
+-    ggml_backend_metal_set_n_cb(backend, 1);
++    // diagnostic: how many threads encode the graph beside the main one
++    static const int n_cb_env = []() {
++        const char * e = getenv("TOSH_METAL_N_CB");
++        return e ? atoi(e) : 1;
++    }();
++    ggml_backend_metal_set_n_cb(backend, n_cb_env > 0 ? n_cb_env : 1);
+ 
+     return backend;
+ 
+     GGML_UNUSED(params);
+ }

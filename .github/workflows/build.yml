@@ -8,6 +8,7 @@ on:
       - "Tests/**"
       - "Package.swift"
       - "Package.resolved"
+      - "helpers/**"
       - ".github/workflows/build.yml"
     tags: ["v*"]
   pull_request:
@@ -38,6 +39,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: swift test
+      - name: Math helper tests
+        run: |
+          ./scripts/build-sympy.sh
+          vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_helper.py
+          vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-scientific/tests/test_scientific.py
+          vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_agent.py
 
   build:
     # PRs validate a single variant; tags and manual runs build BOTH CPU variants
@@ -81,6 +88,24 @@ jobs:
           path: vendor
           # Per variant: the two ISA baselines produce different engine binaries.
           key: engines-${{ matrix.variant }}-${{ hashFiles('patches/**/*.patch', 'scripts/build-engines.sh') }}
+
+      # Pinned CPython, SymPy, NumPy and SciPy, checked against their SHA-256. Rebuilt every
+      # time: it is a download and an unpack, and the helper sources live outside the engine cache key.
+      - name: Build math runtime (x86_64)
+        if: github.event_name != 'pull_request' || steps.scope.outputs.build == 'true'
+        run: |
+          ARCH=x86_64 ./scripts/build-sympy.sh
+          PY=vendor/tosh-sympy/python/bin/python3
+          if "$PY" -I -c pass 2>/dev/null; then
+            # On an arm64 runner the first import pays for the Rosetta translation of every
+            # extension, which is longer than the helper's call timeout.
+            "$PY" -I -c "import sympy, numpy, scipy.fft, scipy.signal, scipy.integrate, scipy.optimize, scipy.interpolate, scipy.stats, scipy.linalg"
+            "$PY" -I helpers/tosh-sympy/tests/test_helper.py
+            "$PY" -I helpers/tosh-scientific/tests/test_scientific.py
+            "$PY" -I helpers/tosh-sympy/tests/test_agent.py
+          else
+            echo "x86_64 runtime cannot run on this runner; its tests ran in the unit test job"
+          fi
 
       - name: Run unit tests
         if: github.event_name == 'pull_request' && steps.scope.outputs.build == 'true'
@@ -135,7 +160,12 @@ jobs:
           # Sign inside out: --deep is deprecated and does not apply the hardened
           # runtime to the engine binaries, which notarization rejects.
           APP=dist/ToshLLM.app
-          for exe in "$APP/Contents/Resources/bin/"* "$APP/Contents/Resources/bin-image/"* "$APP/Contents/Resources/bin-audio/"*; do
+          # the math runtime is CPython plus the extension modules and libraries of NumPy and SciPy:
+          # every one of them is a Mach-O the notary service checks
+          find "$APP/Contents/Resources/tosh-sympy" -type f \( -name '*.so' -o -name '*.dylib' \) -print0 2>/dev/null |
+            xargs -0 -n 20 codesign --force --timestamp --options runtime -s "$IDENTITY"
+          for exe in "$APP/Contents/Resources/bin/"* "$APP/Contents/Resources/bin-image/"* "$APP/Contents/Resources/bin-audio/"* \
+                     "$APP/Contents/Resources/tosh-sympy/python/bin/python3"; do
             [ -f "$exe" ] || continue
             case "$exe" in *.metallib) continue;; esac
             codesign --force --timestamp --options runtime -s "$IDENTITY" "$exe"

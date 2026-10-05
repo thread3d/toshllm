@@ -287,8 +287,8 @@ struct DashboardView: View {
                     Text(loc.t("Contexto", "Context")).font(.callout)
                     Spacer(minLength: 8)
                     Picker("", selection: $ctx) {
-                        ForEach([4096, 8192, 16384, 32768, 65536, 131072, 262144], id: \.self) { n in
-                            Text("\(n / 1024)k").tag(n)
+                        ForEach(ServerSettings.contextChoices(modelPath: modelPath), id: \.self) { n in
+                            Text(ServerSettings.contextLabel(n)).tag(n)
                         }
                     }
                     .labelsHidden().fixedSize().disabled(serverBusy)
@@ -318,6 +318,14 @@ struct DashboardView: View {
                     }
                     .help(loc.t("Proyector de visión: elige un archivo, deja que se empareje solo, o 'Sin visión' para correr solo texto y liberar la VRAM del codificador.",
                                 "Vision projector: choose a file, let it auto-pair, or 'No vision' to run text-only and free the encoder's VRAM.") + restartNote)
+                }
+                if ServerSettings.modelUsesMTP(at: modelPath) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "hare").frame(width: 18).foregroundStyle(.secondary)
+                        Text(loc.t("Predicción MTP", "MTP prediction")).font(.callout)
+                        Spacer(minLength: 8)
+                        MTPControl(modelPath: modelPath, layout: .inline)
+                    }
                 }
                 if ServerSettings.dflashDraftPath(forModel: modelPath) != nil {
                     HStack(spacing: 8) {
@@ -404,7 +412,7 @@ struct DashboardView: View {
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(WorkspaceStyle.border))
 
             HStack {
-                ServerStateBadge(state: server.state)
+                ServerStateBadge(state: server.state, phase: server.startupPhase, since: server.startupPhaseSince)
                 Spacer()
                 ServerWebUIButton(server: server, presentation: .icon)
                 if server.state == .running || server.state == .starting {
@@ -751,6 +759,8 @@ struct GPUUsageBadge: View {
 /// Compact server state indicator, shared by the main and the added server cards.
 struct ServerStateBadge: View {
     let state: ServerController.State
+    var phase: ServerController.StartupPhase? = nil
+    var since: Date? = nil
     @EnvironmentObject var loc: Localizer
     var body: some View {
         switch state {
@@ -758,8 +768,14 @@ struct ServerStateBadge: View {
             Label(loc.t("Activo", "Running"), systemImage: "circle.fill")
                 .foregroundStyle(.green).font(.caption)
         case .starting:
-            Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
-                .foregroundStyle(.orange).font(.caption)
+            if let phase {
+                Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
+                    .foregroundStyle(.orange).font(.caption)
+                    .help("\(phase.title(loc)): \(phase.help(loc))")
+            } else {
+                Label(loc.t("Iniciando…", "Starting…"), systemImage: "circle.fill")
+                    .foregroundStyle(.orange).font(.caption)
+            }
         case .failed(let msg):
             Label(loc.t("Error", "Error"), systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.red).font(.caption)
@@ -767,6 +783,44 @@ struct ServerStateBadge: View {
         case .stopped:
             Label(loc.t("Detenido", "Stopped"), systemImage: "circle")
                 .foregroundStyle(.secondary).font(.caption)
+        }
+    }
+
+}
+
+extension ServerController.StartupPhase {
+    /// Fits under the state in the server header, which must keep its width.
+    func shortTitle(_ loc: Localizer) -> String {
+        switch self {
+        case .planning:       return loc.t("Planificando", "Planning")
+        case .loadingWeights: return loc.t("Cargando pesos", "Loading weights")
+        case .lockingMemory:  return loc.t("Reservando RAM", "Reserving RAM")
+        case .fillingCache:   return loc.t("Preparando", "Preparing")
+        }
+    }
+
+    func title(_ loc: Localizer) -> String {
+        switch self {
+        case .planning:       return loc.t("Planificando memoria", "Planning memory")
+        case .loadingWeights: return loc.t("Cargando pesos", "Loading weights")
+        case .lockingMemory:  return loc.t("Reservando RAM", "Reserving RAM")
+        case .fillingCache:   return loc.t("Preparando expertos", "Preparing experts")
+        }
+    }
+
+    func help(_ loc: Localizer) -> String {
+        switch self {
+        case .planning:
+            return loc.t("El motor mide cuánta VRAM y RAM hay libres para decidir cómo repartir el modelo.",
+                         "The engine measures free VRAM and RAM to decide how to split the model.")
+        case .loadingWeights:
+            return loc.t("Leyendo el modelo del disco a la GPU.", "Reading the model from disk into the GPU.")
+        case .lockingMemory:
+            return loc.t("Dynamic MoE reserva RAM para los expertos. Mientras tanto el Mac puede ir más lento.",
+                         "Dynamic MoE is reserving RAM for the experts. The Mac may feel slower meanwhile.")
+        case .fillingCache:
+            return loc.t("Cargando en RAM los expertos más usados antes de la primera respuesta.",
+                         "Loading the most used experts into RAM before the first answer.")
         }
     }
 }
@@ -873,8 +927,8 @@ struct AddedServerCard: View {
                 Picker("", selection: Binding(
                     get: { isPinned(Profile.Pin.ctx) ? (c.profile?.ctx ?? gCtx) : gCtx },
                     set: { c.profile?.ctx = $0; pin(Profile.Pin.ctx); manager.schedulePersist() })) {
-                    ForEach([4096, 8192, 16384, 32768, 65536, 131072, 262144], id: \.self) { n in
-                        Text("\(n / 1024)k").tag(n)
+                    ForEach(ServerSettings.contextChoices(modelPath: c.effectiveSettings().modelPath), id: \.self) { n in
+                        Text(ServerSettings.contextLabel(n)).tag(n)
                     }
                 }
                 .labelsHidden().fixedSize().disabled(busy)
@@ -996,7 +1050,7 @@ struct AddedServerCard: View {
             .background(WorkspaceStyle.inset.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(WorkspaceStyle.border))
             HStack {
-                ServerStateBadge(state: c.state)
+                ServerStateBadge(state: c.state, phase: c.startupPhase, since: c.startupPhaseSince)
                 Spacer()
                 ServerWebUIButton(server: c)
                 if busy {

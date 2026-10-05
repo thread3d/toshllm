@@ -39,7 +39,7 @@ struct BenchmarksView: View {
     @State private var configFieldsWide = true
 
     private var gpus: [GPUDevice] { hardware.gpus }
-    private var busy: Bool { bench.running || bench.sweeping || bench.optimizingDynamicMoe }
+    private var busy: Bool { bench.running || bench.sweeping }
 
     var body: some View {
 
@@ -47,6 +47,9 @@ struct BenchmarksView: View {
             VStack(spacing: 16) {
                 compactRunCard
                 contextualStatusCard
+                if showAdvanced {
+                    NeedleTestCard()
+                }
                 if !bench.history.isEmpty {
                     bestCards
                     resultsNavigation
@@ -101,11 +104,6 @@ struct BenchmarksView: View {
             }
         }
         .animation(.spring(duration: 0.3), value: appliedToast)
-        .onChange(of: bench.dynamicMoeOptimizationProfile?.modelFingerprint) { _, fingerprint in
-            guard fingerprint != nil else { return }
-            cfg.dynamicMoe = true
-            cfg.dynamicMoePolicy = "auto"
-        }
         .onChange(of: busy) { _, running in
             if running { outputDismissed = false }
         }
@@ -153,19 +151,6 @@ struct BenchmarksView: View {
             ?? ModelName.looksMoE(URL(fileURLWithPath: cfg.modelPath).lastPathComponent)
     }
 
-    /// K is per layer and bounded by the model: at least the experts a token uses,
-    /// at most the ones the GGUF really has.
-    private var dmoeSlotRange: ClosedRange<Int> {
-        guard let info = cfg.dynamicMoeModelInfo else { return 1...256 }
-        return min(max(info.activeExpertCount, 1), info.expertCount)...info.expertCount
-    }
-    private var dmoeSlotBinding: Binding<Int> {
-        Binding(get: { cfg.effectiveDynamicMoeSlots },
-                set: { v in
-                    let r = dmoeSlotRange
-                    cfg.dynamicMoeSlots = min(max(v, r.lowerBound), r.upperBound)
-                })
-    }
 
     /// Model picker binding that seeds ncmoe on selection: the remembered or
     /// recommended value for MoE models, 0 for dense (never carries over stale).
@@ -224,8 +209,7 @@ struct BenchmarksView: View {
 
                     if busy {
                         Button(loc.t("Cancelar", "Cancel"), role: .destructive) {
-                            if bench.optimizingDynamicMoe { bench.cancelDynamicMoeOptimization() }
-                            else if bench.sweeping { bench.cancelSweep() }
+                            if bench.sweeping { bench.cancelSweep() }
                             else { bench.cancel() }
                         }
                         .glassButton().controlSize(.small)
@@ -265,8 +249,8 @@ struct BenchmarksView: View {
                     if cfg.benchDepthClamped > 0 {
                         chip("d\(cfg.benchDepthClamped)", active: true)
                     }
-                    if cfg.effectiveDynamicMoe {
-                        chip("dMoE K\(cfg.effectiveDynamicMoeSlots)", active: true)
+                    if cfg.usesAutoPlan {
+                        chip("Dynamic MoE", active: true)
                     } else if isMoEModel {
                         chip("ncmoe \(cfg.ncmoe)", active: cfg.ncmoe > 0)
                     }
@@ -295,9 +279,7 @@ struct BenchmarksView: View {
                 if busy {
                     HStack(spacing: 8) {
                         ProgressView().controlSize(.small)
-                        Text(bench.sweeping ? bench.sweepStatus : bench.optimizingDynamicMoe
-                             ? bench.dynamicMoeOptimizationStatus.localized(using: loc)
-                             : loc.t("Benchmark en curso…", "Benchmark running…"))
+                        Text(bench.sweeping ? bench.sweepStatus : loc.t("Benchmark en curso…", "Benchmark running…"))
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -385,15 +367,20 @@ struct BenchmarksView: View {
         Divider().padding(.horizontal, 14).frame(height: 70)
     }
 
+    /// Under Dynamic MoE the engine's plan owns offload, batch and KV; the run follows it.
+    private var dynamicMoeNote: some View {
+        Text(loc.t("Activado: el plan del motor decide expertos, lote y KV", "On: the engine's plan picks experts, batch and KV"))
+            .font(.caption).foregroundStyle(.secondary)
+            .help(loc.t("Se desactiva en Ajustes → Rendimiento y memoria.", "Turn it off in Settings → Performance & Memory."))
+    }
+
     private var advancedBenchmarkControls: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
                 compactWorkloadFields.frame(maxWidth: 360)
                 Divider().frame(height: 54)
-                if isMoEModel && cfg.effectiveDynamicMoe {
-                    field(loc.t("Ranuras dMoE", "dMoE slots")) {
-                        Stepper("\(cfg.effectiveDynamicMoeSlots)", value: dmoeSlotBinding, in: dmoeSlotRange)
-                    }
+                if cfg.usesAutoPlan {
+                    field("Dynamic MoE") { dynamicMoeNote }
                 } else if isMoEModel {
                     field(loc.t("MoE en CPU", "MoE on CPU")) {
                         Stepper("\(cfg.ncmoe)", value: $cfg.ncmoe, in: 0...99)
@@ -416,18 +403,11 @@ struct BenchmarksView: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if isMoEModel {
+                if isMoEModel && !cfg.usesAutoPlan {
                     Button { rememberWorkload(); bench.sweep(settings: cfg) } label: {
                         Label(loc.t("Encontrar equilibrio", "Find balance"), systemImage: "scope")
                     }
-                    .disabled(cfg.modelPath.isEmpty || cfg.ncmoe == 0 || cfg.effectiveDynamicMoe
-                              || server.state == .running || server.state == .starting)
-                }
-                if isMoEModel && cfg.dynamicMoeUIUnlocked {
-                    Button { rememberWorkload(); bench.optimizeDynamicMoe(settings: cfg) } label: {
-                        Label(loc.t("Optimizar dMoE", "Optimize dMoE"), systemImage: "gearshape.2")
-                    }
-                    .disabled(cfg.modelPath.isEmpty || cfg.serverBinary != ServerSettings.defaultBinary
+                    .disabled(cfg.modelPath.isEmpty || cfg.ncmoe == 0
                               || server.state == .running || server.state == .starting)
                 }
             }
@@ -452,13 +432,6 @@ struct BenchmarksView: View {
             }
         }
         if !bench.sweepSamples.isEmpty { sweepProgress }
-        if bench.optimizingDynamicMoe || bench.dynamicMoeOptimizationStatus != .idle {
-            DynamicMoeOptimizationStatusView(
-                running: bench.optimizingDynamicMoe,
-                status: bench.dynamicMoeOptimizationStatus,
-                profile: bench.dynamicMoeOptimizationProfile,
-                samples: bench.dynamicMoeOptimizationSamples)
-        }
     }
 
     private var runCard: some View {
@@ -510,11 +483,8 @@ struct BenchmarksView: View {
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
-                            if isMoEModel && cfg.effectiveDynamicMoe {
-                                field(loc.t("Ranuras dMoE", "dMoE slots")) {
-                                    Stepper("\(cfg.effectiveDynamicMoeSlots)", value: dmoeSlotBinding, in: dmoeSlotRange)
-                                        .fixedSize()
-                                }
+                            if cfg.usesAutoPlan {
+                                field("Dynamic MoE") { dynamicMoeNote }
                             } else if isMoEModel {
                                 field(loc.t("MoE en CPU", "MoE on CPU")) {
                                     Stepper("\(cfg.ncmoe)", value: $cfg.ncmoe, in: 0...99).fixedSize()
@@ -568,14 +538,11 @@ struct BenchmarksView: View {
                     if busy {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 10)], spacing: 10) {
                             ProgressView().controlSize(.small)
-                            Text(bench.sweeping ? bench.sweepStatus : bench.optimizingDynamicMoe
-                                 ? bench.dynamicMoeOptimizationStatus.localized(using: loc)
-                                 : loc.t("Benchmark en curso…", "Benchmark running…"))
+                            Text(bench.sweeping ? bench.sweepStatus : loc.t("Benchmark en curso…", "Benchmark running…"))
                                 .font(.callout).foregroundStyle(.secondary)
                             Spacer()
                             Button(loc.t("Cancelar", "Cancel"), role: .destructive) {
-                                if bench.optimizingDynamicMoe { bench.cancelDynamicMoeOptimization() }
-                                else if bench.sweeping { bench.cancelSweep() }
+                                if bench.sweeping { bench.cancelSweep() }
                                 else { bench.cancel() }
                             }
                         }
@@ -596,25 +563,14 @@ struct BenchmarksView: View {
                                       disabled: cfg.modelPath.isEmpty || server.state == .running || server.state == .starting) {
                                 rememberWorkload(); bench.runReal(settings: cfg)
                             }
-                            if isMoEModel {
+                            if isMoEModel && !cfg.usesAutoPlan {
                                 runChoice(loc.t("Encontrar equilibrio", "Find best balance"),
                                           subtitle: loc.t("Busca la distribución GPU/CPU más segura.",
                                                           "Finds a safe GPU/CPU distribution."),
                                           icon: "scope", prominent: false,
-                                          disabled: cfg.modelPath.isEmpty || cfg.ncmoe == 0 || cfg.effectiveDynamicMoe
+                                          disabled: cfg.modelPath.isEmpty || cfg.ncmoe == 0
                                             || server.state == .running || server.state == .starting) {
                                     rememberWorkload(); bench.sweep(settings: cfg)
-                                }
-                            }
-                            if isMoEModel && cfg.dynamicMoeUIUnlocked {
-                                runChoice(loc.t("Optimizar dMoE", "Optimize dMoE"),
-                                          subtitle: loc.t("Crea y activa el mejor mapa de expertos.",
-                                                          "Builds and activates the best expert map."),
-                                          icon: "gearshape.2", prominent: false,
-                                          disabled: cfg.modelPath.isEmpty
-                                            || cfg.serverBinary != ServerSettings.defaultBinary
-                                            || server.state == .running || server.state == .starting) {
-                                    rememberWorkload(); bench.optimizeDynamicMoe(settings: cfg)
                                 }
                             }
                         }
@@ -637,14 +593,6 @@ struct BenchmarksView: View {
 
                 if !bench.sweepSamples.isEmpty {
                     sweepProgress
-                }
-
-                if bench.optimizingDynamicMoe || bench.dynamicMoeOptimizationStatus != .idle {
-                    DynamicMoeOptimizationStatusView(
-                        running: bench.optimizingDynamicMoe,
-                        status: bench.dynamicMoeOptimizationStatus,
-                        profile: bench.dynamicMoeOptimizationProfile,
-                        samples: bench.dynamicMoeOptimizationSamples)
                 }
 
                 statusNote
@@ -1442,6 +1390,14 @@ private struct BenchmarkResultTableRow: View, Equatable {
                                 .background(Color.appAccent.opacity(0.13), in: Capsule())
                                 .fixedSize()
                         }
+                        if let dmoe = result.dynamicMoeLabel {
+                            Image(systemName: "memorychip")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Color.chartSecondary)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(Color.chartSecondary.opacity(0.13), in: Capsule())
+                                .help(loc.t("Medido con %@", "Measured with %@", dmoe))
+                        }
                     }
                     Text(result.date, format: .dateTime.day().month().hour().minute())
                         .font(.caption2).foregroundStyle(.tertiary)
@@ -1507,7 +1463,9 @@ private struct BenchmarkResultTableRow: View, Equatable {
         if let accept = result.accept {
             values.append("MTP \(Int((accept * 100).rounded()))%")
         }
-        if let dmoe = result.dmoeK, dmoe > 0 {
+        if let dynamic = result.dynamicMoeLabel {
+            values.append(dynamic)
+        } else if let dmoe = result.dmoeK, dmoe > 0 {
             values.append("dMoE K\(dmoe)")
         } else if result.ncmoe > 0 {
             values.append("ncmoe \(result.ncmoe)")
@@ -1571,7 +1529,7 @@ private struct BenchmarkOutputCard: View {
                         "Hide the output and show system information again."))
         }) {
             ScrollViewReader { proxy in
-                ScrollView([.horizontal, .vertical]) {
+                ScrollView(.vertical) {
                     Text(buffer.text.isEmpty ? "…" : buffer.text)
                         .font(.system(size: 10.5, design: .monospaced))
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1638,6 +1596,11 @@ private struct BenchHistoryRow: View, Equatable {
                         .help(r.quantization == "—"
                               ? loc.t("El resultado antiguo no guardó el quant", "This older result did not store its quant")
                               : loc.t("Quantización del modelo", "Model quantization"))
+                    if let dmoe = r.dynamicMoeLabel {
+                        Image(systemName: "memorychip")
+                            .font(.system(size: 9)).foregroundStyle(Color.chartSecondary)
+                            .help(loc.t("Medido con %@", "Measured with %@", dmoe))
+                    }
                     if r.shared == true {
                         Image(systemName: "globe")
                             .font(.system(size: 9)).foregroundStyle(Color.appAccent)

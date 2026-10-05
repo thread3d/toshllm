@@ -46,6 +46,9 @@ It opens, detects your hardware, and recommends models that will actually run we
 
 - **Native chat** — multiple persistent conversations, full Markdown with code-copy, regenerate, system prompt, live tokens/sec, file attachments, conversation forking and per-message metrics
 - **Agent tools and MCP** — the model can read, edit and run files and commands with per-step permission, run JavaScript in a sandbox, and use tools from external Model Context Protocol servers you connect
+- **Symbolic math (SymPy)** — optional exact math tools for the model: simplify, solve equations and systems, derivatives, integrals, limits, series, differential equations, matrices, Laplace and Fourier transforms, and checking that two expressions are equivalent or that a solution holds. The runtime ships inside the app, nothing else to install; off by default, in chat settings under Agents ([details](helpers/tosh-sympy/README.md))
+- **Scientific computing (NumPy and SciPy)** — optional numerical tools for the model: definite integrals without a closed form, roots, optimization and curve fitting, differential equations over an interval, linear algebra on decimal matrices, FFT and filters, and statistics. The model sends an operation and its numbers, never code. Same bundled runtime, its own switch, off by default ([details](helpers/tosh-scientific/README.md))
+- **Math answers you can check** — with either math tool set on, the engine runs the turn itself: a calculation has to go through a tool or a question back, every call is checked against your message, and the answer only states numbers from your message or from a validated result. The app's chat, the web chat and any OpenAI client that sends `X-Tosh-Agent: on` get the same agent, also from another computer; requests that bring their own tools get the model as it is ([how to call it](helpers/tosh-sympy/README.md#four-ways-to-reach-the-tools))
 - **GPU speech and subtitle studio** — Whisper.cpp transcribes microphone dictation into one clean paragraph, while the Audio workspace can disable Silero VAD, use Whisper.cpp's native defaults or tune it with calibrated profiles, previews audio or video with a synchronized editable transcript, preserves recoverable original and translated tracks, keeps Chat translation consistent with context and a glossary, and exports SRT, VTT, TXT, JSON or a captioned MOV; nothing leaves the Mac
 - **Vision** — attach images (or paste a screenshot with Cmd+V) and vision-capable models describe them; the matching projector (`mmproj`) is paired automatically
 - **Image generation (beta)** — a local text-to-image studio (stable-diffusion.cpp on the same AMD Metal stack): text-to-image and image-to-image, with a model catalog sized to your VRAM, a live preview of the image forming, and an **upscaler** that takes your own photos too (x2/x4, batches, and a drag-to-compare view)
@@ -65,6 +68,7 @@ It opens, detects your hardware, and recommends models that will actually run we
 
 These are new and still being validated — enable them in Settings, but expect rough edges:
 
+- **Dynamic MoE (off by default)** — for Mixture-of-Experts models that do not fit in VRAM: the most used experts stay in VRAM, the rest in RAM, sized for your context and for the memory the Mac has free right now, and the model is not loaded when nothing fits safely. On an RX 6700 XT it reads prompts nearly twice as fast as the standard offload on Qwen3.6-35B-A3B and generates about 50% faster. Off, MoE models use the standard offload as before. [How it works](#dynamic-moe-experimental-off-by-default).
 - **Video generation (experimental, first cut)** — a Video mode next to Chat and Images, on the same stable-diffusion.cpp engine, with Wan 2.1/2.2, LTX-2 and HunyuanVideo. Read this before downloading 7 GB: a few seconds of video take minutes, 49 frames at 480p already fill a 12 GB card, and **only Wan 2.1 1.3B fits one at all** — the others ask for 24 GB or more. Asking for more frames or more pixels than fit fails instead of degrading. The clip comes back as frames you can scrub, and exports to mp4. The engine side is measured; the interface is new and the defaults will move.
 - **Remember conversations (disk cache)** — persists each chat's KV cache so reopening it, or restarting the app, skips re-processing the prompt; the reload is byte-exact, and an 8.6k-token chat comes back in 0.9 s instead of 24.8 s of re-prefilling. Also pre-warms the cache for external clients (VS Code/Cline), so their first request skips the multi-minute cold prefill.
 - **Prompt cache reuse** — reuses the cache across mid-prompt edits (coding assistants) and trimmed reasoning instead of reprocessing. Fast but approximate; toggle it off in Settings for exact, reproducible output.
@@ -159,7 +163,7 @@ DeepSeek-V4-Flash is the exception in both directions. Its 145 GB of experts sta
 - An Intel Mac with an AMD GPU that supports Metal (developed and tuned on an RX 6700 XT 12 GB)
 - 16 GB RAM minimum — 32 GB recommended for 35B-class MoE models; a 145 GB MoE such as DeepSeek-V4 keeps its experts in system memory and needs RAM of a comparable size
 
-> **Hackintosh note:** AMD RDNA 2 dGPUs work great with the [NootRX](https://github.com/ChefKissInc/NootRX) kext providing Metal support. ToshLLM runs on top of any working Metal setup.
+> **Hackintosh note:** AMD RDNA 2 dGPUs work great with the [NootRX](https://github.com/ChefKissInc/NootRX) kext providing Metal support. ToshLLM runs on top of any working Metal setup. If your OpenCore config injects `ATY,Henbury` in `DeviceProperties`, try removing it: on an RX 6600 XT it cut generation from about 20 to 14 tokens a second ([#44](https://github.com/engeldlgado/toshllm/issues/44)). It was a workaround for macOS 12.3 and is only needed if your displays depend on it.
 
 ## Good to know
 
@@ -188,115 +192,50 @@ The AMD patch lives in [`patches/`](patches/) — chunked staging transfers for 
 
 ## Research: AMD GPUs on Metal
 
-### Dynamic MoE: bounded-VRAM expert cache (private experiment)
+### Dynamic MoE (experimental, off by default)
 
-`--n-cpu-moe` and ToshLLM's Dynamic MoE solve the same capacity problem in two different ways. Both keep llama.cpp, GGUF and the normal graph; Dynamic MoE is compiled into the bundled engine but is **off at runtime and hidden from the UI by default** while its model coverage is measured.
+A Mixture-of-Experts model only uses a few experts per token, so it does not need all of them in
+VRAM. With **Settings → Performance & Memory → Dynamic MoE (experimental)** turned on, the bundled
+engine plans memory for MoE models itself: the most used experts live in a VRAM arena, the rest of
+the expert bank stays in RAM, and routed experts are uploaded as needed. Off, MoE models keep the
+standard expert offload (`--n-cpu-moe`) exactly as before. The switch is `--dynamic-moe on` on the
+engine's command line.
 
-The experiment targets systems whose discrete GPU cannot hold the complete MoE model in VRAM, but which have substantial free system RAM. Its goal is to keep only the active expert working set in limited VRAM, use host RAM as the complete expert bank, and approach the normal prompt-processing and generation performance of a more GPU-resident `ncmoe` configuration while consuming materially less VRAM. It does not benefit a model that already fits completely in VRAM, and it trades that VRAM reduction for higher RAM use and PCIe traffic.
+When it is on, the planner reads the model (every file of a split GGUF), probes the memory each
+layout needs without loading weights, and looks at how much RAM the Mac can give right now, not
+only at how much it has. It then picks one of:
 
-The design is an independent llama.cpp/Metal implementation inspired by the publicly documented [FreeToken architecture](https://github.com/FlashML-org/FreeToken) and [paper](https://arxiv.org/abs/2608.16157). ToshLLM does not vendor or link the FreeToken runtime or source code. FreeToken is distributed under Apache-2.0; if its source is incorporated in the future, its license, notices and modification requirements must be retained.
+| plan | when |
+|---|---|
+| Full GPU | the model and the requested context fit in VRAM with a safe margin |
+| Dynamic MoE, full host | the whole expert bank fits in RAM next to everything else |
+| Dynamic MoE, bounded host | free RAM is short: RAM keeps the most used experts and the rest are read from the model file |
+| Expert offload | the classic `--n-cpu-moe` layout is the only safe one left |
+| No safe plan | the model is not loaded, and the engine says what it needed and what was available |
 
-> **RAM warning:** Dynamic MoE reduces **VRAM** by keeping the expert pool addressable in host **RAM**, and Metal wires those pages so the system cannot page or compress them. That is why the usable share of installed memory is small: the rule is that the expert pool must fit in a third of physical RAM, which on a 32 GB machine is about 10.7 GiB and admits an 11.44 GiB GGUF but not a 19.45 GiB one. Measured on 32 GB, a 9.6 GiB pool runs flat while 12.7 and 16.9 GiB starve the compositor. If the headroom is unavailable, Automatic mode rejects Dynamic MoE and returns to normal `ncmoe` instead of relying on swap.
+A bounded plan reports its coverage, (VRAM arena + RAM cache) / expert bank: 1.25 or more is
+comfortable, 1.0 to 1.25 works with slower prompts, and under 1.0 is refused. The planner checks
+memory again right before it commits, so another app taking memory during the few seconds of
+planning makes it plan again; it also leaves room for the server's prompt cache and conversation
+checkpoints. The plan, with projected RAM, VRAM and coverage, is shown before the model starts, and
+the measured memory once it is running.
 
-#### How to enable it
+Validated on Qwen3.6-35B-A3B, GPT-OSS 20B, Gemma 4 26B-A4B and GLM-4.7-Flash-REAP on an RX 6700 XT
+(32 GB RAM), and on the 104 GB split Qwen3.8 Flash Next on one Radeon Pro Vega II die. Other MoE
+architectures may work but are not validated. Reference speeds on the RX 6700 XT, 3.4K-token prompt,
+Dynamic MoE with the full bank in RAM against the standard offload:
 
-1. Select the bundled engine and a MoE GGUF.
-2. In **Settings → Extra arguments**, add `TOSH_MOE_UI=1`.
-3. The private **Dynamic MoE (experimental)** panel appears. Turn it on.
-4. Open **Benchmarks** and press **Optimize dMoE**. ToshLLM measures normal execution, learns a complete expert ranking, sweeps K, then tunes prompt prefetch without accepting more than a 3% TG regression at the chosen K.
-5. The resulting **Automatic** profile is activated for the integrated chat. **Manual cache** remains available to vary K and prefetch by hand.
+| model | prompt t/s (standard → Dynamic MoE) | generation t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B | 310.6 → 580.6 | 29.0 → 43.8 |
+| GPT-OSS 20B | 496.7 → 901.9 | 40.7 → 68.1 |
+| Gemma 4 26B-A4B | 384.6 → 595.3 | 22.5 → 38.8 |
+| GLM-4.7-Flash-REAP-23B | 411.6 → 401.8 | 28.5 → 30.9 |
 
-`TOSH_MOE_UI=1` only reveals the controls. Removing it, turning Dynamic MoE off, selecting a custom engine, or letting Auto reject the configuration returns the same binary to unmodified llama.cpp execution. The feature is not yet used by router or multi-GPU mode.
-
-#### The normal `ncmoe` architecture
-
-Let:
-
-- `L` = transformer/MoE layer count (`*.block_count` in the GGUF);
-- `E` = total experts in each MoE layer (`*.expert_count`);
-- `A` = experts selected per token, or top-k (`*.expert_used_count`);
-- `W` = total GGUF weight bytes;
-- `Wshared` = attention, embeddings and other non-expert weights;
-- `Wexp = max(W - Wshared, 0)` = the complete quantized expert pool;
-- `V` = physical VRAM and `R` = the configured VRAM reserve;
-- `C` and `KV` = compute buffers and KV cache.
-
-Normal llama.cpp places whole expert banks statically. With `N = --n-cpu-moe`, approximately `N/L` of the expert pool is processed from host RAM and the rest remains GPU-resident:
-
-```text
-VRAMncmoe ≈ Wshared + Wexp × (1 - N/L) + C + KV
-RAMncmoe  ≈ Wexp × N/L + host overhead
-```
-
-The first capacity estimate is therefore:
-
-```text
-Bexpert_gpu = max(0, V - R - Wshared - C - KV)
-N ≈ ceil(L × max(0, Wexp - Bexpert_gpu) / Wexp)
-```
-
-ToshLLM uses that estimate when a model is selected, then the benchmark's **Find optimum** sweep measures nearby `ncmoe` values because PCIe bandwidth, CPU memory bandwidth, quantization and the driver's real allocations cannot be inferred exactly from the file. Raising `ncmoe` saves VRAM but makes more active experts use the CPU path; lowering it does the reverse. `ncmoe 0` means no MoE layers are deliberately assigned to CPU and is only viable when the complete placement fits.
-
-#### The Dynamic MoE architecture
-
-Dynamic MoE keeps the complete quantized expert bank addressable in RAM, but gives every MoE layer only `K` reusable expert slots in VRAM. A GPU-resident LRU table maps `(layer, expert)` to a slot; selected experts already present execute immediately. Routing and slot IDs stay on the GPU, so decode does not round-trip through the CPU just to make a cache decision.
-
-There are two execution routes. **Direct** maps the stable host expert bank once and preserves the high-performance implementation already validated when that bank fits Metal's practical window. **Split** keeps K fixed experts per layer in private VRAM, stores the remaining quantized rows in RAM, and exposes only a small `ring` of cold rows plus bounded full-bank staging buffers to Metal. This removes the former requirement to wrap a 10–17 GiB expert allocation as one Metal resource and allows oversized Q4 models to run without copying the complete expert pool into VRAM.
-
-The router remains exact in both routes: every GGUF expert is available and the model still selects the same top-A experts for every token. The optimizer records a complete per-layer histogram as `expert:count`; future loads normalize the historical counts to a bounded prior, then add new observations. This means repeated representative use improves the initial resident ranking, short sessions cannot erase the profile, and a changed workload can still overtake stale history. It is cache adaptation, not model training, and performance eventually stabilizes when the routing distribution stabilizes.
-
-K is **per layer**, not a global model count, and its valid interval comes from that model's GGUF:
-
-```text
-A ≤ K ≤ E
-```
-
-This is why K114 is valid for Qwen3.6-35B-A3B (`L=40, E=256, A=8`), but invalid for GPT-OSS 20B (`L=24, E=32, A=4`) and OLMoE (`L=16, E=64, A=8`). The panel now reads those values instead of offering a fixed list. If a saved K114 is applied to GPT-OSS 20B, runtime clamps it to K32; it can never silently request more slots than the tensor actually has.
-
-One slot represents one expert across every MoE layer, so its first-order byte cost is:
-
-```text
-bytes_per_K ≈ Wexp / E
-```
-
-For the UI's conservative VRAM estimate ToshLLM uses the same `Wshared ≈ min(W, 1.3 GiB)` split as its ncmoe planner. The widest per-layer bank is estimated from the fused gate/up tensors, and one such bank is reserved for staging plus one for every prefetch slot `P`:
-
-```text
-Wstage ≈ (2/3) × Wexp / L
-Wfixed ≈ Wshared + 512 MiB + (P + 1) × Wstage
-Kbudget = floor((V - R - Wfixed) / (Wexp / E))
-Krecommended = min(E, Kbudget)
-VRAMdynamic(K) ≈ Wfixed + K × (Wexp / E)
-```
-
-The manual control permits every architecturally valid integer from `A` through `E`, while showing a warning above `Krecommended`; that warning is an estimate, not a prohibition, so unusual hardware can still be measured. Before a profile exists, Automatic mode starts conservatively at the smallest useful cache:
-
-```text
-Kauto = A
-```
-
-That is K8 for Qwen3.6/OLMoE and K4 for GPT-OSS 20B—not a hard-coded K8. **Optimize dMoE** then tests model-derived values between A and the estimated VRAM limit, saves the smallest K reaching at least 95% of the normal TG reference when possible, and tunes prefetch 0/1/2/4 for PP. The profile is keyed by GGUF fingerprint and physical GPU, so changing models or GPUs never silently reuses an unrelated ranking. Auto activates the cache only when `A < E`, a discrete single GPU is selected, and physical RAM can hold `W` plus `max(25% of W, 4 GiB)` of headroom; otherwise it falls back before launch to normal `ncmoe` execution.
-
-The memory trade is deliberate:
-
-```text
-RAMdynamic  ≈ W + max(0.25 × W, 4 GiB) headroom
-VRAMdynamic ≈ bounded by K instead of by a fixed number of whole MoE layers
-```
-
-The reference system was the development machine: **RX 6700 XT 12 GB**, Core i5-10400 (6c/12t), 32 GB DDR4 and macOS, running Qwen3.6-35B-A3B Q2_K_XL (11.44 GiB, `L=40`, `E=256`, `A=8`). In the short `pp256`/`tg128` sweep, using the same model and binary for every row:
-
-| Mode | Approx. VRAM during PP | VRAM saved vs `ncmoe 24` | Host RAM footprint | pp256 (t/s) | tg128 (t/s) |
-|---|---:|---:|---:|---:|---:|
-| Dynamic K8, all 40 layers, prefetch 4 | **2.78 GiB** | **~54%** | ~10.5 GiB† | 299.28 ± 1.09 | **32.44 ± 0.45** |
-| 8 complete resident layers + K8 on 32 layers | 4.67 GiB | ~22% | ~10.5 GiB† | 346.56 ± 1.57 | **37.14 ± 0.54** |
-| Normal `ncmoe 24` control | ~6 GiB | baseline | 6.6–6.7 GiB† | **352.98 ± 5.09** | ~22–24.5 |
-
-The K8 configuration therefore saved approximately 54% of VRAM against the roughly 6 GiB `ncmoe 24` control and generated faster, while prompt processing remained the main optimization target. The resident-layer alternative saved approximately 22% of VRAM and recovered about 98.2% of the locally reproduced `ncmoe 24` prompt rate, but exists as an optional higher-VRAM trade-off rather than the minimum-VRAM goal.
-
-K8 does not mean that only 8 of the model's 256 experts exist or that the cache uses half of some fixed capacity. It means **8 reusable VRAM slots per MoE layer**, exactly matching this model's top-8 active experts; all 256 experts per layer remain available from the complete host-RAM bank.
-
-† The `pp256`/`tg128` speeds and VRAM values were captured together in the short sweep. Physical RAM was captured in a separate matched-context audit on the same RX 6700 XT: 10.5 GiB for the complete Dynamic MoE host-bank route and 6.6–6.7 GiB for `ncmoe 24`. Changing K changes the number of VRAM slots, not the complete host bank, so the Dynamic RAM figure is the expected K8-class footprint, but direct K8 RSS was not recorded in that short sweep and is not claimed as an independently measured K8 value. These figures are specific to this model and hardware, not a promise for every MoE.
+With less free RAM, bounded plans trade prompt speed for memory: Qwen with 8 GB held by other apps
+runs a 12.9 GiB RAM cache at coverage 1.12, 365.8 t/s on the first prompt and 31.2 t/s generating,
+in 13 GiB of RAM instead of 22. Measurements and the reasoning behind each limit are in
+[`research/bounded-host-residency`](research/bounded-host-residency/).
 
 ### Flash Attention (decode)
 
@@ -452,6 +391,8 @@ Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Free to use, study, modify and redistribute. Any distributed derivative must remain GPL-3.0 and preserve the copyright notice — the project can never be turned into closed-source commercial software.
 
+Components bundled under their own licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Credits
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) (ggml-org) — inference engine
@@ -492,6 +433,9 @@ Casi todas las herramientas de LLM locales en macOS apuntan a Apple Silicon; los
 
 - **Chat nativo** — conversaciones persistentes, Markdown completo con copiar código, regenerar, prompt de sistema, tokens/seg en vivo, adjuntar archivos, bifurcar conversaciones y métricas por mensaje
 - **Herramientas de agente y MCP** — el modelo puede leer, editar y ejecutar archivos y comandos con permiso paso a paso, correr JavaScript en un sandbox y usar herramientas de servidores MCP externos que conectes
+- **Matemática simbólica (SymPy)** — herramientas opcionales de matemática exacta para el modelo: simplificar, resolver ecuaciones y sistemas, derivadas, integrales, límites, series, ecuaciones diferenciales, matrices, transformadas de Laplace y Fourier, y verificar que dos expresiones son equivalentes o que una solución cumple. El runtime va dentro de la app, sin instalar nada más; apagado por defecto, en los ajustes del chat, en Agentes
+- **Cálculo científico (NumPy y SciPy)** — herramientas numéricas opcionales para el modelo: integrales definidas sin forma cerrada, raíces, optimización y ajuste de curvas, ecuaciones diferenciales en un intervalo, álgebra lineal con matrices decimales, FFT y filtros, y estadística. El modelo envía una operación y sus números, nunca código. Mismo runtime incluido, con su propio interruptor, apagado por defecto
+- **Respuestas matemáticas comprobables** — con cualquiera de las dos herramientas matemáticas encendida, el motor lleva el turno: un cálculo tiene que pasar por una herramienta o por una pregunta de vuelta, cada llamada se compara con tu mensaje y la respuesta solo da números de tu mensaje o de un resultado validado. El chat de la app, el chat web y cualquier cliente OpenAI que envíe `X-Tosh-Agent: on` usan el mismo agente, también desde otro equipo; las peticiones que traen sus propias herramientas reciben el modelo tal cual
 - **Dictado por voz** — el botón de micrófono transcribe directo al cuadro de mensaje en el propio Mac (framework Speech de Apple); nada sale del equipo
 - **Estudio de audio y subtítulos en GPU** — Whisper.cpp transcribe audio o vídeo, muestra y sigue el segmento activo durante la reproducción, conserva proyectos recuperables con original y traducción, mantiene términos consistentes mediante contexto y glosario, permite editar y comparar ambas pistas, prueba VAD en una muestra y exporta SRT, VTT, TXT, JSON o una copia MOV subtitulada
 - **Visión** — adjunta imágenes (o pega una captura con Cmd+V) y los modelos con visión las describen; el proyector (`mmproj`) se empareja solo
@@ -511,6 +455,7 @@ Casi todas las herramientas de LLM locales en macOS apuntan a Apple Silicon; los
 
 Funciones nuevas, aún en validación — actívalas en Ajustes, pero pueden tener detalles por pulir:
 
+- **Dynamic MoE (apagado por defecto)** — para modelos Mixture-of-Experts que no caben en VRAM: los expertos más usados quedan en VRAM y el resto en RAM, a la medida del contexto y de la memoria que el Mac tiene libre en ese momento, y el modelo no se carga si nada cabe con seguridad. En una RX 6700 XT lee los prompts casi al doble que la descarga estándar con Qwen3.6-35B-A3B y genera un 50% más rápido. Apagado, los modelos MoE usan la descarga estándar de siempre.
 - **Recordar conversaciones (caché en disco)** — guarda la caché KV de cada chat, así al reabrirlo o reiniciar la app no se reprocesa el prompt; la restauración es byte-exacta y un chat de 8.6k tokens vuelve en 0.9 s en vez de 24.8 s. También pre-calienta la caché para clientes externos (VS Code/Cline), evitando el prefill frío de varios minutos en la primera petición.
 - **Generación de vídeo (experimental, primera versión)** — un modo Vídeo junto a Chat e Imágenes, sobre el mismo motor stable-diffusion.cpp, con Wan 2.1/2.2, LTX-2 y HunyuanVideo. Léelo antes de descargar 7 GB: unos segundos de vídeo tardan minutos, 49 fotogramas a 480p ya llenan una tarjeta de 12 GB y **solo entra Wan 2.1 1.3B**; los demás piden 24 GB o más. Pedir más fotogramas o más píxeles de los que caben falla, no degrada. El clip vuelve como fotogramas que puedes recorrer, y se exporta a mp4. El motor está medido; la interfaz es nueva y los valores por defecto van a cambiar.
 - **Repartir el modelo entre varias GPUs** — validado en un equipo con dos GPUs (RX 6900 XT + RX 6800 XT por eGPU): un MoE de 35B con todos los expertos en VRAM generó a ~3× la velocidad de una sola GPU con offload, y hay testers corriendo modelos de 122B repartidos en cuatro tarjetas. Puedes elegir el conjunto exacto de tarjetas por servidor; sigue marcado experimental mientras llegan más configuraciones.
@@ -527,7 +472,7 @@ Descarga el `.dmg` desde [Releases](https://github.com/engeldlgado/toshllm/relea
 ### Requisitos y notas
 
 - macOS 14 o posterior · Mac Intel con GPU AMD compatible con Metal · 16 GB de RAM mínimo (32 GB recomendado para MoE de 35B); un MoE de 145 GB como DeepSeek-V4 mantiene sus expertos en memoria del sistema y necesita RAM del orden del modelo.
-- **Hackintosh:** las GPUs AMD RDNA 2 funcionan muy bien con el kext [NootRX](https://github.com/ChefKissInc/NootRX).
+- **Hackintosh:** las GPUs AMD RDNA 2 funcionan muy bien con el kext [NootRX](https://github.com/ChefKissInc/NootRX). Si tu configuración de OpenCore inyecta `ATY,Henbury` en `DeviceProperties`, prueba a quitarlo: en una RX 6600 XT bajaba la generación de unos 20 a 14 tokens por segundo ([#44](https://github.com/engeldlgado/toshllm/issues/44)). Era un parche para macOS 12.3 y solo hace falta si tus pantallas dependen de él.
 - **Beta:** funciona para uso diario pero pueden aparecer detalles por pulir; reporta lo que encuentres en [Issues](https://github.com/engeldlgado/toshllm/issues) (exporta diagnósticos desde Ajustes → Registro del servidor).
 - **Limitaciones conocidas:** los clientes externos (VS Code, Cline…) envían un prompt fijo de 15-19k tokens en cada petición, lo que en frío satura la GPU varios minutos (el chat integrado no se ve afectado). Los modelos MoE grandes con offload antes ahogaban al driver AMD y se estancaban a mitad de generación; **0.81.49 lo solucionó** con un buffer de staging persistente y ahora corren estables y planos (confirmado en RX 6700 XT y en el Mac Pro de dos GPUs de un tester). Queda un watchdog como red de seguridad.
 - **DeepSeek-V4 (MoE de 145 GB):** el modelo más grande validado hasta ahora, y el único donde mantener **todos** los expertos en CPU es el camino rápido. Sus 145 GB de expertos MXFP4 cruzan PCIe en cada token: repartirlos en 96 GB de VRAM mide 0.1 t/s frente a 2.8 t/s en un chat, así que fija `ncmoe` al número de capas (`43`) y prefiere una GPU antes que un reparto. En Metal AMD su caché KV se queda en memoria del sistema, porque la escritura de la GPU en la caché de ventana deslizante bloquea la cola de comandos; MLA comparte una sola caché para claves y valores, y la app rechaza una pareja distinta antes de lanzar.

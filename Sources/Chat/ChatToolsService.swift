@@ -64,6 +64,28 @@ struct BuiltinToolInfo: Identifiable, Sendable {
 struct ToolExecutionResult: Sendable, Equatable {
     let content: String
     let isError: Bool
+    /// Images a tool returned, as data URIs, sent to vision models instead of as base64 text.
+    var imageURIs: [String] = []
+}
+
+/// Tool output goes back into the prompt verbatim, so one directory listing or web page can
+/// fill the context. The head and the tail are kept because errors usually land at the end.
+enum ToolResultLimit {
+    static let defaultCharacters = 20_000
+
+    static var characters: Int {
+        UserDefaults.standard.object(forKey: SettingsKeys.toolResultLimit) as? Int ?? defaultCharacters
+    }
+
+    static func apply(_ text: String, limit: Int = characters) -> String {
+        guard limit > 0 else { return text }
+        let total = text.count
+        guard total > limit else { return text }
+        let tail = limit / 4
+        return String(text.prefix(limit - tail))
+            + "\n\n[… \(total - limit) of \(total) characters omitted …]\n\n"
+            + String(text.suffix(tail))
+    }
 }
 
 enum ChatToolsError: LocalizedError {
@@ -86,8 +108,16 @@ enum ChatToolsService {
         "file_glob_search", "grep_search", "exec_shell_command", "run_javascript"
     ]
 
-    static func isAlwaysAllowed(_ name: String) -> Bool {
-        UserDefaults.standard.bool(forKey: permissionKey(name))
+    /// `bundled` is false for tools of the user's own MCP servers. The math tools of the bundled helpers
+    /// run without asking unless the user turned that off: they only compute, and the engine's agent,
+    /// which runs math turns, cannot ask.
+    static func isAlwaysAllowed(_ name: String, bundled: Bool = true) -> Bool {
+        if UserDefaults.standard.bool(forKey: permissionKey(name)) { return true }
+        return bundled && mathToolsAllowed && MathTranscriptionService.isMathTool(name)
+    }
+
+    static var mathToolsAllowed: Bool {
+        UserDefaults.standard.object(forKey: SettingsKeys.mathToolsAllowed) as? Bool ?? true
     }
 
     static func allowAlways(_ name: String) {
@@ -110,6 +140,21 @@ enum ChatToolsService {
             throw ChatToolsError.invalidResponse
         }
         return rows.compactMap(BuiltinToolInfo.init(json:))
+    }
+
+    /// The engine tools the settings allow. File tools and the math tools share the /tools endpoint.
+    static func listEnabled(port: Int) async throws -> [BuiltinToolInfo] {
+        let agent = UserDefaults.standard.bool(forKey: SettingsKeys.agentToolsEnabled)
+        let sympy = SymPyToolsService.isEnabled
+        let scientific = ScientificToolsService.isEnabled
+        guard agent || sympy || scientific else { return [] }
+        // a server started before a math switch was turned on has no /tools: not worth failing the chat
+        let tools = agent ? try await list(port: port) : ((try? await list(port: port)) ?? [])
+        return tools.filter {
+            if SymPyToolsService.isTool($0.name) { return sympy }
+            if ScientificToolsService.isTool($0.name) { return scientific }
+            return agent
+        }
     }
 
     static func execute(name: String, arguments: [String: Any], port: Int,

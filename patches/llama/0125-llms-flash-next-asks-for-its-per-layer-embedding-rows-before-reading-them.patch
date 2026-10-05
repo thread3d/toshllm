@@ -1,0 +1,130 @@
+diff --git a/src/models/models.h b/src/models/models.h
+index 2643486cf..f835af1c4 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2403,10 +2403,13 @@ struct llama_model_qwen4exp : public llama_model_base {
+     class llm_graph_input_qsa;
+ 
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+ 
++    // the PLE table stays in the file mapping instead of being loaded
++    bool ple_lazy = false;
++
+     struct graph : public llm_build_delta_net_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+     protected:
+         struct no_build_t {};
+         graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index ce94720d4..11e56b3b1 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -3,10 +3,16 @@
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <thread>
++
++#if defined(__APPLE__) || defined(__linux__)
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
+ 
+ // bad metadata must be catchable: GGML_ASSERT aborts the whole process
+ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+     if (value == 0) {
+         throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
+@@ -205,10 +211,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+             ple_rows = ple_w->tensor->ne[1];
+         }
+ 
+         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
++        ple_lazy = per_layer_tok_embd != nullptr && ml.lazy.has(per_layer_tok_embd);
+     }
+ 
+     const int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+ 
+     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
+@@ -1299,10 +1306,59 @@ public:
+ 
+     // scratch, reused across set_input() calls
+     std::vector<llama_token> prev;
+ };
+ 
++// The table is mapped from the file and read row by row. Asking for the pages first lets the
++// reads run together instead of one blocking fault per row.
++static void qwen4exp_ple_prefetch(const ggml_tensor * table, const std::vector<int32_t> & rows) {
++#if defined(__APPLE__) || defined(__linux__)
++    if (table == nullptr || table->data == nullptr) {
++        return;
++    }
++    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
++    const size_t row_size = ggml_row_size(table->type, table->ne[0]);
++
++    // a row may straddle two pages, so both ends are asked for
++    std::vector<uintptr_t> pages;
++    pages.reserve(rows.size() * 2);
++    for (const int32_t r : rows) {
++        const uintptr_t first = (uintptr_t) table->data + (size_t) r * row_size;
++        pages.push_back(first & ~(page - 1));
++        pages.push_back((first + row_size - 1) & ~(page - 1));
++    }
++    std::sort(pages.begin(), pages.end());
++    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++
++    auto advise = [&](size_t begin, size_t end) {
++        for (size_t i = begin; i < end; ++i) {
++            madvise((void *) pages[i], page, MADV_WILLNEED);
++        }
++    };
++
++    // the request itself costs time per page, which a prompt-sized batch spreads over a few threads
++    constexpr size_t n_threads   = 4;
++    constexpr size_t min_threads = 2048;
++    if (pages.size() < min_threads) {
++        advise(0, pages.size());
++        return;
++    }
++    std::vector<std::thread> workers;
++    const size_t step = (pages.size() + n_threads - 1) / n_threads;
++    for (size_t t = 1; t < n_threads; ++t) {
++        workers.emplace_back(advise, std::min(pages.size(), t * step), std::min(pages.size(), (t + 1) * step));
++    }
++    advise(0, std::min(pages.size(), step));
++    for (auto & w : workers) {
++        w.join();
++    }
++#else
++    GGML_UNUSED(table);
++    GGML_UNUSED(rows);
++#endif
++}
++
+ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+     const auto & hp = pmodel.hparams;
+ 
+     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
+     // stand in the image token id that the reference hashes, or EOS if the file has no such key
+@@ -1359,10 +1415,18 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+                     (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+             }
+         }
+     }
+ 
++    static const bool prefetch = [] {
++        const char * v = getenv("TOSH_PLE_PREFETCH");
++        return v == nullptr || atoi(v) != 0;
++    }();
++    if (prefetch && pmodel.ple_lazy) {
++        qwen4exp_ple_prefetch(pmodel.per_layer_tok_embd, idx);
++    }
++
+     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+ }
+ 
+ // Read a conv history out of its own recurrent row and write the new tail back.
+ // The shared build_conv_state cannot do this: qwen4exp has two such rows per layer.

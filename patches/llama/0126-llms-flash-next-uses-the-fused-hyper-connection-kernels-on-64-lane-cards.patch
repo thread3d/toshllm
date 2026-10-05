@@ -1,0 +1,160 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index bca75d76b..2f2f250a1 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -546,21 +546,31 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
+ 
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char name[256];
+     const char * base = nullptr;
+ 
++    const bool w64 = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width == 64;
++
+     switch (op->op) {
+         case GGML_OP_DSV4_HC_COMB:
+             base = "kernel_dsv4_hc_comb_f32";
+             snprintf(name, 256, "%s", base);
+             break;
+         case GGML_OP_DSV4_HC_PRE:
+-            base = ggml_get_op_params_i32(op, 1) != 0 ? "kernel_dsv4_hc_pre_gated_f32" : "kernel_dsv4_hc_pre_f32";
++            if (w64) {
++                base = ggml_get_op_params_i32(op, 1) != 0 ? "kernel_dsv4_hc_pre_gated_f32_w64" : "kernel_dsv4_hc_pre_f32_w64";
++            } else {
++                base = ggml_get_op_params_i32(op, 1) != 0 ? "kernel_dsv4_hc_pre_gated_f32" : "kernel_dsv4_hc_pre_f32";
++            }
+             snprintf(name, 256, "%s_n_hc=%d", base, (int) op->src[0]->ne[1]);
+             break;
+         case GGML_OP_DSV4_HC_POST:
+-            base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
++            if (w64 && !op->src[3]) {
++                base = "kernel_dsv4_hc_post_nocomb_f32_w64";
++            } else {
++                base = op->src[3] ? "kernel_dsv4_hc_post_f32" : "kernel_dsv4_hc_post_nocomb_f32";
++            }
+             snprintf(name, 256, "%s", base);
+             break;
+         default:
+             GGML_ABORT("fatal error");
+     }
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index a4b6f1937..b37b6c638 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -2873,18 +2873,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                 op->src[2]->ne[0] == 24 &&
+                 ggml_is_contiguous_rows(op->src[0]) &&
+                 ggml_is_contiguous_rows(op->src[1]) &&
+                 ggml_is_contiguous_rows(op->src[2]);
+         case GGML_OP_DSV4_HC_PRE:
+-            return has_simdgroup_reduction &&
++            return (has_simdgroup_reduction || wave64_decode) &&
+                 op->src[0]->type == GGML_TYPE_F32 &&
+                 op->src[1]->type == GGML_TYPE_F32 &&
+                 op->type         == GGML_TYPE_F32 &&
+                 ggml_is_contiguous_rows(op->src[0]) &&
+                 ggml_is_contiguous_rows(op->src[1]);
+         case GGML_OP_DSV4_HC_POST:
+-            return has_simdgroup_reduction &&
++            // 64-lane cards only have the kernel without a combination matrix
++            return (has_simdgroup_reduction || (wave64_decode && op->src[3] == NULL)) &&
+                 op->src[0]->type == GGML_TYPE_F32 &&
+                 op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 &&
+                 (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F32) &&
+                 op->type         == GGML_TYPE_F32 &&
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 80dfc2aaf..562e60eee 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -820,10 +820,91 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
+         const float rv = *(device const float *) (rb + idst*args.nb_r1);
+         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = xv*post_reg[idst] + rv;
+     }
+ }
+ 
++// 64-lane cards: the same three kernels indexed by thread position, with no SIMD-group lanes.
++kernel void kernel_dsv4_hc_pre_f32_w64(
++        constant ggml_metal_kargs_dsv4_hc_pre & args,
++        device const char * x,
++        device const char * weights,
++        device       char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    const int it = tgpig.y;
++    const int i0 = ((int) tgpig.x*ntg.y + tpitg.y)*ntg.x + tpitg.x;
++
++    if (i0 >= args.n_embd) {
++        return;
++    }
++
++    device const char * xb = x + i0*args.nb_x0 + it*args.nb_x2;
++    float result = 0.0f;
++    FOR_UNROLL (int ih = 0; ih < FC_dsv4_hc_n_hc; ++ih) {
++        const float xv = *(device const float *) (xb + ih*args.nb_x1);
++        const float wv = *(device const float *) (weights + ih*args.nb_w0 + it*args.nb_w1);
++        result = fma(xv, wv, result);
++    }
++
++    *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
++}
++
++kernel void kernel_dsv4_hc_pre_gated_f32_w64(
++        constant ggml_metal_kargs_dsv4_hc_pre & args,
++        device const char * x,
++        device const char * gate,
++        device       char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    const int it = tgpig.y;
++    const int i0 = ((int) tgpig.x*ntg.y + tpitg.y)*ntg.x + tpitg.x;
++
++    if (i0 >= args.n_embd) {
++        return;
++    }
++
++    device const char * xb = x    + i0*args.nb_x0 + it*args.nb_x2;
++    device const char * gb = gate + i0*args.nb_w0 + it*args.nb_w2;
++    float result = 0.0f;
++    FOR_UNROLL (int ih = 0; ih < FC_dsv4_hc_n_hc; ++ih) {
++        const float g  = 1.0f/(1.0f + exp(-*(device const float *) (gb + ih*args.nb_w1)));
++        const float xv = *(device const float *) (xb + ih*args.nb_x1);
++        result = fma(xv, g, result);
++    }
++
++    *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
++}
++
++kernel void kernel_dsv4_hc_post_nocomb_f32_w64(
++        constant ggml_metal_kargs_dsv4_hc_post & args,
++        device const char * x,
++        device const char * residual,
++        device const char * post,
++        device       char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    constexpr ushort hc = 4;
++
++    const int it = tgpig.y;
++    const int i0 = ((int) tgpig.x*ntg.y + tpitg.y)*ntg.x + tpitg.x;
++
++    if (i0 >= args.n_embd) {
++        return;
++    }
++
++    const float xv = *(device const float *) (x + i0*args.nb_x0 + it*args.nb_x1);
++    device const char * rb = residual + i0*args.nb_r0 + it*args.nb_r2;
++    FOR_UNROLL (ushort idst = 0; idst < hc; ++idst) {
++        const float pv = *(device const float *) (post + idst*args.nb_p0 + it*args.nb_p1);
++        const float rv = *(device const float *) (rb + idst*args.nb_r1);
++        *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = xv*pv + rv;
++    }
++}
++
+ kernel void kernel_dsv4_hc_post_f32(
+         constant ggml_metal_kargs_dsv4_hc_post & args,
+         device const char * x,
+         device const char * residual,
+         device const char * post,

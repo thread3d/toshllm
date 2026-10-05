@@ -25,10 +25,6 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.prefetchExperts) private var prefetchExperts = true
     @AppStorage(SettingsKeys.ubatch) private var ubatch = 0
     @AppStorage(SettingsKeys.routerMode) private var routerMode = false
-    @AppStorage(SettingsKeys.dynamicMoe) private var dynamicMoe = false
-    @AppStorage(SettingsKeys.dynamicMoeSlots) private var dynamicMoeSlots = 8
-    @AppStorage(SettingsKeys.dynamicMoePrefetch) private var dynamicMoePrefetch = 4
-    @AppStorage(SettingsKeys.dynamicMoePolicy) private var dynamicMoePolicy = "cache"
     @AppStorage(SettingsKeys.persistCache) private var persistCache = false
     @AppStorage(SettingsKeys.port) private var port = 8080
     @AppStorage(SettingsKeys.ngl) private var ngl = 99
@@ -58,7 +54,13 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.imageMaxTokens) private var imageMaxTokens = 0
     @AppStorage(SettingsKeys.parallelSlots) private var parallelSlots = 1
     @AppStorage(SettingsKeys.reasoningInline) private var reasoningInline = false
+    @AppStorage(SettingsKeys.serverDefaultReasoning) private var serverDefaultReasoning = "model"
+    @AppStorage(SettingsKeys.serverDefaultMaxTokens) private var serverDefaultMaxTokens = 0
     @AppStorage(SettingsKeys.modelPath) private var modelPath = ""
+    @AppStorage(SettingsKeys.dynamicMoeEnabled) private var dynamicMoeEnabled = false
+    @AppStorage(SettingsKeys.executionMode) private var executionMode = "auto"
+    @AppStorage(SettingsKeys.autoKVMode) private var autoKVMode = "auto"
+    @AppStorage(SettingsKeys.dynamicMoeLeanRAM) private var dynamicMoeLeanRAM = false
     @AppStorage(SettingsKeys.modelsDir) private var modelsDir = ""
     @AppStorage(SettingsKeys.menuBarIcon) private var menuBarIcon = true
     @AppStorage(SettingsKeys.updateAutoCheck) private var updateAutoCheck = true
@@ -72,15 +74,7 @@ struct SettingsView: View {
     @State private var settingsDestination: SettingsDestination = .general
 
     private var availableKVTypes: [String] {
-        // Only f16/q8_0/q4_0 have an FA-AMD KV kernel; the rest fall back to a much
-        // slower path. An already-selected type stays listed so the field is not blank.
-        if ServerSettings.isAppleSilicon { return ["f16", "q8_0", "q4_0"] }
-        var types = ["f16", "q8_0", "q4_0"]
-        if !modelPath.isEmpty && ServerSettings.modelSupportsTurboKV(at: modelPath) {
-            types += ["turbo4", "turbo3"]
-        }
-        for t in [cacheTypeK, cacheTypeV] where !types.contains(t) { types.append(t) }
-        return types
+        ServerSettings.kvTypeChoices(modelPath: modelPath, selected: [cacheTypeK, cacheTypeV])
     }
     /// Why the chosen KV combination cannot run, so the warning names the actual
     /// cause instead of listing every reason a type might be unavailable. Uses the
@@ -148,66 +142,6 @@ struct SettingsView: View {
     }
     private var kvNeedsFlashAttention: Bool { cacheTypeK != "f16" || cacheTypeV != "f16" }
     private var amdFlashActive: Bool { faAmd }
-    private var dynamicMoeUIUnlocked: Bool {
-        ShellWords.split(extraArgs).contains("TOSH_MOE_UI=1")
-    }
-    private func dynamicMoeSlotBinding(settings: ServerSettings) -> Binding<Int> {
-        Binding(
-            get: { settings.effectiveDynamicMoeSlots },
-            set: { v in
-                guard let info = settings.dynamicMoeModelInfo else { dynamicMoeSlots = v; return }
-                let floor = min(max(info.activeExpertCount, 1), info.expertCount)
-                dynamicMoeSlots = min(max(v, floor), info.expertCount)
-            })
-    }
-    private func gibLabel(_ bytes: UInt64) -> String {
-        String(format: "%.2f GiB", Double(bytes) / 1_073_741_824)
-    }
-    private func dynamicMoeIsEffective(settings: ServerSettings) -> Bool {
-        dynamicMoe && dynamicMoeUIUnlocked
-            && (dynamicMoePolicy != "auto" || settings.dynamicMoeAutoRoute == .cache)
-    }
-    private func dynamicMoeAutoMessage(settings: ServerSettings) -> String {
-        switch settings.dynamicMoeAutoRoute {
-        case .cache:
-            if let profile = settings.dynamicMoeOptimizationProfile {
-                return profile.route == .split
-                    ? loc.t("Auto usa el perfil optimizado dividido K%@ + ring%@. El mapa seguirá adaptándose durante el uso.", "Auto uses the optimized split profile K%@ + ring%@. The map keeps adapting during use.", "\(profile.slots)", "\(profile.ringSlots)")
-                    : loc.t("Auto usa el perfil directo K%@, porque el banco de expertos cabe en la ventana Metal.", "Auto uses the direct K%@ profile because the expert bank fits in the Metal window.", "\(profile.slots)")
-            }
-            return loc.t("Auto eligió caché dinámica: el modelo no cabe con margen en VRAM y hay RAM suficiente.",
-                         "Auto selected dynamic cache: the model does not fit in VRAM with headroom and enough RAM is available.")
-        case .normalDense:
-            return loc.t("Auto eligió normal: el modelo no es MoE.", "Auto selected normal: the model is not MoE.")
-        case .normalFitsVRAM:
-            return loc.t("Auto eligió normal: el modelo cabe en VRAM con el margen configurado.",
-                  "Auto selected normal: the model fits in VRAM with the configured headroom.")
-        case .normalInsufficientRAM:
-            return loc.t("Auto eligió normal: no hay RAM física suficiente para fijar el banco de expertos.",
-                  "Auto selected normal: there is not enough physical RAM to pin the expert bank.")
-        case .normalUnsupportedGPU:
-            return loc.t("Auto eligió normal: se necesita una GPU discreta compatible.",
-                  "Auto selected normal: a compatible discrete GPU is required.")
-        case .normalMissingModel:
-            return loc.t("Auto espera un modelo válido para decidir.", "Auto is waiting for a valid model before deciding.")
-        case .normalSplitOrRouter:
-            return loc.t("Auto eligió normal: Dynamic MoE aún no admite split ni router.",
-                  "Auto selected normal: Dynamic MoE does not support split or router yet.")
-        case .normalMissingMetadata:
-            return loc.t("Auto eligió normal: el GGUF no declara capas, expertos totales y expertos activos.",
-                  "Auto selected normal: the GGUF does not declare layers, total experts, and active experts.")
-        case .normalInsufficientVRAM:
-            return loc.t("Auto eligió normal: ni la caché mínima de expertos cabe con los márgenes configurados.",
-                  "Auto selected normal: even the minimum expert cache does not fit with the configured headroom.")
-        case .normalNoCacheBenefit:
-            return loc.t("Auto eligió normal: todos los expertos de la capa están activos y la caché no reduciría VRAM.",
-                  "Auto selected normal: every expert in the layer is active, so the cache would not reduce VRAM.")
-        case .normalOversizedHostBank:
-            return loc.t("Auto eligió normal: el banco de expertos supera la ventana Metal validada para esta GPU.",
-                  "Auto selected normal: the expert bank exceeds the validated Metal window for this GPU.")
-        }
-    }
-
     private var engineSelection: Binding<String> {
         Binding(
             get: { engineKind },
@@ -218,7 +152,6 @@ struct SettingsView: View {
                     faAmd = ServerSettings.defaultFaAmd
                 } else {
                     faAmd = false
-                    dynamicMoe = false
                 }
             })
     }
@@ -477,8 +410,8 @@ struct SettingsView: View {
                     }
                     SettingsRow(icon: "terminal",
                                 title: loc.t("Argumentos extra", "Extra arguments"),
-                                help: loc.t("Argumentos adicionales de llama-server separados por espacios. Un token CLAVE=VALOR se aplica como variable de entorno. Para mostrar la configuración privada de Dynamic MoE escribe TOSH_MOE_UI=1. En tarjetas GCN/Vega con texto corrupto, GGML_METAL_WAVE64_SAFEMODE=1 fuerza la ruta segura.",
-                                            "Additional llama-server arguments, space-separated. A KEY=VALUE token is applied as an environment variable. To reveal the private Dynamic MoE settings, enter TOSH_MOE_UI=1. On GCN/Vega cards with corrupted text, GGML_METAL_WAVE64_SAFEMODE=1 forces the safe path.")) {
+                                help: loc.t("Argumentos adicionales de llama-server separados por espacios. Un token CLAVE=VALOR se aplica como variable de entorno. En tarjetas GCN/Vega con texto corrupto, GGML_METAL_WAVE64_SAFEMODE=1 fuerza la ruta segura.",
+                                            "Additional llama-server arguments, space-separated. A KEY=VALUE token is applied as an environment variable. On GCN/Vega cards with corrupted text, GGML_METAL_WAVE64_SAFEMODE=1 forces the safe path.")) {
                         DeferredSettingsTextField("", text: $extraArgs,
                                                   width: 240, monospaced: true)
                     }
@@ -644,12 +577,6 @@ struct SettingsView: View {
             }
 
             if settingsDestination == .models {
-            let dynamicSettings = ServerSettings.fromDefaults()
-            let dynamicRoute = dynamicSettings.dynamicMoeAutoRoute
-            let dynamicInfo = dynamicSettings.dynamicMoeModelInfo
-            let dynamicPlan = dynamicSettings.dynamicMoeSlotPlan()
-            let effectiveSlots = dynamicSettings.effectiveDynamicMoeSlots
-            let slotBinding = dynamicMoeSlotBinding(settings: dynamicSettings)
             Section(loc.t("Perfiles", "Profiles")) {
                 ProfileNameField()
                 ForEach(profileStore.profiles) { p in
@@ -682,6 +609,41 @@ struct SettingsView: View {
                             .tint(.red)
                             .accessibilityLabel(loc.t("Eliminar el perfil", "Delete the profile"))
                     }
+                }
+            }
+
+            Section(loc.t("Rendimiento y memoria", "Performance & Memory")) {
+                Toggle(loc.t("Dynamic MoE (experimental)", "Dynamic MoE (experimental)"), isOn: $dynamicMoeEnabled)
+                    .settingsGlyph("wand.and.stars")
+                    .infoTip(loc.t("Apagado: los modelos MoE usan la descarga de expertos estándar con tus ajustes de abajo. Encendido: el motor usa GPU, RAM y el propio archivo del modelo para que quepa; guarda en VRAM los expertos más usados y en RAM lo que la máquina puede dar ahora, elige KV y lote, y si nada cabe con seguridad no carga el modelo y dice por qué.",
+                                "Off: MoE models use the standard expert offload with your settings below. On: the engine uses the GPU, RAM and the model file itself to fit the model; it keeps the most used experts in VRAM and in RAM what the machine can give right now, picks the KV and batch size, and when nothing fits safely it does not load the model and says why."))
+                if dynamicMoeEnabled {
+                    LabeledContent(loc.t("Ejecución", "Execution")) {
+                        ToshDropdown(selection: $executionMode, options: [
+                            .init(value: "auto", title: loc.t("Auto", "Auto")),
+                            .init(value: "full", title: loc.t("GPU completa (manual)", "Full GPU (manual)")),
+                            .init(value: "dmoe", title: "Dynamic MoE"),
+                            .init(value: "legacy", title: loc.t("Expertos en CPU (clásico)", "Legacy offload"))
+                        ], width: 200)
+                    }
+                    .settingsGlyph("cpu")
+                    .infoTip(loc.t("Auto elige solo. GPU completa carga todo en la GPU aunque deje poco margen (para pruebas). Dynamic MoE lo fuerza en modelos MoE. Expertos en CPU usa el ajuste manual de ncmoe de abajo.",
+                                "Auto decides on its own. Full GPU loads everything on the GPU even with little headroom (for testing). Dynamic MoE forces it on MoE models. Legacy offload uses the manual ncmoe setting below."))
+                    LabeledContent(loc.t("KV cache", "KV cache")) {
+                        ToshDropdown(selection: $autoKVMode, options: [
+                            .init(value: "auto", title: loc.t("Auto", "Auto")),
+                            .init(value: "f16", title: "F16"),
+                            .init(value: "q8_0", title: "Q8"),
+                            .init(value: "turbo4", title: loc.t("Turbo4 (ahorro de memoria)", "Turbo4 (memory saver)"))
+                        ], width: 200)
+                    }
+                    .settingsGlyph("key")
+                    .infoTip(loc.t("Auto usa F16 y pasa a Q8 solo cuando libera memoria que de verdad importa (Q8 no cambia la calidad de forma medible). Turbo4 ahorra más memoria a cambio de algo de velocidad y calidad; nunca se elige solo.",
+                                "Auto uses F16 and moves to Q8 only when that frees memory that really matters (Q8 has no measurable quality cost). Turbo4 saves more memory at some speed and quality cost; it is never chosen automatically."))
+                    Toggle(loc.t("Ahorrar RAM", "Save RAM"), isOn: $dynamicMoeLeanRAM)
+                        .settingsGlyph("memorychip")
+                        .infoTip(loc.t("Apagado: si caben, todos los expertos se quedan en RAM, también los que ya están en VRAM. Encendido: la RAM guarda solo los que no están en VRAM y deja libre el resto para otras apps; genera más lento (entre un 11 y un 17% en un modelo de 35B) y el primer prompt tras cargar tarda más.",
+                                    "Off: when they fit, every expert stays in RAM, also the ones already in VRAM. On: RAM keeps only the ones that are not in VRAM and leaves the rest free for other apps; generation is slower (11 to 17% on a 35B model) and the first prompt after loading takes longer."))
                 }
             }
 
@@ -813,85 +775,7 @@ struct SettingsView: View {
                     .settingsGlyph("cpu")
                     .infoTip(loc.t("Solo modelos MoE: capas cuyos 'expertos' viven en RAM y los procesa el CPU. Se ajusta solo al elegir modelo; súbelo si la VRAM se satura, bájalo si te sobra. (Deshabilitado en modelos densos, donde el motor lo ignora.)",
                                 "MoE models only: layers whose 'experts' live in RAM and run on the CPU. Auto-set when picking a model; raise if VRAM saturates, lower if you have headroom. (Disabled on dense models, where the engine ignores it.)"))
-                    .disabled(!modelIsMoE || dynamicMoeIsEffective(settings: dynamicSettings))
-                if engineSelection.wrappedValue != "custom" && dynamicMoeUIUnlocked {
-                    Toggle(loc.t("Dynamic MoE (experimental)", "Dynamic MoE (experimental)"),
-                           isOn: $dynamicMoe)
-                        .disabled(!modelIsMoE)
-                        .settingsGlyph("wand.and.stars")
-                        .infoTip(loc.t("Mantiene todos los expertos cuantizados en RAM y una caché pequeña en VRAM. Está apagado por defecto. Al activarlo usa ncmoe 1, mlock y el override Metal requeridos; desactívalo para volver al camino normal con el mismo binario.",
-                                    "Keeps all quantized experts in RAM and a small cache in VRAM. It is off by default. Enabling it applies ncmoe 1, mlock, and the required Metal override; turn it off to return to the normal path with the same binary."))
-                    if dynamicMoe {
-                        LabeledContent(loc.t("Política", "Policy")) {
-                            ToshDropdown(selection: $dynamicMoePolicy, options: [
-                                .init(value: "auto", title: loc.t("Automática", "Automatic")),
-                                .init(value: "cache", title: loc.t("Caché manual", "Manual cache"))
-                            ])
-                        }
-                        .settingsGlyph("slider.horizontal.3")
-                        .infoTip(loc.t("Auto reutiliza el perfil medido por Optimizar dMoE. Puede elegir la ruta directa cuando el banco cabe o la ruta dividida para modelos grandes. Sin perfil usa una configuración conservadora; Caché manual permite experimentar.",
-                                    "Auto reuses the profile measured by Optimize dMoE. It can choose the direct route when the bank fits or the split route for large models. Without a profile it uses a conservative configuration; Manual cache remains available for experiments."))
-                        if dynamicMoePolicy == "auto" {
-                            Label(dynamicMoeAutoMessage(settings: dynamicSettings),
-                                  systemImage: dynamicRoute == .cache ? "bolt.horizontal.fill" : "checkmark.shield")
-                                .font(.caption)
-                                .foregroundStyle(dynamicRoute == .cache ? .orange : .secondary)
-                            if dynamicRoute == .cache, let plan = dynamicPlan {
-                                Label(loc.t("Auto usa K%@ de %@ expertos por capa (top-%@); estimado %@ de VRAM.", "Auto uses K%@ of %@ experts per layer (top-%@); estimated %@ VRAM.", "\(plan.automaticSlots)", "\(plan.maximumSlots)", "\(plan.minimumSlots)", "\(gibLabel(plan.estimatedVRAMBytes(slots: plan.automaticSlots)))"),
-                                      systemImage: "memorychip")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                        } else {
-                            if let info = dynamicInfo {
-                                HStack {
-                                    Text(loc.t("Ranuras en VRAM (K, de %@)", "VRAM slots (K, of %@)", "\(info.expertCount)"))
-                                    Spacer()
-                                    DeferredSettingsIntegerField(
-                                        value: slotBinding,
-                                        in: info.activeExpertCount...info.expertCount,
-                                        width: 64)
-                                    Stepper("", value: slotBinding,
-                                            in: info.activeExpertCount...info.expertCount)
-                                        .labelsHidden()
-                                }
-                                    .infoTip(loc.t("K es por capa. El mínimo es el número de expertos activos por token (top-%@) y el máximo es el total real del GGUF (%@).",
-                                                        "K is per layer. The minimum is the experts active per token (top-%@); the maximum is the GGUF's real total (%@).",
-                                                        String(info.activeExpertCount), String(info.expertCount)))
-                                if let plan = dynamicPlan {
-                                    let overBudget = effectiveSlots > plan.recommendedMaximumSlots
-                                    Label(loc.t("Estimación: %@ · máximo recomendado K%@.", "Estimate: %@ · recommended maximum K%@.", "\(gibLabel(plan.estimatedVRAMBytes(slots: effectiveSlots)))", "\(plan.recommendedMaximumSlots)"),
-                                          systemImage: overBudget ? "exclamationmark.triangle.fill" : "memorychip")
-                                        .font(.caption)
-                                        .foregroundStyle(overBudget ? .orange : .secondary)
-                                } else {
-                                    Label(loc.t("La caché mínima top-%@ supera el presupuesto estimado; el modo manual permite probarla, pero puede agotar la VRAM.", "The minimum top-%@ cache exceeds the estimated budget; manual mode still allows testing it, but it may exhaust VRAM.", "\(info.activeExpertCount)"),
-                                          systemImage: "exclamationmark.triangle.fill")
-                                        .font(.caption).foregroundStyle(.orange)
-                                }
-                            } else {
-                                Label(loc.t("Este GGUF no declara los metadatos necesarios para calcular K de forma segura.",
-                                            "This GGUF does not declare the metadata needed to calculate K safely."),
-                                      systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption).foregroundStyle(.orange)
-                            }
-                            LabeledContent(loc.t("Prefetch de Dynamic MoE", "Dynamic MoE prefetch")) {
-                                ToshDropdown(selection: $dynamicMoePrefetch, options: [0, 1, 2, 3, 4, 5, 6, 8, 12, 16].map {
-                                    .init(value: $0, title: "\($0)")
-                                }, width: 130)
-                            }
-                            .settingsGlyph("arrow.down.circle")
-                            .infoTip(loc.t("Número de bancos anticipados durante el prompt. Cuatro fue el óptimo medido para K8; los demás valores sirven para repetir el barrido desde Benchmarks.",
-                                        "Number of banks prefetched during prompt processing. Four was the measured optimum for K8; the other values let you repeat the sweep from Benchmarks."))
-                        }
-                        Label(dynamicMoePolicy == "auto"
-                                ? loc.t("Auto: perfil medido y adaptación continua", "Auto: measured profile with continuous adaptation")
-                                : loc.t("Configuración efectiva: cache · mlock · NCB8",
-                                        "Effective configuration: cache · mlock · NCB8"),
-                              systemImage: "flask.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                }
+                    .disabled(!modelIsMoE || (dynamicMoeEnabled && executionMode != "legacy"))
                 Stepper(loc.t("Reserva de VRAM: %@ MB", "VRAM reserve: %@ MB", "\(vramReserve)"),
                         value: $vramReserve, in: 256...4096, step: 256)
                     .settingsGlyph("gauge.with.needle")
@@ -933,8 +817,8 @@ struct SettingsView: View {
             if settingsDestination == .inference {
             Section {
                 LabeledContent(loc.t("Contexto", "Context")) {
-                    ToshDropdown(selection: $ctx, options: [4096, 8192, 16384, 32768, 65536, 131072, 262144].map {
-                        .init(value: $0, title: "\($0 / 1024)k tokens")
+                    ToshDropdown(selection: $ctx, options: ServerSettings.contextChoices(modelPath: modelPath).map {
+                        .init(value: $0, title: "\(ServerSettings.contextLabel($0)) tokens")
                     })
                 }
                 .settingsGlyph("text.alignleft")
@@ -1083,6 +967,29 @@ struct SettingsView: View {
                     .settingsGlyph("brain")
                     .infoTip(loc.t("Envía el razonamiento dentro de la respuesta (<think>…) en vez del campo aparte reasoning_content. Actívalo si un cliente externo (VS Code, plugins) se queda 'pensando' sin mostrar nada. El chat de la app entiende ambos formatos.",
                                 "Sends the reasoning inline in the response (<think>…) instead of the separate reasoning_content field. Enable it if an external client (VS Code, plugins) appears stuck 'thinking' showing nothing. The in-app chat understands both formats."))
+                LabeledContent(loc.t("Razonamiento por defecto", "Default reasoning")) {
+                    ToshDropdown(selection: $serverDefaultReasoning, options: [
+                        .init(value: "model", title: loc.t("El del modelo", "Model default")),
+                        .init(value: "off", title: loc.t("Desactivado", "Off")),
+                        .init(value: "low", title: loc.t("Bajo", "Low")),
+                        .init(value: "medium", title: loc.t("Medio", "Medium")),
+                        .init(value: "high", title: loc.t("Alto", "High")),
+                    ])
+                }
+                .settingsGlyph("brain.head.profile")
+                .infoTip(loc.t("Nivel de razonamiento para las peticiones que no eligen uno, como las de VS Code o muchos agentes. Una petición que lo indica siempre gana. Los niveles solo cambian algo en modelos cuya plantilla los acepta; «Desactivado» funciona en todos los que razonan.",
+                            "Reasoning level for requests that do not choose one, such as those from VS Code or many agents. A request that sets it always wins. Levels only change anything on models whose template accepts them; Off works on every reasoning model."))
+                LabeledContent(loc.t("Longitud máxima por defecto", "Default response limit")) {
+                    ToshDropdown(selection: $serverDefaultMaxTokens, options: [
+                        .init(value: 0, title: loc.t("Sin límite", "No limit")),
+                        .init(value: 2048, title: "2K"), .init(value: 4096, title: "4K"),
+                        .init(value: 8192, title: "8K"), .init(value: 16384, title: "16K"),
+                        .init(value: 32768, title: "32K"),
+                    ])
+                }
+                .settingsGlyph("text.append")
+                .infoTip(loc.t("Tokens de respuesta para las peticiones que no fijan max_tokens. Evita que un cliente sin límite deje al modelo razonando o escribiendo sin fin. El chat de la app usa su propio límite.",
+                            "Response tokens for requests that do not set max_tokens. It keeps a client without a limit from leaving the model reasoning or writing without end. The in-app chat uses its own limit."))
                 Toggle(loc.t("Plantilla de chat (--jinja)", "Chat template (--jinja)"), isOn: $jinja)
                     .infoTip(loc.t("Usa la plantilla de chat oficial del modelo (formato de mensajes, herramientas). Déjalo activado salvo problemas con un modelo concreto.",
                                 "Uses the model's official chat template (message format, tools). Keep it on unless a specific model misbehaves."))

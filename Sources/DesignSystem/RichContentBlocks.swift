@@ -111,11 +111,18 @@ private struct RichContentPreview: View {
 
 struct InlineMathText: View {
     let source: String
+    var base: ChatFont.Base = .body
+    var bold = false
     @State private var height: CGFloat = 24
+    @State private var baseline: CGFloat = 0
+    @Environment(\.chatFontScale) private var scale
 
     var body: some View {
-        RichWebView(source: source, kind: .inlineMath, contentHeight: $height)
-            .frame(height: min(max(height, 20), 360))
+        RichWebView(source: source, kind: .inlineMath, contentHeight: $height,
+                    fontSize: base.points * scale, bold: bold, firstBaseline: $baseline)
+            .frame(height: min(max(height, 16), 360))
+            // Lines up with a list marker beside it.
+            .alignmentGuide(.firstTextBaseline) { d in baseline > 0 ? baseline : d[.firstTextBaseline] }
             .accessibilityLabel(Text(source))
     }
 }
@@ -143,8 +150,11 @@ struct RichWebView: NSViewRepresentable {
     var zoom: CGFloat = 1
     /// Only the expanded preview keeps its own scrolling.
     var scrollsInternally = false
+    var fontSize: CGFloat = 14
+    var bold = false
+    var firstBaseline: Binding<CGFloat>?
 
-    func makeCoordinator() -> Coordinator { Coordinator(height: $contentHeight) }
+    func makeCoordinator() -> Coordinator { Coordinator(height: $contentHeight, baseline: firstBaseline) }
 
     func makeNSView(context: Context) -> RichContentWebView {
         let configuration = WKWebViewConfiguration()
@@ -157,33 +167,52 @@ struct RichWebView: NSViewRepresentable {
         view.navigationDelegate = context.coordinator
         view.allowsMagnification = true
         view.setMagnification(zoom, centeredAt: .zero)
-        context.coordinator.signature = Self.signature(source: source, kind: kind)
-        view.loadHTMLString(Self.html(source: source, kind: kind), baseURL: Self.assetsDirectory)
+        context.coordinator.signature = signature
+        view.loadHTMLString(Self.html(source: source, kind: kind, fontSize: fontSize, bold: bold),
+                            baseURL: Self.assetsDirectory)
         return view
+    }
+
+    static func dismantleNSView(_ view: RichContentWebView, coordinator: Coordinator) {
+        view.stopLoading()
+        view.configuration.userContentController.removeScriptMessageHandler(forName: "height")
     }
 
     func updateNSView(_ view: RichContentWebView, context: Context) {
         view.forwardsVerticalScroll = !scrollsInternally
         context.coordinator.height = $contentHeight
+        context.coordinator.baseline = firstBaseline
         if abs(view.magnification - zoom) > 0.001 {
             view.setMagnification(zoom, centeredAt: CGPoint(x: view.bounds.midX, y: view.bounds.midY))
         }
-        let signature = Self.signature(source: source, kind: kind)
         guard context.coordinator.signature != signature else { return }
         context.coordinator.signature = signature
-        view.loadHTMLString(Self.html(source: source, kind: kind), baseURL: Self.assetsDirectory)
+        view.loadHTMLString(Self.html(source: source, kind: kind, fontSize: fontSize, bold: bold),
+                            baseURL: Self.assetsDirectory)
     }
 
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         var height: Binding<CGFloat>
+        var baseline: Binding<CGFloat>?
         var signature = ""
 
-        init(height: Binding<CGFloat>) { self.height = height }
+        init(height: Binding<CGFloat>, baseline: Binding<CGFloat>? = nil) {
+            self.height = height
+            self.baseline = baseline
+        }
 
         func userContentController(_ userContentController: WKUserContentController,
                                    didReceive message: WKScriptMessage) {
-            guard let value = message.body as? NSNumber else { return }
-            height.wrappedValue = CGFloat(truncating: value) + 20
+            guard let report = message.body as? [String: Any],
+                  let value = report["height"] as? NSNumber else { return }
+            update(height, to: CGFloat(truncating: value))
+            if let baseline, let value = report["baseline"] as? NSNumber {
+                update(baseline, to: CGFloat(truncating: value))
+            }
+        }
+
+        private func update(_ binding: Binding<CGFloat>, to value: CGFloat) {
+            if abs(binding.wrappedValue - value) >= 0.5 { binding.wrappedValue = value }
         }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
@@ -209,11 +238,11 @@ struct RichWebView: NSViewRepresentable {
         return FileManager.default.fileExists(atPath: local.path) ? local : nil
     }
 
-    private static func signature(source: String, kind: RichContentKind) -> String {
-        "\(String(describing: kind)):\(source.hashValue)"
+    private var signature: String {
+        "\(String(describing: kind)):\(fontSize):\(bold):\(source.hashValue)"
     }
 
-    private static func html(source: String, kind: RichContentKind) -> String {
+    static func html(source: String, kind: RichContentKind, fontSize: CGFloat = 14, bold: Bool = false) -> String {
         let encoded = (try? String(data: JSONEncoder().encode(source), encoding: .utf8)) ?? "\"\""
         let payload: String
         switch kind {
@@ -229,15 +258,8 @@ struct RichWebView: NSViewRepresentable {
             <script src="katex/dist/katex.min.js"></script>
             <script src="marked/lib/marked.umd.js"></script>
             <script>
-            const raw = \#(encoded);
-            const formulas = [];
-            const tokenized = raw.replace(/\\\(([^\n]{1,160}?)\\\)|(?<![\\$])\$(?![\s\d])([^\n$]{1,160}?)(?<![\s\\$])\$(?!\$)/g, (match, paren, dollar) => {
-              const body = paren ?? dollar;
-              if (body.length > 3 && !/[\\^_{}]/.test(body)) return match;
-              const token = `TOSHMATH${formulas.length}TOKEN`;
-              formulas.push(body);
-              return token;
-            });
+            \#(RichText.inlineMathScript)
+            const { text: tokenized, formulas } = toshTokenizeMath(\#(encoded));
             const escaped = tokenized.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
             document.getElementById('content').innerHTML = marked.parseInline(escaped, {gfm:true, breaks:true});
             const walker = document.createTreeWalker(document.getElementById('content'), NodeFilter.SHOW_TEXT);
@@ -255,6 +277,8 @@ struct RichWebView: NSViewRepresentable {
               }
               node.replaceWith(fragment);
             }
+            const probe = document.createElement('span'); probe.id = 'toshBaseline';
+            document.getElementById('content').prepend(probe);
             for (const anchor of document.querySelectorAll('a[href]')) {
               const protocol = new URL(anchor.href).protocol;
               if (!['http:', 'https:', 'mailto:'].includes(protocol)) anchor.removeAttribute('href');
@@ -294,16 +318,44 @@ struct RichWebView: NSViewRepresentable {
         <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src data: blob:; connect-src 'none'; media-src 'none'; frame-src 'none'">
         <style>
         :root { color-scheme: light dark; } html,body { margin:0; background:transparent; overflow:auto; }
-        body { padding:\(bodyPadding); font:14px -apple-system, BlinkMacSystemFont, sans-serif; color:CanvasText; }
-        #content { min-width:\(minimumWidth); transform-origin:top left; overflow-wrap:anywhere; }
+        body { padding:\(bodyPadding); font:\(bold ? "bold " : "")\(fontSize)px -apple-system, BlinkMacSystemFont, sans-serif; color:CanvasText; }
+        #content { display:flow-root; min-width:\(minimumWidth); transform-origin:top left; overflow-wrap:anywhere; }
         #content p { margin:0; } .inline-math { white-space:nowrap; }
+        #toshBaseline { display:inline-block; width:0; height:0; }
         svg, .svg-content { display:block; max-width:none; height:auto; }
         </style></head><body><div id="content"></div>
-        <script>function report(){requestAnimationFrame(()=>webkit.messageHandlers.height.postMessage(document.documentElement.scrollHeight));}</script>
-        \(payload)<script>report(); new ResizeObserver(report).observe(document.getElementById('content'));</script>
+        <script>\(heightScript)</script>
+        \(payload)<script>report(); new ResizeObserver(report).observe(document.getElementById('content')); document.fonts.ready.then(report);</script>
         </body></html>
         """
     }
+}
+
+extension RichWebView {
+    /// Measures the content itself: the document's scroll height never drops
+    /// below the frame, so a report based on it could only grow.
+    static let heightScript = """
+    let toshPending = false, toshLast = '';
+    function toshMeasure() {
+      const content = document.getElementById('content');
+      const body = getComputedStyle(document.body);
+      const scrollbar = Math.max(0, window.innerHeight - document.documentElement.clientHeight);
+      return Math.ceil(content.getBoundingClientRect().height
+        + parseFloat(body.paddingTop) + parseFloat(body.paddingBottom) + scrollbar);
+    }
+    function report() {
+      if (toshPending) return;
+      toshPending = true;
+      requestAnimationFrame(() => {
+        toshPending = false;
+        const probe = document.getElementById('toshBaseline');
+        const baseline = probe ? Math.round(probe.getBoundingClientRect().bottom + window.scrollY) : 0;
+        const sizes = { height: toshMeasure(), baseline };
+        const key = sizes.height + ':' + baseline;
+        if (key !== toshLast) { toshLast = key; webkit.messageHandlers.height.postMessage(sizes); }
+      });
+    }
+    """
 }
 
 enum RichContentIsolation {

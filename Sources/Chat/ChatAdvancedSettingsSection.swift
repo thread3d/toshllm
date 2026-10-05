@@ -13,7 +13,12 @@ struct ChatAdvancedSettingsSection: View {
     @AppStorage(SettingsKeys.agentToolsEnabled) private var agentToolsEnabled = false
     @AppStorage(SettingsKeys.toolsRuntime) private var toolsRuntime = ""
     @AppStorage(SettingsKeys.jsSandboxEnabled) private var jsSandboxEnabled = false
+    @AppStorage(SettingsKeys.sympyEnabled) private var sympyEnabled = false
+    @AppStorage(SettingsKeys.scientificEnabled) private var scientificEnabled = false
+    @AppStorage(SettingsKeys.mathAgentEnabled) private var mathAgentEnabled = false
+    @AppStorage(SettingsKeys.mathToolsAllowed) private var mathToolsAllowed = true
     @AppStorage(SettingsKeys.memoryToolsEnabled) private var memoryToolsEnabled = true
+    @AppStorage(SettingsKeys.toolResultLimit) private var toolResultLimit = ToolResultLimit.defaultCharacters
     @State private var blockedToolModels: [String] = ToolSupport.blockedModels
     @AppStorage(SettingsKeys.memoryArchiveHookURL) private var archiveHookURL = ""
     @AppStorage(SettingsKeys.memoryArchiveHookSecret) private var archiveHookSecret = ""
@@ -249,10 +254,44 @@ struct ChatAdvancedSettingsSection: View {
                                        "Adds a tool that runs JavaScript in a sandbox for calculations or data transforms.")) {
                         SettingsToggle(isOn: $jsSandboxEnabled)
                     }
+                    if SymPyToolsService.runtimeDirectory() != nil {
+                        SettingsRow(icon: "function",
+                                    title: loc.t("Matemática simbólica (SymPy)", "Symbolic math (SymPy)"),
+                                    help: loc.t("Añade herramientas de matemática exacta: simplificar, resolver ecuaciones, derivar, integrar, matrices y verificar resultados. Va incluido en la app, no ejecuta código del modelo y no escribe archivos. Apagado no consume nada; encendido, el motor mantiene un proceso auxiliar pequeño y SymPy solo se carga al usarlo. Se aplica al reiniciar el servidor.",
+                                                "Adds exact math tools: simplify, solve equations, differentiate, integrate, matrices and checking results. It ships inside the app, runs no code from the model and writes no files. Off, it uses nothing; on, the engine keeps a small helper process and SymPy loads only when used. Applies when the server restarts.")) {
+                            SettingsToggle(isOn: $sympyEnabled)
+                        }
+                        SettingsRow(icon: "waveform.path.ecg",
+                                    title: loc.t("Cálculo científico (NumPy y SciPy)", "Scientific computing (NumPy and SciPy)"),
+                                    help: loc.t("Añade herramientas de cálculo numérico: álgebra lineal, integración, optimización, ajuste de curvas, FFT y filtros, ecuaciones diferenciales y estadística. Va incluido en la app, no ejecuta código del modelo y no lee ni escribe archivos. Apagado no consume nada; encendido, las librerías solo se cargan al usarlas y calculan en un solo hilo para no frenar al modelo. Se aplica al reiniciar el servidor.",
+                                                "Adds numerical tools: linear algebra, integration, optimization, curve fitting, FFT and filters, differential equations and statistics. It ships inside the app, runs no code from the model and neither reads nor writes files. Off, it uses nothing; on, the libraries load only when used and compute on a single thread so the model is not slowed down. Applies when the server restarts.")) {
+                            SettingsToggle(isOn: $scientificEnabled)
+                        }
+                        if sympyEnabled || scientificEnabled {
+                            SettingsRow(icon: "checkmark.shield",
+                                        title: loc.t("Usar las herramientas matemáticas sin preguntar", "Use the math tools without asking"),
+                                        help: loc.t("Las herramientas matemáticas solo calculan: no leen ni escriben archivos ni ejecutan comandos. Así el agente de Tosh en el motor lleva estos turnos con todas sus comprobaciones. Apagado, el chat pide permiso en cada llamada y lleva el turno él mismo, con las mismas reglas. No cambia los permisos de ninguna otra herramienta.",
+                                                    "The math tools only compute: they neither read nor write files nor run commands. This way the Tosh agent in the engine runs these turns with all its checks. Off, the chat asks before each call and runs the turn itself, with the same rules. It does not change the permissions of any other tool.")) {
+                                SettingsToggle(isOn: $mathToolsAllowed)
+                            }
+                            SettingsRow(icon: "server.rack",
+                                        title: loc.t("Responder con las herramientas por la API", "Answer with the tools over the API"),
+                                        help: loc.t("El agente de Tosh, el mismo que usan este chat y el chat web, responde también a los clientes de /v1/chat/completions que no lo piden con la cabecera X-Tosh-Agent: on, también en remoto y sin la app. Las peticiones que traen herramientas propias (VS Code, agentes) o X-Tosh-Agent: off siguen yendo al modelo tal cual. Se aplica al reiniciar el servidor.",
+                                                    "The Tosh agent, the one this chat and the web chat use, also answers /v1/chat/completions clients that do not ask for it with the X-Tosh-Agent: on header, also remotely and without the app. Requests that bring tools of their own (VS Code, agents) or X-Tosh-Agent: off still go to the model as they are. Applies when the server restarts.")) {
+                                SettingsToggle(isOn: $mathAgentEnabled)
+                            }
+                        }
+                    }
                     integerStepper(loc.t("Turnos máximos del agente", "Maximum agent turns"),
                                    value: $agenticMaxTurns, range: 1...100,
                                    help: loc.t("Máximo de rondas herramienta→respuesta que el agente encadena en un turno antes de detenerse.",
                                                "Maximum tool→response rounds the agent chains in one turn before stopping."))
+                    integerStepper(loc.t("Tope del resultado de una herramienta", "Tool result limit"),
+                                   icon: "scissors",
+                                   value: $toolResultLimit, range: 0...200_000, step: 5_000,
+                                   zeroLabel: loc.t("Sin tope", "None"),
+                                   help: loc.t("Caracteres de cada resultado de herramienta que llegan al modelo. Si se pasa, se envían el principio y el final con una nota de lo recortado; la tarjeta de la herramienta sigue mostrando el resultado entero. Evita que una página web o un listado grande llene el contexto. 0 lo envía entero.",
+                                               "Characters of each tool result that reach the model. Longer results send the beginning and the end with a note of what was cut; the tool card still shows the whole result. Keeps one web page or large listing from filling the context. 0 sends it whole."))
                     if !blockedToolModels.isEmpty {
                         SettingsRow(icon: "hammer.slash",
                                     title: loc.t("Modelos sin herramientas", "Models without tools"),
@@ -454,7 +493,8 @@ struct ChatAdvancedSettingsSection: View {
         backendSampling = false; customJSON = ""; agenticMaxTurns = 10; pasteLongTextLength = 2500
         maxImageMegapixels = 1; pdfAsImages = false
         autoCompact = true; smoothTyping = true; agentToolsEnabled = false; jsSandboxEnabled = false
-        memoryToolsEnabled = true; toolsRuntime = ""
+        sympyEnabled = false; scientificEnabled = false; mathAgentEnabled = false; mathToolsAllowed = true
+        memoryToolsEnabled = true; toolsRuntime = ""; toolResultLimit = ToolResultLimit.defaultCharacters
         archiveHookURL = ""; archiveHookSecret = ""
     }
 }

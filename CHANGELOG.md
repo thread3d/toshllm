@@ -13,6 +13,254 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **LLMs: a model whose keys and values share one cache no longer starts with a KV pair the engine refuses.** DeepSeek-V4 uses MLA but its converter writes plain `attention.key_length`/`value_length` instead of the `*_mla` keys, so the app did not recognise it and let `-ctk q8_0 -ctv turbo4` through; llama.cpp then exited with "model does not support different K (q8_0) and V (turbo4) cache types". The server, the router, both benchmark buttons and the Settings warning now use the engine's own rule (`hparams.is_mla() || arch == LLM_DeepSeek4`) before launching, and Settings offers the matching pair in one click.
 
+- **LLMs: math in the chat no longer leaves blank space under its paragraph**, and resizing the window no longer makes that space grow.
+
+- **LLMs: a numbered list split by paragraphs keeps the numbers it was written with** instead of starting each part at 1.
+
+- **LLMs: formulas inside list items and headings, and numbers such as `$84$`, render as math.** Prices such as `$10` stay as text.
+
+- **LLMs: a long formula or matrix on its own line renders as a formula** instead of its LaTeX source.
+
+## [0.87.15] - 2026-10-03
+
+### Added
+
+- **LLMs: math answers come from one agent in the engine, for the chat, the web chat and the API.** API clients ask for it with `X-Tosh-Agent: on`, also from another computer and without the app; the reply carries a `tosh` object with the intent, every call and the validated results.
+
+### Improved
+
+- **LLMs: a request for a calculation is answered with the math tools.** The model can no longer skip them and write the result from memory; explanations and questions without a calculation are answered as before.
+
+- **LLMs: stopping a math answer also stops its model passes and tool calls in the engine.** So does a client that closes the connection.
+
+- **LLMs: math answers for several clients at once run side by side** instead of one after another.
+
+- **LLMs: the math tools run without asking by default**, so the chat's math turns go through the engine's agent. "Use the math tools without asking" in the chat settings turns it off; no other tool changes.
+
+- **LLMs: the tool calls of a turn show as one block that folds.** It names the tools and counts those without a result; what the model wrote before a call sits inside it, marked as not verified.
+
+### Fixed
+
+- **LLMs: the web chat can no longer run the math tools without their checks.** Its conversations go through the engine's agent, and a page in a browser no longer gets the math tools for a loop of its own.
+
+- **LLMs: a request without streaming stops when its client goes away**, also while other requests keep the engine busy and in router mode.
+
+- **LLMs: the math answers written by the engine follow the language of the conversation.**
+
+- **LLMs: math written in LaTeX is checked like plain text.** A correct call is no longer refused for `\frac`, `\infty` or the limits of `\int`, and list numbers or digit counts in a request no longer count as data.
+
+- **LLMs: a numerical integral can go to infinity.** A call that puts a number such as 100 in place of infinity is refused instead of computed.
+
+- **LLMs: a math call refused once stays refused when the model repeats it.**
+
+- **LLMs: neither an API client nor the model can pass a math call off as checked.** The fields that carry your request to the tools are honoured only from Tosh itself.
+
+- **LLMs: what the model writes before a math call is dropped when the call gives no result.** An exact value written from memory no longer stays on screen after the call that should have computed it was refused.
+
+- **LLMs: a math turn keeps the results it already validated when a later call is refused.** The answer states them and says which parts could not be validated, instead of only saying that nothing could be.
+
+- **LLMs: after math tools, the answer only states numbers from your message or from a validated result.** An answer that adds others goes back to the model once and is otherwise replaced by the validated results, so it shows once it has been checked.
+
+## [0.87.14] - 2026-10-02
+
+### Added
+
+- **LLMs: symbolic math tools with SymPy.** The model can factor, solve equations and differential equations, differentiate, integrate, take limits and work with matrices, all exactly. Off by default, in chat settings under Agents ([details](helpers/tosh-sympy/README.md)).
+
+- **LLMs: numerical tools with NumPy and SciPy.** The model can integrate numerically, find roots, fit curves, run FFTs and filters and compute statistics, sending numbers and never code. Off by default, next to the SymPy switch; the two add 47 MB to the download ([details](helpers/tosh-scientific/README.md)).
+
+- **LLMs: math tool calls are checked against your message before they run.** A call that drops or changes part of the problem is refused instead of computed, and the card shows what was computed. After a refusal the model can only correct the call or ask you.
+
+### Improved
+
+- **LLMs: Qwen3.8-Flash-Next generates about 11% faster on Radeon Pro Vega II.** On a Radeon Pro Vega II Duo it writes at 29.9 tokens a second instead of 26.8 with Tensor Mesh, and at 23.8 instead of 21.6 on one card with Dynamic MoE.
+
+- **LLMs: Qwen3.8-Flash-Next reads text it has not seen before sooner.** On a Radeon Pro Vega II, a new 4000-token document is read at about 197 tokens a second instead of 162.
+
+## [0.87.13] - 2026-10-01
+
+### Added
+
+- **LLMs: the details of a model show when it was published** ([#112](https://github.com/engeldlgado/toshllm/issues/112)). For a quantized file it is the date of the original model on Hugging Face.
+
+- **LLMs: a Save RAM switch for Dynamic MoE.** RAM keeps only the experts that are not in video memory: on a Radeon RX 6700 XT with 32 GB, Qwen3.6-35B-A3B locks 14.3 GB instead of 18.5 and generates 11 to 17% slower. Tables in [Dynamic MoE](docs/performance/0.87.13-dynamic-moe.md).
+
+- **LLMs: default reasoning level and response limit for requests that bring none.** In Settings, next to Reasoning as plain text: VS Code and agents that send no level or no max_tokens get these, and a request that sets its own still wins.
+
+- **LLMs: a context recall test in Benchmarks.** It hides a code at 10%, 50% and 90% of a 8K, 32K or 128K text and asks the running server for it back, to check that a quantized KV cache or a long context still remembers what it read.
+
+### Improved
+
+- **LLMs: long chats with Qwen 3.5 to 3.8 and other hybrid models use less RAM.** Over 14 turns Qwen3.6-35B-A3B grew 1.8 GB instead of 4.1, with the same answers.
+
+- **LLMs: while a server starts, its status says what it is doing and for how long.** Planning memory, loading weights, reserving RAM for the experts (when the Mac may feel slower) and preparing them, instead of a plain "Starting".
+
+- **LLMs: experts computed on the CPU unpack each block of weights once for all the tokens that use it.** It covers Q4_K, Q5_K, Q6_K, Q3_K, IQ4_XS and Q4_0, with the same result bit for bit. With MoE offload, Qwen3.6-35B-A3B reads short prompts 9% faster and generates 1 to 2% faster with its MTP head. Dynamic MoE uses them too, and its CPU part of each layer takes 4 to 7% less.
+
+- **LLMs: Dynamic MoE leaves the CPU cores to the experts it computes there.** The engine's own CPU threads had little to do and competed with them for the cores. On a Radeon RX 6700 XT with a 6-core Core i5, Qwen3.6-35B-A3B writes prose 12% faster and code 7% faster.
+
+- **LLMs: Qwen3.8-Flash-Next uses its MTP head under Dynamic MoE.** On one card of a Radeon Pro Vega II Duo it writes prose 20% faster and code 52% faster. Tables in [Dynamic MoE](docs/performance/0.87.13-dynamic-moe.md).
+
+- **LLMs: Dynamic MoE starts on cards with little video memory.** When the MTP head does not fit beside the model it is left out, instead of the server refusing to start. With the memory of a 6 GB card, Qwen3.6-35B-A3B writes prose at 38 tokens a second against 23 with expert offload.
+
+- **LLMs: Dynamic MoE starts answering short messages sooner.** On a Radeon RX 6700 XT, Qwen3.6-35B-A3B reads a 30-token follow-up in 0.4 s instead of 0.9, and on a Radeon Pro Vega II, Qwen3.8-Flash-Next in 1.0 s instead of 2.6.
+
+- **LLMs: when Dynamic MoE keeps only part of the experts in RAM, the first prompt after loading is read sooner.** On a Radeon RX 6700 XT, Qwen3.6-35B-A3B reads it at 295 tokens a second instead of 240.
+
+- **LLMs: models with an MTP head also draft from earlier text when the answer repeats it.** When a rewrite or an edit copies stretches of the prompt, a longer guess taken from that text is verified instead, only where the measured timing says it pays. On a Radeon RX 6700 XT, Qwen3.8-9B edits a file 12% faster; prose and new code keep their speed.
+
+- **LLMs: Q2_0 and PQ2_0 models, such as the GSQ-RCO quantizations and Ternary Bonsai, compute on the CPU about 9 times faster on Intel Macs with AVX2, and PTQ1_0 models 1.4 times.** This covers experts left on the CPU and Macs without a supported GPU.
+
+- **LLMs: the MTP head of Qwen 3.5 to 3.8 models scores its guesses over the 151K most common tokens instead of the whole 248K vocabulary.** On a Radeon RX 6700 XT, Qwen3.8-9B writes prose and code 3 to 5% faster.
+
+- **LLMs: with an MTP head, Dynamic MoE reads the weights of an expert once when several drafted tokens use it.** On a Mac Pro with a Radeon Pro Vega II, the CPU part of each layer takes 15% less and Qwen3.6-35B-A3B writes code 2% faster.
+
+- **LLMs: Dynamic MoE spends less time on the experts it runs on the CPU.** The host part of each layer takes about 6% less, which adds about 1% to generation speed.
+
+- **LLMs: a long tool result no longer fills the context.** The model gets the first 20,000 characters and the end, with a note of what was cut, and the tool card still shows everything. The limit is in the chat settings under Agents, and 0 turns it off. Images returned by MCP tools reach vision models as images instead of base64 text.
+
+### Fixed
+
+- **LLMs: a chat no longer forgets a file from the first message a few turns later.** With conversation memory on, a model could archive that turn while the context still had room. Archiving now waits until the context is 60% full.
+
+- **LLMs: Dynamic MoE with part of the experts in RAM no longer generates slower after a long prompt.** On a Radeon RX 6700 XT, Qwen3.6-35B-A3B writes prose at 47 tokens a second instead of 37.
+
+- **LLMs: a model that is slow to load gets 10 minutes instead of 5 before its server is stopped.** A large model split across cards could run out of time and stop with nothing in the log.
+
+- **LLMs: a model with its MTP head built in shows up in the model list when its file name says MTP.** Files such as Qwen3.6-35B-A3B-MTP-UD-Q4_K_S were hidden as if they were a head alone, and taken for the head of the same model without it.
+
+- **LLMs: a KV cache type chosen on a stopped server is the one it starts with** ([#111](https://github.com/engeldlgado/toshllm/issues/111)). The server page's Start button used the settings from before the change, so it took a second start to pick it up.
+
+- **LLMs: agents that ask for reasoning effort "minimal", "off" or "max" no longer get an error from models such as Qwen3.8-Flash-Next.** The first ones turn reasoning off and "max" means high.
+
+- **LLMs: a server whose engine stops in the middle of a session starts again on its own, once, with the cause in the log.** A second stop within ten minutes leaves it stopped, as before, so a repeating problem stays visible.
+
+- **LLMs: Dynamic MoE with an MTP head no longer runs out of video memory during an answer.** The plan now leaves room for the draft head, so the driver stops moving GPU memory into RAM. On a Radeon RX 6700 XT, Qwen3.6-35B-A3B generates code at 46 tokens a second instead of 34.
+
+- **LLMs: agents and editors no longer drop the connection while a long prompt is being read.** The server sends a keep-alive every 30 seconds from the start of the request, not only once the answer begins.
+
+- **LLMs: Dynamic MoE locks its memory a step at a time and stops if the system reports memory pressure,** instead of locking it all at once while it reads the model.
+
+- **LLMs: a system message sent in the middle of a conversation reaches the model.** Agent hooks send them, and templates such as Qwen 3.5's dropped them without a word; they now arrive as a user message in the same place.
+
+## [0.87.12] - 2026-09-29
+
+### Improved
+
+- **LLMs: the KV cache type can be chosen on each server's page, also under Dynamic MoE.** Quantizing the keys to q8_0 fits about a third more context in the same memory.
+
+### Fixed
+
+- **LLMs: math symbols such as `$\neq$` or `$\rightarrow$` render in headings, lists, quotes and tables, not only in paragraphs.**
+
+- **LLMs: the GPU memory readout shows what is in use on Macs with unified memory instead of 0.**
+
+- **UI improvements and fixes.**
+
+## [0.87.11] - 2026-09-28
+
+### Added
+
+- **LLMs: Dynamic MoE, an experimental mode for Mixture-of-Experts models that do not fit in VRAM, off by default.** Turn it on in Settings → Performance & Memory. On a Radeon RX 6700 XT, Qwen3.6-35B-A3B reads prompts at 581 tokens a second instead of 311 and generates at 43.8 instead of 29.0, keeping its MTP head.
+
+- **LLMs: with little free RAM, Dynamic MoE keeps only part of the expert bank in memory and reads the rest from the model file.** With 8 GB taken by other apps, Qwen3.6-35B-A3B runs in 13 GB of RAM instead of 22, reading a prompt at 366 tokens a second and generating at 31.
+
+### Improved
+
+- **LLMs: the context menus offer 128k, 256k, 512k and 1M when the model supports them.** The choices stop at the context each model was trained for, which the model details and the server page now show.
+
+- **Images: Qwen-Image 2.1 edits with reference images take about a quarter of the time.** On a Radeon RX 6700 XT at 1024x1024, a 25-step edit with two references takes under 5 minutes instead of about 19; cards with 8 GB keep the previous speed.
+
+- **Images: Qwen-Image 2.1 generates from text about 40% faster.** On a Radeon RX 6700 XT at 1024x1024 a 25-step image takes 182 seconds instead of 314: each step goes from 11.6 to 6.6 seconds, and cards with 12 GB or more decode the result in larger tiles, 12.2 seconds instead of 19.9.
+
+### Fixed
+
+- **LLMs: when no safe memory plan exists, Dynamic MoE does not load the model and says what it needed and what was free.** Before, the engine fell back to its default layout, could fill the GPU and stop answering, as Gemma 4 26B-A4B did on a Mac short of free memory.
+
+- **LLMs: with Dynamic MoE, long chats no longer push the model into swap.** The plan now leaves room for the conversation state the server keeps in memory: Gemma 4 26B-A4B on a 32 GB Mac wrote 2 GB to swap during a long chat and now writes none.
+
+- **LLMs: FirePro and other GCN cards before Vega join Q4_0, Q5_0 and Q8_0 data correctly.** The 48 concatenation cases that failed on those cards in the engine's own tests now pass.
+
+### Known issues
+
+- **LLMs: with little free RAM, Dynamic MoE reads prompts slower.** Below a coverage of about 1.25 (shown in the plan) prompts can take twice as long as with the whole bank in RAM; generation drops less.
+
+- **LLMs: Dynamic MoE's prompt speed is limited by moving experts to the GPU.** Up to a third of the time goes to that copy; overlapping it with computation is future work.
+
+## [0.87.10] - 2026-09-25
+
+### Improved
+
+- **LLMs: long prompts read much faster with a model split into groups of GPUs.** On two Radeon Pro Vega II Duo cards a 2048 token prompt reads 32% faster with Qwen3-14B, 41% with Qwen3.8-27B and 29% with Qwen3.6-35B-A3B; short prompts read as before.
+
+- **LLMs: a model split by tensors across GPUs generates faster, also with multi-token prediction (MTP).** On a Radeon Pro Vega II Duo Qwen3-14B generates 49.4 tokens a second instead of 47.2 and Qwen3.8-27B Q4_0 30.7 instead of 29.3, also in groups of two across four GPUs; with MTP the 27B goes from 31.1 to 33.3.
+
+### Known issues
+
+- **LLMs: Qwen3.8 Flash Next can still answer with a run of zeros after a long prompt on Radeon Pro Vega and Radeon VII.** Prompts of a few thousand tokens work; past roughly 20,000 tokens they may not. It is not solved in this version.
+
+- **LLMs: Qwen3.8 Flash Next split by tensors can still stop in the middle of a long answer on Radeon PRO W6800X Duo cards.** Generation stalls with a GPU timeout.
+
+## [0.87.9] - 2026-09-24
+
+### Added
+
+- **LLMs: multi-token prediction (MTP) can be switched off per model, like DFlash.** The switch is in the model's settings, on the dashboard and in the server details. MTP stays on by default; with text the model predicts poorly it can generate slower than without it, and off it generates one token per step.
+
+- **LLMs: the engine moves to a newer upstream.** It brings the fixes and the model support added there since the last one, among them router mode no longer hanging when several requests ask for the same model, DFM Mimir 1B, and the Ling 3.0 and DeepSeek V3.2 and V4 chat formats. Speed is unchanged apart from the improvements below.
+
+### Improved
+
+- **LLMs: mixture of experts models generate faster on Radeon Pro Vega and Radeon VII.** On a Radeon Pro Vega II gpt-oss-20B generates 92.7 tokens a second instead of 90.8 and Qwen3.6-35B-A3B 70.0 instead of 68.3.
+
+- **LLMs: batches of two tokens run faster on Radeon Pro Vega and Radeon VII.** On a Radeon Pro Vega II Qwen3.8-27B Q4_0 reads them 18 percent faster and Qwen3.6-35B-A3B 12 percent.
+
+- **LLMs: multi-token prediction (MTP) costs less on Q4_0 models on Radeon Pro Vega and Radeon VII.** On a Radeon Pro Vega II Qwen3.8-27B Q4_0 generates 21.4 tokens a second with it instead of 18.7 on a technical answer where it accepts about half of its guesses. That is still below the 25.7 it reaches without MTP, so on text like this the new switch is worth turning off.
+
+### Known issues
+
+- **LLMs: Qwen3.8 Flash Next can still answer with a run of zeros after a long prompt on Radeon Pro Vega and Radeon VII.** Prompts of a few thousand tokens work; past roughly 20,000 tokens they may not. It is not solved in this version.
+
+- **LLMs: Qwen3.8 Flash Next split by tensors can still stop in the middle of a long answer on Radeon PRO W6800X Duo cards.** Generation stalls with a GPU timeout.
+
+## [0.87.8] - 2026-09-22
+
+### Added
+
+- **Images: Qwen-Image 2.1.** A 7B model that writes legible text inside the image and edits from up to sixteen reference images. On a Radeon RX 6700 XT a 1024x1024 image takes 4 min 52 s at the published 25 steps. A card that also draws the desktop goes up to 1920 pixels; one without a display, like a Radeon Pro Vega II, to 2048. Four sizes cover cards from 8 GB up.
+
+- **Images: fast mode.** Reuses sampling steps instead of computing them again, in three levels: 1.13x, 1.45x and 1.69x faster on Qwen-Image 2.1, at the cost of fine detail. Off by default.
+
+### Improved
+
+- **LLMs: multi-token prediction (MTP) now speeds up generation on Radeon Pro Vega, Radeon VII and AMD RDNA2 (tested on the Radeon RX 6700 XT).** On a Radeon RX 6700 XT Qwen3.8-9B Q4_K_M generates 59.4 tokens a second with it instead of 54.6 without, where it used to lose. On a Radeon Pro Vega II Qwen3.8-27B Q4_K_S generates 21.2 with it against 20.8 without, where it lost 17 percent before. Each card now drafts the number of tokens that pays on it, and one rejected draft no longer switches prediction off.
+
+- **LLMs: mixture of experts models read prompts and generate faster on Radeon Pro Vega, Radeon VII and AMD RDNA2 (tested on the Radeon RX 6700 XT).** Prompt lengths that left part of the card idle are gone: on a Radeon RX 6700 XT gpt-oss-20B reads them 28 to 34 percent faster and OLMoE-1B-7B 17 to 26 percent, and on a Radeon Pro Vega II an 8 expert model reads a 128 token batch in 1.33 ms instead of 4.47. The router now runs as one kernel: Qwen3.6-35B-A3B generates 68.3 tokens a second instead of 65.5 on a Radeon Pro Vega II, and gpt-oss-20B 101.1 instead of 99.9 on a Radeon RX 6700 XT. Same output.
+
+- **LLMs: short batches of two to eight tokens run faster, on Radeon Pro Vega, Radeon VII and AMD RDNA2 (tested on the Radeon RX 6700 XT).** They speed up multi-token prediction and several requests at once. On a Radeon RX 6700 XT two-token batches take 32 percent less on Q4_K, 29 percent on Q5_K and 21 to 28 percent on IQ3; on a Radeon Pro Vega II 23 percent less on Q4_K and 16 to 41 percent on IQ4_NL, MXFP4, Q2_K, Q3_K and Q4_0, and Qwen3.8-27B IQ4_XS reads four token batches 16 percent faster. Single token generation is unchanged. Same output.
+
+- **LLMs: an 8-bit KV cache and several requests at once on 8-bit models are faster on Radeon Pro Vega and Radeon VII.** Qwen3-4B with a q8_0 KV cache at a 4,400 token context generates 51.7 tokens a second instead of 39.0, and a Q8_0 model serving two to eight requests together produces 20 to 25 percent more. Same output.
+
+- **LLMs: follow-up messages in a chat start answering sooner with Qwen3.5, Qwen3.6, Qwen3.8 and Gemma models.** A follow-up to Qwen3.5-4B starts in 149 ms instead of 161 on a Radeon RX 6700 XT. Same output.
+
+- **Images: SD 1.5, SDXL Turbo, Flux.2 klein 4B and Qwen-Image 2.1 generate faster on AMD RDNA2 (tested on the Radeon RX 6700 XT).** SDXL Turbo takes 8.97 s instead of 10.36 s at 1024x1024, and Qwen-Image 2.1 13 percent less per step, with the same image.
+
+### Fixed
+
+- **Chat: Stop now stops the model on the card too, and an answer whose connection drops picks up where it left off.** Before, the answer stopped on screen while the engine kept generating and holding the GPU, and a dropped reply was lost.
+
+- **LLMs: stopping the server frees the card's memory in router mode.** An engine that went down could leave its loaded models running and holding VRAM with no server on.
+
+- **Images and Video: large sizes no longer fail saying there is no memory.** The AMD driver over-reports what is in use, so a large image, a 16:9 frame, an edit from a reference image or the video decoder was refused although it fit.
+
+- **Images: Qwen-Image 2.1 no longer warns about repeated compositions below 2048 pixels.** The warning used the older Qwen-Image limit.
+
+### Known issues
+
+- **LLMs: Qwen3.8 Flash Next can answer with a run of zeros after a long prompt on Radeon Pro Vega and Radeon VII.** Prompts of a few thousand tokens work; around 26,000 tokens they do not. It is under investigation.
+
+- **LLMs: Qwen3.8 Flash Next split by tensors can stop in the middle of a long answer on Radeon PRO W6800X Duo cards.** Generation stalls with a GPU timeout; it is under investigation.
+
 ## [0.87.7] - 2026-09-19
 
 ### Added

@@ -1,0 +1,839 @@
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -682,10 +682,12 @@
+     std::string server_tools_runtime;
+ 
+     // MCP server configs (Cursor-compatible JSON)
+     std::string mcp_servers_config;   // path to JSON file with MCP server definitions
+     std::string mcp_servers_json;     // inline JSON with MCP server definitions
++    std::string mcp_agent;            // MCP server whose "run" tool answers chat completions that bring no tools
++    bool        mcp_agent_explicit = false; // the agent answers only requests with X-Tosh-Agent: on
+ 
+     // router server configs
+     std::string models_dir    = "";     // directory containing models for the router server
+     std::string models_preset = "";     // directory containing model presets for the router server
+     int models_max = 4;                 // maximum number of models to load simultaneously
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3480,10 +3480,25 @@
+         [](common_params & params, const std::string & value) {
+             params.mcp_servers_json = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_JSON"));
+     add_opt(common_arg(
++        {"--mcp-agent"}, "NAME",
++        "experimental: answer /v1/chat/completions requests that bring no tools with the \"run\" tool of the MCP server NAME;\n"
++        "requests with tools, a grammar or a response format, or the header X-Tosh-Agent: off, stay raw inference (default: none)",
++        [](common_params & params, const std::string & value) {
++            params.mcp_agent = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_AGENT"));
++    add_opt(common_arg(
++        {"--mcp-agent-explicit"},
++        "experimental: with --mcp-agent, answer only requests that carry X-Tosh-Agent: on or come from a page in a browser; the rest stay raw inference (default: disabled)",
++        [](common_params & params) {
++            params.mcp_agent_explicit = true;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_AGENT_EXPLICIT"));
++    add_opt(common_arg(
+         {"-ag", "--agent"},
+         {"-no-ag", "--no-agent"},
+         "whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)\n"
+         "note: for security reasons, this will limit --cors-origins to localhost by default",
+         [](common_params & params, bool value) {
+diff --git a/tools/server/server-mcp.h b/tools/server/server-mcp.h
+--- a/tools/server/server-mcp.h
++++ b/tools/server/server-mcp.h
+@@ -2,14 +2,17 @@
+ 
+ #include "server-common.h"
+ 
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
++#include <deque>
+ #include <functional>
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <set>
+ #include <string>
+ #include <thread>
+ #include <vector>
+ 
+ //
+@@ -48,10 +51,12 @@
+ //
+ 
+ struct server_mcp_transport {
+     std::string name;
+     int timeout_ms = 30000;
++    // the server answers calls in parallel (the Tosh agent); the rest get one call at a time
++    bool concurrent = false;
+ 
+     server_pipe<std::string> to_server;   // serialized messages we send to the server
+     server_pipe<std::string> from_server; // serialized messages read from the server
+ 
+     virtual ~server_mcp_transport() = default;
+@@ -68,25 +73,38 @@
+         return last_error;
+     }
+ 
+     std::vector<server_mcp_tool_def> list_tools(const std::function<bool()> & should_stop);
+ 
++    // on_progress, when set, receives the params of every notifications/progress the call sends
+     json call_tool(const std::string & tool_name,
+                    const json & arguments,
+-                   const std::function<bool()> & should_stop);
++                   const std::function<bool()> & should_stop,
++                   const std::function<void(const json &)> & on_progress = nullptr);
+ 
+ protected:
+-    // per-transport: send_rpc() holds it across the reply wait, so sharing it would stall every server behind one slow call. guards all members below.
++    // per-transport: guards the handshake, the tool list and the members below; a tool call holds it only to
++    // take its id, so a long call (the Tosh agent's turn) does not stall the calls of other clients
+     std::mutex rpc_mutex;
++    std::mutex call_mutex; // held across a whole call unless the server is concurrent
+     uint64_t next_id = 1; // reset to 1 per (re)spawn
+     bool initialized = false;
+     std::string last_error;
+     std::vector<server_mcp_tool_def> tools;
+ 
+-    // both assume rpc_mutex is already held by the public caller
+-    bool ensure_init(const std::function<bool()> & should_stop); // initialize handshake, once
+-    json send_rpc(const json & request, const std::function<bool()> & should_stop); // returns the reply or an {"error": ...}
++    // calls in flight share the pipe: one of them reads it at a time and hands each frame to the call it belongs to
++    std::mutex demux_mutex;
++    std::condition_variable demux_cv;
++    bool demux_reading = false;
++    bool demux_closed  = false;
++    std::set<std::string> demux_waiting;                    // ids of the calls still waiting
++    std::map<std::string, json> demux_replies;              // id -> reply read by another call
++    std::map<std::string, std::deque<json>> demux_progress; // progress token -> its notifications
++
++    bool ensure_init(const std::function<bool()> & should_stop); // initialize handshake, once; assumes rpc_mutex
++    json send_rpc(const json & request, const std::function<bool()> & should_stop,
++                  const std::function<void(const json &)> & on_progress = nullptr); // returns the reply or an {"error": ...}
+ };
+ 
+ //
+ // server_mcp_stdio: child process, NDJSON JSON-RPC over stdio (stderr drained to the debug log)
+ //
+@@ -146,11 +164,12 @@
+ 
+     // lazily (re)spawns the transport. returns the MCP result or an {"error": ...}. should_stop is OR-ed with the manager's cancel flag.
+     json call_tool(const std::string & server_name,
+                    const std::string & tool_name,
+                    const json & arguments,
+-                   const std::function<bool()> & should_stop = nullptr);
++                   const std::function<bool()> & should_stop = nullptr,
++                   const std::function<void(const json &)> & on_progress = nullptr);
+ 
+     // flip the cancel flag so in-flight calls return; blocking teardown is in the destructor. call before the HTTP server drains.
+     // note: multiple calls are idempotent
+     void shutdown();
+ 
+@@ -163,10 +182,11 @@
+     std::map<std::string, std::shared_ptr<server_mcp_transport>> transports;
+     std::map<std::string, std::chrono::steady_clock::time_point> dead_servers; // spawn-failure cooldown
+     std::vector<server_mcp_tool_def> registry;
+ 
+     std::atomic<bool> stopping{false};
++    std::string agent_name; // --mcp-agent: its transport takes calls in parallel
+ 
+     const server_mcp_server_config * find_config(const std::string & name) const;
+ 
+     // the only place that names a concrete transport
+     std::shared_ptr<server_mcp_transport> create_transport(const server_mcp_server_config & cfg);
+diff --git a/tools/server/server-mcp.cpp b/tools/server/server-mcp.cpp
+--- a/tools/server/server-mcp.cpp
++++ b/tools/server/server-mcp.cpp
+@@ -209,45 +209,132 @@
+         return {{"error", text.empty() ? "MCP tool returned an error" : text}};
+     }
+     return {{"plain_text_response", text}};
+ }
+ 
+-json server_mcp_transport::send_rpc(const json & request, const std::function<bool()> & should_stop) {
++json server_mcp_transport::send_rpc(const json & request, const std::function<bool()> & should_stop,
++                                    const std::function<void(const json &)> & on_progress) {
++    const bool has_id = request.contains("id");
++    const std::string key = has_id ? request.at("id").dump() : "";
++    {
++        std::lock_guard<std::mutex> lk(demux_mutex);
++        if (demux_closed) {
++            return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
++        }
++        if (has_id) {
++            demux_waiting.insert(key);
++        }
++    }
+     if (!to_server.write(request.dump())) {
++        std::lock_guard<std::mutex> lk(demux_mutex);
++        demux_waiting.erase(key);
+         return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
+     }
+ 
+-    const bool has_id = request.contains("id");
+     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+     auto stop = [&]() {
+         return (should_stop && should_stop()) || std::chrono::steady_clock::now() >= deadline;
+     };
+ 
+-    std::string frame;
+-    while (from_server.read(frame, stop, false)) {
+-        json reply;
++    json reply;
++    bool got = false;
++    std::unique_lock<std::mutex> lk(demux_mutex);
++    while (true) {
++        auto it = demux_replies.find(key);
++        if (it != demux_replies.end()) {
++            reply = std::move(it->second);
++            demux_replies.erase(it);
++            got = true;
++            break;
++        }
++        auto pending = demux_progress.find(key);
++        if (pending != demux_progress.end() && !pending->second.empty()) {
++            json params = std::move(pending->second.front());
++            pending->second.pop_front();
++            lk.unlock();
++            if (on_progress) {
++                on_progress(params);
++            }
++            lk.lock();
++            continue;
++        }
++        if (demux_closed || stop()) {
++            break;
++        }
++        if (demux_reading) {
++            demux_cv.wait_for(lk, std::chrono::milliseconds(200));
++            continue;
++        }
++        demux_reading = true;
++        lk.unlock();
++        std::string frame;
++        const bool read = from_server.read(frame, stop, false);
++        lk.lock();
++        demux_reading = false;
++        demux_cv.notify_all();
++        if (!read) {
++            demux_closed = demux_closed || from_server.writer_closed.load();
++            continue;
++        }
++        json message;
+         try {
+-            reply = json::parse(frame);
++            message = json::parse(frame);
+         } catch (...) {
+-            if (std::chrono::steady_clock::now() >= deadline) {
+-                break;
+-            }
+             continue; // skip malformed frame
+         }
+-        // no id: a notification. mismatched id: a stale reply from a timed-out request (ids are monotonic, never a future one)
+-        if (!has_id || (reply.contains("id") && reply.at("id") == request.at("id"))) {
+-            return reply;
++        if (!has_id) {
++            reply = std::move(message);
++            got = true;
++            break;
+         }
+-        if (std::chrono::steady_clock::now() >= deadline) {
+-            break; // a flood of notifications must not outrun the deadline
++        if (message.contains("id")) {
++            const std::string id = message.at("id").dump();
++            if (id == key) {
++                reply = std::move(message);
++                got = true;
++                break;
++            }
++            // a reply nobody waits for is from a call that timed out or was cancelled: dropped
++            if (demux_waiting.count(id)) {
++                demux_replies[id] = std::move(message);
++            }
++        } else if (message.value("method", "") == "notifications/progress" && message.contains("params")) {
++            const json & params = message.at("params");
++            const std::string token = params.contains("progressToken") ? params.at("progressToken").dump() : "";
++            if (token == key) {
++                lk.unlock();
++                if (on_progress) {
++                    on_progress(params);
++                }
++                lk.lock();
++            } else if (demux_waiting.count(token)) {
++                demux_progress[token].push_back(params);
++            }
+         }
+     }
++    demux_waiting.erase(key);
++    demux_replies.erase(key);
++    demux_progress.erase(key);
++    const bool closed = demux_closed;
++    lk.unlock();
++    if (got) {
++        return reply;
++    }
+ 
++    // the server keeps working on a request nobody waits for unless it is told
++    auto cancel = [&](const char * reason) {
++        if (has_id && !closed) {
++            to_server.write(json{{"jsonrpc", "2.0"}, {"method", "notifications/cancelled"},
++                                 {"params", {{"requestId", request.at("id")}, {"reason", reason}}}}.dump());
++        }
++    };
+     if (should_stop && should_stop()) {
++        cancel("the caller went away");
+         return {{"error", {{"code", -32603}, {"message", "cancelled"}}}};
+     }
+     if (std::chrono::steady_clock::now() >= deadline) {
++        cancel("request timed out");
+         return {{"error", {{"code", -32603}, {"message", "request timed out"}}}};
+     }
+     return {{"error", {{"code", -32603}, {"message", "transport closed"}}}};
+ }
+ 
+@@ -312,23 +399,34 @@
+     return tools;
+ }
+ 
+ json server_mcp_transport::call_tool(const std::string & tool_name,
+                                      const json & arguments,
+-                                     const std::function<bool()> & should_stop) {
+-    std::lock_guard<std::mutex> lock(rpc_mutex);
+-    if (!ensure_init(should_stop)) {
+-        return {{"error", last_error}};
++                                     const std::function<bool()> & should_stop,
++                                     const std::function<void(const json &)> & on_progress) {
++    // a call queued behind another only starts its timeout once it is sent
++    std::unique_lock<std::mutex> serial(call_mutex, std::defer_lock);
++    if (!concurrent) {
++        serial.lock();
+     }
+-
+-    json req = {
+-        {"jsonrpc", "2.0"},
+-        {"id", next_id++},
+-        {"method", "tools/call"},
+-        {"params", {{"name", tool_name}, {"arguments", arguments}}},
+-    };
+-    json resp = send_rpc(req, should_stop);
++    json req;
++    {
++        std::lock_guard<std::mutex> lock(rpc_mutex);
++        if (!ensure_init(should_stop)) {
++            return {{"error", last_error}};
++        }
++        req = {
++            {"jsonrpc", "2.0"},
++            {"id", next_id++},
++            {"method", "tools/call"},
++            {"params", {{"name", tool_name}, {"arguments", arguments}}},
++        };
++    }
++    if (on_progress) {
++        req["params"]["_meta"] = {{"progressToken", req.at("id")}};
++    }
++    json resp = send_rpc(req, should_stop, on_progress);
+     if (resp.contains("error")) {
+         return {{"error", rpc_error_message(resp)}};
+     }
+     if (resp.contains("result")) {
+         return mcp_result_to_response(resp.at("result"));
+@@ -689,10 +787,11 @@
+     }
+     return nullptr;
+ }
+ 
+ void server_mcp::start(const common_params & params) {
++    agent_name = params.mcp_agent;
+     auto append = [this](const std::string & json_str) {
+         try {
+             auto parsed = server_mcp_server_config::parse_from_json(json_str);
+             if (parsed.empty()) {
+                 SRV_WRN("%s", "MCP config: no servers found in JSON\n");
+@@ -754,20 +853,21 @@
+ }
+ 
+ json server_mcp::call_tool(const std::string & server_name,
+                            const std::string & tool_name,
+                            const json & arguments,
+-                           const std::function<bool()> & should_stop) {
++                           const std::function<bool()> & should_stop,
++                           const std::function<void(const json &)> & on_progress) {
+     auto transport = get_or_create(server_name);
+     if (!transport) {
+         return {{"error", "MCP server unavailable: " + server_name}};
+     }
+ 
+     auto stop = [this, &should_stop]() {
+         return stopping.load() || (should_stop && should_stop());
+     };
+-    return transport->call_tool(tool_name, arguments, stop);
++    return transport->call_tool(tool_name, arguments, stop, on_progress);
+ }
+ 
+ std::shared_ptr<server_mcp_transport> server_mcp::get_or_create(const std::string & name) {
+     std::vector<std::shared_ptr<server_mcp_transport>> to_close; // closed after unlock
+     std::shared_ptr<server_mcp_transport> result;
+@@ -798,10 +898,11 @@
+         }
+ 
+         const server_mcp_server_config * cfg = find_config(name);
+         if (cfg) {
+             auto fresh = create_transport(*cfg);
++            fresh->concurrent = name == agent_name;
+             if (fresh->start() && fresh->is_alive()) {
+                 transports[name] = fresh;
+                 result = fresh;
+             } else {
+                 SRV_WRN("MCP '%s': failed to start: %s\n", name.c_str(), fresh->diagnostics().c_str());
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -474,10 +474,15 @@
+     preset.unset_option("LLAMA_ARG_API_KEY_FILE");
+     preset.unset_option("LLAMA_ARG_MODELS_DIR");
+     preset.unset_option("LLAMA_ARG_MODELS_MAX");
+     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
+     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
++    // the router runs the MCP servers and the Tosh agent; a worker only answers raw inference
++    preset.unset_option("LLAMA_ARG_MCP_SERVERS_CONFIG");
++    preset.unset_option("LLAMA_ARG_MCP_SERVERS_JSON");
++    preset.unset_option("LLAMA_ARG_MCP_AGENT");
++    preset.unset_option("LLAMA_ARG_MCP_AGENT_EXPLICIT");
+     if (unset_model_args) {
+         preset.unset_option("LLAMA_ARG_MODEL");
+         preset.unset_option("LLAMA_ARG_MMPROJ");
+         preset.unset_option("LLAMA_ARG_ALIAS");
+         preset.unset_option("LLAMA_ARG_HF_REPO");
+@@ -2479,13 +2484,16 @@
+     cli->set_follow_location(true);
+     cli->set_connection_timeout(timeout_read, 0); // use --timeout value instead of hardcoded 5 s
+     cli->set_write_timeout(timeout_read, 0); // reversed for cli (client) vs srv (server)
+     cli->set_read_timeout(timeout_write, 0);
+     this->status = 500; // to be overwritten upon response
+-    this->cleanup_pipes = [pipe]() {
++    this->cleanup_pipes = [pipe, cli]() {
+         pipe->close_read();
+         pipe->close_write();
++        // a request without streaming sends nothing until it is done, so its thread would not notice the
++        // client left: closing the socket lets the worker see it and stop generating
++        cli->stop();
+     };
+ 
+     // wire up the receive end of the pipe
+     this->next = [pipe, should_stop](std::string & out) -> bool {
+         msg_t msg;
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -446,10 +446,13 @@
+ 
+     // should never reach here
+ }
+ 
+ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
++    // results of other tasks wake this wait too, so the timeout counts from the call: under steady traffic the
++    // caller must still get back to check whether its client went away
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout);
+     while (true) {
+         std::unique_lock<std::mutex> lock(mutex_results);
+ 
+         for (int i = 0; i < (int) queue_results.size(); i++) {
+             if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
+@@ -457,11 +460,11 @@
+                 queue_results.erase(queue_results.begin() + i);
+                 return res;
+             }
+         }
+ 
+-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
++        std::cv_status cr_res = condition_results.wait_until(lock, deadline);
+         if (!running) {
+             RES_DBG("%s : queue result stop\n", __func__);
+             std::terminate(); // we cannot return here since the caller is HTTP code
+         }
+         if (cr_res == std::cv_status::timeout) {
+diff --git a/tools/server/server-tools.h b/tools/server/server-tools.h
+--- a/tools/server/server-tools.h
++++ b/tools/server/server-tools.h
+@@ -43,11 +43,12 @@
+     // set when --tools-runtime is configured; routes every tool call through an isolate
+     std::unique_ptr<server_tools_runtime> runtime;
+ 
+     void setup(const std::vector<std::string> & enabled_tools,
+                server_mcp & mcp_mgr,
+-               const std::string & tools_runtime);
++               const std::string & tools_runtime,
++               const std::string & hidden_server = "");
+ 
+     server_http_context::handler_t handle_get;
+     server_http_context::handler_t handle_post;
+ 
+     server_tools();
+diff --git a/tools/server/server-tools.cpp b/tools/server/server-tools.cpp
+--- a/tools/server/server-tools.cpp
++++ b/tools/server/server-tools.cpp
+@@ -1994,11 +1994,12 @@
+     return std::make_unique<server_tools_static_runtime>(spec);
+ }
+ 
+ void server_tools::setup(const std::vector<std::string> & enabled_tools,
+                          server_mcp & mcp_mgr,
+-                         const std::string & tools_runtime) {
++                         const std::string & tools_runtime,
++                         const std::string & hidden_server) {
+     if (!tools_runtime.empty()) {
+         runtime = make_tools_runtime(tools_runtime);
+     }
+ 
+     if (!enabled_tools.empty()) {
+@@ -2041,10 +2042,14 @@
+         for (auto & t : tools) {
+             seen_names.insert(t->name);
+         }
+         size_t n_added = 0;
+         for (const auto & def : mcp_mgr.list_tools()) {
++            // the agent answers chat requests; neither clients nor models call it as a tool
++            if (!hidden_server.empty() && def.server_name == hidden_server) {
++                continue;
++            }
+             std::string mcp_name = def.server_name + "_" + def.name;
+             if (seen_names.count(mcp_name)) {
+                 SRV_WRN("MCP tool \"%s\" from server \"%s\" collides with an existing tool, skipping\n",
+                     mcp_name.c_str(), def.server_name.c_str());
+                 continue;
+@@ -2056,15 +2061,26 @@
+         if (n_added > 0) {
+             SRV_INF("Added %zu MCP tools\n", n_added);
+         }
+     }
+ 
+-    handle_get = [this](const server_http_req &) -> server_http_res_ptr {
++    // A page in a browser runs its own agent loop on these tools, without the checks the Tosh agent
++    // puts around the MCP ones (math among them). It gets the built-in tools only; programs that are not
++    // browsers keep the whole list. Browsers mark every request with Sec-Fetch-Site or Origin.
++    auto from_browser = [](const server_http_req & req) {
++        return !get_header(req.headers, "sec-fetch-site").empty() || !get_header(req.headers, "origin").empty();
++    };
++
++    handle_get = [this, from_browser](const server_http_req & req) -> server_http_res_ptr {
+         auto res = std::make_unique<server_http_res>();
+         try {
+             json result = json::array();
++            const bool browser = from_browser(req);
+             for (const auto & t : tools) {
++                if (browser && t->type() == "mcp") {
++                    continue;
++                }
+                 result.push_back(t->to_json());
+             }
+             res->data = safe_json_to_str(result);
+         } catch (const std::exception & e) {
+             SRV_ERR("got exception: %s\n", e.what());
+@@ -2072,11 +2088,11 @@
+             res->data   = safe_json_to_str(format_error_response(e.what(), ERROR_TYPE_SERVER));
+         }
+         return res;
+     };
+ 
+-    handle_post = [this](const server_http_req & req) -> server_http_res_ptr {
++    handle_post = [this, from_browser](const server_http_req & req) -> server_http_res_ptr {
+         auto res = std::make_unique<server_tools_res>();
+         try {
+             json body = json::parse(req.body);
+             std::string tool_name = body.at("tool").get<std::string>();
+             json params = body.value("params", json::object());
+@@ -2111,10 +2127,16 @@
+             if (!resp_type.empty()) {
+                 params["resp_type"] = resp_type;
+             }
+ 
+             server_tool & tool = find_tool(tools, tool_name, stream);
++            if (from_browser(req) && tool.type() == "mcp") {
++                res->status = 403;
++                res->data   = safe_json_to_str(format_error_response(
++                    "MCP tools are not run for pages in a browser; use the Tosh agent", ERROR_TYPE_PERMISSION));
++                return res;
++            }
+ 
+             if (stream) {
+                 int id = res_id.fetch_add(1);
+                 queue_res.add_waiting_task_id(id);
+                 res->qr = &queue_res;
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -10,12 +10,16 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
+ #include "log.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <clocale>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
+ #include <exception>
+ #include <signal.h>
+ #include <thread> // for std::thread::hardware_concurrency
+ 
+ #if defined(_WIN32)
+@@ -44,12 +48,220 @@
+ void llama_server_terminate();
+ void llama_server_terminate() {
+     if (shutdown_handler) {
+         shutdown_handler(0);
+     }
++}
++
++
++// The Tosh agent (--mcp-agent NAME) answers /v1/chat/completions with the "run" tool of the MCP server
++// NAME, which calls this server back for raw inference and /tools. The contract, per request:
++//   X-Tosh-Agent: off (or raw)  raw model inference, always
++//   X-Tosh-Agent: on            the agent; refused when the server runs none or the request brings tools
++//   no header                   the agent, unless the server takes it on request only (--mcp-agent-explicit)
++//                               and the request does not come from a page in a browser (the bundled web chat),
++//                               or the request brings tools, functions, a grammar, json_schema or
++//                               response_format: then raw, so clients that run their own tools are unaffected
++static std::string tosh_header(const server_http_req & req, const char * name) {
++    for (const auto & [key, value] : req.headers) {
++        std::string k = key, v = value;
++        std::transform(k.begin(), k.end(), k.begin(), ::tolower);
++        std::transform(v.begin(), v.end(), v.begin(), ::tolower);
++        if (k == name) {
++            return v;
++        }
++    }
++    return "";
++}
++
++static bool tosh_agent_constrained(const json & body) {
++    for (const char * key : {"tools", "functions", "grammar", "json_schema", "response_format"}) {
++        if (body.contains(key) && !body.at(key).is_null() && !(body.at(key).is_array() && body.at(key).empty())) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static json tosh_agent_answer(const json & out, int & status) {
++    status = 502;
++    auto failure = [](const std::string & message) {
++        return json{{"error", {{"message", message}, {"type", "agent_error"}}}};
++    };
++    if (out.contains("error")) {
++        return failure(out.at("error").is_string() ? out.at("error").get<std::string>() : out.at("error").dump());
++    }
++    if (!out.contains("plain_text_response") || !out.at("plain_text_response").is_string()) {
++        return failure("the agent gave no answer");
++    }
++    json answer;
++    try {
++        answer = json::parse(out.at("plain_text_response").get<std::string>());
++    } catch (const std::exception &) {
++        return failure("the agent gave no answer");
++    }
++    if (!answer.is_object()) {
++        return failure("the agent gave no answer");
++    }
++    if (answer.contains("error")) {
++        status = answer.value("status", 500);
++        answer.erase("status");
++        return answer;
++    }
++    status = 200;
++    return answer;
++}
++
++// the answer goes out only once the agent has checked it; before that only progress events and keep-alives
++static std::vector<std::string> tosh_agent_chunks(const json & answer, int status) {
++    if (status != 200) {
++        return {"data: " + answer.dump() + "\n\n", "data: [DONE]\n\n"};
++    }
++    json head = {{"id", answer.value("id", "")}, {"object", "chat.completion.chunk"},
++                 {"created", answer.value("created", 0)}, {"model", answer.value("model", "")}};
++    std::string content;
++    if (answer.contains("choices") && answer.at("choices").is_array() && !answer.at("choices").empty()) {
++        content = answer.at("choices").at(0).value("message", json::object()).value("content", "");
++    }
++    json first = head;
++    first["choices"] = json::array({{{"index", 0}, {"delta", {{"role", "assistant"}, {"content", content}}}, {"finish_reason", nullptr}}});
++    json last = head;
++    last["choices"] = json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", "stop"}}});
++    for (const char * key : {"usage", "tosh"}) {
++        if (answer.contains(key)) {
++            last[key] = answer.at(key);
++        }
++    }
++    return {"data: " + first.dump() + "\n\n", "data: " + last.dump() + "\n\n", "data: [DONE]\n\n"};
++}
++
++struct tosh_agent_state {
++    std::mutex mutex;
++    std::condition_variable cv;
++    std::deque<json> events;
++    std::atomic<bool> cancelled{false};
++    bool done = false;
++    json out;
++};
++
++// a client that goes away stops the agent, its model passes and its tool calls
++struct tosh_agent_res : server_http_res {
++    std::shared_ptr<tosh_agent_state> state;
++    void on_complete() override {
++        state->cancelled = true;
++        state->cv.notify_all();
++    }
++};
++
++static server_http_res_ptr tosh_agent_refuse(const std::string & message) {
++    auto res = std::make_unique<server_http_res>();
++    res->status = 400;
++    res->data = json{{"error", {{"message", message}, {"type", "invalid_request_error"}}}}.dump();
++    return res;
+ }
+ 
++static server_http_context::handler_t tosh_agent_handler(server_http_context::handler_t raw,
++                                                         server_mcp & mcp_mgr,
++                                                         const common_params & params) {
++    return [raw, &mcp_mgr, &params](const server_http_req & req) -> server_http_res_ptr {
++        const std::string mode = tosh_header(req, "x-tosh-agent");
++        if (mode == "off" || mode == "raw") {
++            return raw(req);
++        }
++        const bool asked = mode == "on";
++        json body;
++        try {
++            body = json::parse(req.body);
++        } catch (const std::exception &) {
++            return raw(req);
++        }
++        if (params.mcp_agent.empty()) {
++            return asked ? tosh_agent_refuse("this server runs no Tosh agent: start it with --mcp-agent") : raw(req);
++        }
++        if (!body.is_object() || tosh_agent_constrained(body)) {
++            return asked ? tosh_agent_refuse("a request for the Tosh agent cannot bring tools, functions, a grammar or a response format")
++                         : raw(req);
++        }
++        // browsers mark every request with one of these; a page never gets the MCP tools for its own loop
++        const bool browser = !tosh_header(req, "sec-fetch-site").empty() || !tosh_header(req, "origin").empty();
++        if (!asked && params.mcp_agent_explicit && !browser) {
++            return raw(req);
++        }
++        std::string host = params.hostnames.empty() ? "127.0.0.1" : params.hostnames.front();
++        if (host.empty() || host == "0.0.0.0" || host == "::") {
++            host = "127.0.0.1";
++        }
++        json args = {{"request", body},
++                     {"base_url", "http://" + host + ":" + std::to_string(params.port)},
++                     {"api_key", params.api_keys.empty() ? "" : params.api_keys.front()}};
++        if (!body.value("stream", false)) {
++            auto res = std::make_unique<server_http_res>();
++            int status = 502;
++            json answer = tosh_agent_answer(mcp_mgr.call_tool(params.mcp_agent, "run", args, req.should_stop), status);
++            res->status = status;
++            res->data = answer.dump();
++            return res;
++        }
++        auto state = std::make_shared<tosh_agent_state>();
++        std::thread([state, args, &mcp_mgr, name = params.mcp_agent]() {
++            json out = mcp_mgr.call_tool(name, "run", args,
++                [state]() { return state->cancelled.load(); },
++                [state](const json & progress) {
++                    std::lock_guard<std::mutex> lock(state->mutex);
++                    state->events.push_back(progress);
++                    state->cv.notify_all();
++                });
++            std::lock_guard<std::mutex> lock(state->mutex);
++            state->out = std::move(out);
++            state->done = true;
++            state->cv.notify_all();
++        }).detach();
++        auto res = std::make_unique<tosh_agent_res>();
++        res->state = state;
++        res->content_type = "text/event-stream";
++        res->status = 200;
++        res->next = [state, gone = req.should_stop, finals = std::vector<std::string>(), sent = size_t(0)](std::string & output) mutable -> bool {
++            if (finals.empty()) {
++                std::unique_lock<std::mutex> lock(state->mutex);
++                // a keep-alive every 5 s, but a client that went away is noticed within a second
++                for (int i = 0; i < 5 && !state->done && state->events.empty(); i++) {
++                    state->cv.wait_for(lock, std::chrono::seconds(1), [&] { return state->done || !state->events.empty(); });
++                    if (gone && gone()) {
++                        state->cancelled = true;
++                        state->cv.notify_all();
++                        return false;
++                    }
++                }
++                if (!state->events.empty()) {
++                    json progress = state->events.front();
++                    state->events.pop_front();
++                    json event = progress.value("message", json());
++                    if (event.is_string()) {
++                        try {
++                            event = json::parse(event.get<std::string>());
++                        } catch (const std::exception &) {
++                        }
++                    }
++                    json chunk = {{"object", "chat.completion.chunk"},
++                                  {"choices", json::array({{{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})},
++                                  {"tosh", {{"version", 1}, {"event", event}}}};
++                    output = "data: " + chunk.dump() + "\n\n";
++                    return true;
++                }
++                if (!state->done) {
++                    output = ": keep-alive\n\n";
++                    return true;
++                }
++                int status = 502;
++                finals = tosh_agent_chunks(tosh_agent_answer(state->out, status), status);
++            }
++            output = finals[sent++];
++            return sent < finals.size();
++        };
++        return res;
++    };
++}
+ 
+ // wrapper function that handles exceptions and logs errors
+ // this is to make sure handler_t never throws exceptions; instead, it returns an error response
+ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t func) {
+     return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
+@@ -256,12 +468,14 @@
+     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
+     ctx_http.get ("/v1/models",                ex_wrapper(routes.get_models));
+     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
+     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
+     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
+-    ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
+-    ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
++    // also without an agent, so that X-Tosh-Agent: on is refused instead of silently answered raw
++    auto chat_completions = tosh_agent_handler(routes.post_chat_completions, mcp_mgr, params);
++    ctx_http.post("/chat/completions",         ex_wrapper(chat_completions));
++    ctx_http.post("/v1/chat/completions",      ex_wrapper(chat_completions));
+     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));
+     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
+     ctx_http.post("/responses",                ex_wrapper(routes.post_responses_oai));
+     ctx_http.post("/v1/audio/transcriptions",  ex_wrapper(routes.post_transcriptions_oai));
+     ctx_http.post("/audio/transcriptions",     ex_wrapper(routes.post_transcriptions_oai));
+@@ -350,11 +564,11 @@
+         return 1;
+     }
+ 
+     if (!params.server_tools.empty() || !mcp_mgr.empty()) {
+         try {
+-            tools.setup(params.server_tools, mcp_mgr, params.server_tools_runtime);
++            tools.setup(params.server_tools, mcp_mgr, params.server_tools_runtime, params.mcp_agent);
+         } catch (const std::exception & e) {
+             SRV_ERR("tools setup failed: %s\n", e.what());
+             return 1;
+         }
+         ctx_http.get ("/tools",           ex_wrapper(tools.handle_get));

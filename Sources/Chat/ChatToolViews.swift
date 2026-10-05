@@ -97,6 +97,13 @@ private struct ToolCallDetailView: View {
                         .font(.system(.callout, design: .monospaced))
                         .textSelection(.enabled)
                 } else { emptyState("Waiting…") }
+            case .math:
+                codePanel(presentation.code ?? "", language: presentation.language)
+                if let result = presentation.result, !result.isEmpty {
+                    Label(result, systemImage: "function")
+                        .font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                } else { emptyState(call.state == .running ? "Calculating…" : "No result") }
             case .search:
                 SearchResultPanel(result: presentation.result)
             case .generic:
@@ -280,5 +287,125 @@ struct ToolResultCard: View {
         }
         .padding(10)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+/// One row of the transcript: a message, or consecutive tool rounds with their results.
+enum TranscriptRow: Identifiable {
+    case message(ChatMessage)
+    case tools([ChatMessage])
+
+    var id: UUID {
+        switch self {
+        case .message(let message): message.id
+        case .tools(let rounds): rounds[0].id
+        }
+    }
+
+    static func rows(_ messages: [ChatMessage]) -> [TranscriptRow] {
+        var rows: [TranscriptRow] = []
+        var run: [ChatMessage] = []
+        for message in messages {
+            let round = message.role == "assistant" && !(message.toolCalls ?? []).isEmpty
+            if round || (message.role == "tool" && !run.isEmpty) {
+                run.append(message)
+                continue
+            }
+            if !run.isEmpty { rows.append(.tools(run)) }
+            run = []
+            rows.append(.message(message))
+        }
+        if !run.isEmpty { rows.append(.tools(run)) }
+        return rows
+    }
+}
+
+/// Consecutive tool rounds of a turn as one block. Each call card carries its own result, so the
+/// result messages are not drawn again; the answer that follows stays a message of its own.
+struct ToolRoundsGroup: View, Equatable {
+    let rounds: [ChatMessage]
+
+    static func == (a: ToolRoundsGroup, b: ToolRoundsGroup) -> Bool { a.rounds == b.rounds }
+
+    @EnvironmentObject private var loc: Localizer
+    @State private var expanded: Bool?
+
+    private var calls: [ChatToolCall] { rounds.flatMap { $0.toolCalls ?? [] } }
+
+    private var running: Bool {
+        calls.contains { [.pending, .awaitingPermission, .running].contains($0.state) }
+    }
+
+    private var withoutResult: Int {
+        calls.filter { call in
+            call.state == .failed || call.state == .denied
+                || (call.state == .completed && MathTranscriptionService.isMathTool(call.name)
+                    && !MathTranscriptionService.succeeded(call))
+        }.count
+    }
+
+    private var summary: String {
+        let count = calls.count == 1 ? loc.t("1 herramienta", "1 tool")
+            : loc.t("%@ herramientas", "%@ tools", "\(calls.count)")
+        var titles: [String] = []
+        for call in calls {
+            let title = ToolCallPresentation.make(call).title
+            if !titles.contains(title) { titles.append(title) }
+        }
+        return ([count] + titles.prefix(3)).joined(separator: " · ")
+    }
+
+    var body: some View {
+        let isExpanded = expanded ?? running
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "wrench.and.screwdriver.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(Color.appAccent)
+                .frame(width: 26, height: 26)
+                .background(Color.appAccent.opacity(0.15), in: Circle())
+            VStack(alignment: .leading, spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { expanded = !isExpanded }
+                } label: {
+                    HStack(spacing: 7) {
+                        Text(summary).lineLimit(1)
+                        if withoutResult > 0 {
+                            Text(loc.t("%@ sin resultado", "%@ without a result", "\(withoutResult)"))
+                                .foregroundStyle(.red)
+                        }
+                        if running { ProgressView().controlSize(.mini) }
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    }
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(loc.t("Muestra u oculta las llamadas a herramientas de este turno, con sus resultados y el texto que el modelo escribió antes de cada una.",
+                            "Shows or hides this turn's tool calls, with their results and the text the model wrote before each one."))
+                if isExpanded {
+                    ForEach(rounds.filter { $0.role == "assistant" }) { round in
+                        let said = [round.parts.thinking ?? "", round.parts.body, round.settledInterim ?? ""]
+                            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+                        if !said.isEmpty {
+                            DisclosureGroup(loc.t("Texto del modelo antes de la llamada (no verificado)",
+                                                  "Model text before the call (not verified)")) {
+                                Text(said).chatFont(.small).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help(loc.t("Lo que el modelo escribió antes de llamar a la herramienta. No es un resultado: lo calculado está en cada tarjeta.",
+                                        "What the model wrote before calling the tool. It is not a result: what was computed is in each card."))
+                        }
+                        ForEach(round.toolCalls ?? []) { ToolCallCard(call: $0) }
+                    }
+                }
+            }
+            .padding(.horizontal, 13).padding(.vertical, 10)
+            .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 16))
+            Spacer(minLength: 70)
+        }
     }
 }

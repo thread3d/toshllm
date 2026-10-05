@@ -6,7 +6,7 @@ import Foundation
 
 struct ToolCallPresentation: Equatable {
     enum Kind: Equatable {
-        case read, write, edit, shell, grep, glob, javaScript, dateTime, search, generic
+        case read, write, edit, shell, grep, glob, javaScript, dateTime, math, search, generic
     }
 
     struct Edit: Equatable, Identifiable {
@@ -84,6 +84,24 @@ struct ToolCallPresentation: Equatable {
                                         code: nil, language: "text", detail: nil,
                                         edits: [], result: result)
         default:
+            if SymPyToolsService.isTool(call.name) {
+                let operation = (args["operation"] as? String ?? "math")
+                    .replacingOccurrences(of: "_", with: " ")
+                return ToolCallPresentation(kind: .math,
+                                            title: operation.prefix(1).uppercased() + operation.dropFirst(),
+                                            path: nil, code: SymPyToolsService.input(args),
+                                            language: "python", detail: nil, edits: [],
+                                            result: result.map(SymPyToolsService.readable))
+            }
+            if ScientificToolsService.isTool(call.name) {
+                let operation = (args["operation"] as? String ?? "compute")
+                    .replacingOccurrences(of: "_", with: " ")
+                return ToolCallPresentation(kind: .math,
+                                            title: operation.prefix(1).uppercased() + operation.dropFirst(),
+                                            path: nil, code: ScientificToolsService.input(args),
+                                            language: "python", detail: nil, edits: [],
+                                            result: result.map(ScientificToolsService.readable))
+            }
             if call.name.localizedCaseInsensitiveContains("search") {
                 let query = string(args, keys: ["query", "q", "search_query"])
                 return ToolCallPresentation(kind: .search,

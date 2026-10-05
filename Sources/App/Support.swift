@@ -91,6 +91,15 @@ enum SettingsKeys {
     static let agentToolsEnabled = "agentToolsEnabled"
     static let toolsRuntime = "toolsRuntime"
     static let jsSandboxEnabled = "jsSandboxEnabled"
+    /// Symbolic math tools from the bundled SymPy runtime. Off by default: on, the engine
+    /// keeps a small helper process beside each server.
+    static let sympyEnabled = "sympyEnabled"
+    /// Numerical tools from the bundled NumPy and SciPy. Off by default, like SymPy.
+    static let scientificEnabled = "scientificEnabled"
+    static let mathAgentEnabled = "mathAgentEnabled"
+    static let mathToolsAllowed = "mathToolsAllowed"
+    /// Characters of a tool result that reach the model; 0 sends it whole.
+    static let toolResultLimit = "toolResultLimit"
     /// memory_list / memory_archive / memory_recall. Off for setups where an
     /// external memory server already covers the job and the model mixes the two.
     static let memoryToolsEnabled = "memoryToolsEnabled"
@@ -106,15 +115,24 @@ enum SettingsKeys {
     static let cacheRAM = "cacheRAM"
     static let parallelSlots = "parallelSlots"
     static let reasoningInline = "reasoningInline"
+    /// Reasoning level for requests that do not choose one: "model", "off", "low", "medium", "high".
+    static let serverDefaultReasoning = "serverDefaultReasoning"
+    /// Response token limit for requests that do not set one; 0 leaves it to the engine.
+    static let serverDefaultMaxTokens = "serverDefaultMaxTokens"
     static let specMTP = "specMTP"
     static let faAmd = "faAmd"
     static let prefetchExperts = "prefetchExperts"
     /// Micro-batch size (--ubatch-size). 0 keeps the engine default of 512.
     static let ubatch = "ubatch"
-    static let dynamicMoe = "dynamicMoe"
-    static let dynamicMoeSlots = "dynamicMoeSlots"
-    static let dynamicMoePrefetch = "dynamicMoePrefetch"
-    static let dynamicMoePolicy = "dynamicMoePolicy"
+    /// Opt-in: the engine plans MoE memory with Dynamic MoE (--dynamic-moe on): full GPU, experts
+    /// in VRAM and RAM, or expert offload, plus the KV type and batch. Off keeps the standard offload.
+    static let dynamicMoeEnabled = "dynamicMoeEnabled"
+    /// auto | full | dmoe | legacy
+    static let executionMode = "executionMode"
+    /// auto | f16 | q8_0 | turbo4
+    static let autoKVMode = "autoKVMode"
+    /// Dynamic MoE keeps in RAM only the experts that are not in VRAM, even when all of them fit.
+    static let dynamicMoeLeanRAM = "dynamicMoeLeanRAM"
     static let routerMode = "routerMode"
     static let routerModelsMax = "routerModelsMax"
     static let serverConfigurationAdvanced = "serverConfigurationAdvanced"
@@ -245,11 +263,11 @@ enum SettingsKeys {
         audioGlossary, audioTranslationModel, audioVADMode,
         audioVADProfile, audioVADThreshold, audioVADMinSpeechMS,
         audioVADMinSilenceMS, audioVADMaxSpeechSeconds, audioVADSpeechPadMS,
-        extraArgs, embeddings, agentToolsEnabled, toolsRuntime, jsSandboxEnabled,
+        extraArgs, embeddings, agentToolsEnabled, toolsRuntime, jsSandboxEnabled, sympyEnabled, scientificEnabled, mathAgentEnabled, mathToolsAllowed, toolResultLimit,
         memoryToolsEnabled, toolsUnsupportedModels, mcpServers, uiMcpProxy,
         cacheTypeK, cacheTypeV, mlock, cacheRAM,
-        parallelSlots, reasoningInline, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
-        dynamicMoe, dynamicMoeSlots, dynamicMoePrefetch, dynamicMoePolicy, routerMode, routerModelsMax,
+        parallelSlots, reasoningInline, serverDefaultReasoning, serverDefaultMaxTokens, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
+        dynamicMoeEnabled, dynamicMoeLeanRAM, routerMode, routerModelsMax,
         persistCache, multiGPU, multiGPUCount, splitMode, splitGroupSize, mgpuEvents, mgpuPeer,
         forcePrivateBuffers, cacheReuse, apiKeyEnabled, localNetworkDiscovery,
         menuBarIcon, menuBarGPU, autoStart, updateAutoCheck, appAccent,
@@ -524,6 +542,31 @@ enum EngineLock {
         }
         save([])
         return reaped
+    }
+
+    /// Kills engines from one of our bundles that launchd has adopted: a router child whose
+    /// parent engine died, or an engine whose app went away. A live engine always hangs off
+    /// the app or off its router, so nothing running is touched.
+    static func reapStrayEngines() {
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return }
+        var pids = [pid_t](repeating: 0, count: Int(count) + 64)
+        let n = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
+        guard n > 0 else { return }
+        for pid in pids.prefix(Int(n)) where pid > 1 {
+            var info = proc_bsdinfo()
+            let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size, info.pbi_ppid == 1 else { continue }
+            var buffer = [CChar](repeating: 0, count: 4096)
+            guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { continue }
+            let path = String(cString: buffer)
+            guard path.contains("ToshLLM.app/Contents/Resources/bin"), path.hasSuffix("/llama-server") else { continue }
+            AppLog.app.warning("Reaping stray engine pid \(pid) at \(path)")
+            kill(pid, SIGTERM)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
+                if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+            }
+        }
     }
 }
 

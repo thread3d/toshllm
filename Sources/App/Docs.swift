@@ -242,6 +242,29 @@ Agentes de terminal y SDKs basados en el formato Anthropic, no solo OpenAI. El m
 - El servidor acepta tanto `Authorization: Bearer` como `x-api-key`, el header que usan estos clientes.
 - Revisa la documentación de tu cliente para el nombre exacto de su archivo de configuración; muchos leen esas variables solo al arrancar, así que reinícialo tras cambiarlas.
 """),
+        DocSection(title: "Herramientas matemáticas y el agente", icon: "function", body: """
+Con **Matemática simbólica (SymPy)** o **Cálculo científico (NumPy y SciPy)** encendidos (Ajustes del chat → Agentes), el motor lleva diez herramientas con 70 operaciones: expresiones, ecuaciones, matrices y verificación con SymPy; integrales y ecuaciones numéricas, optimización, ajuste, estadística y señales con SciPy. El infinito se escribe `oo` y `-oo`.
+
+#### El agente de Tosh
+El turno lo lleva el motor, no la app: decide si la pregunta pide un cálculo, obliga a pasar por una herramienta o a preguntar lo que falta, compara cada llamada con tu mensaje antes de ejecutarla y solo deja en la respuesta números de tu mensaje o de un resultado validado. El chat de la app y el chat web lo usan; las tarjetas de herramientas muestran cada llamada, lo que se leyó y si se validó o se rechazó.
+
+Las herramientas matemáticas se usan sin preguntar, porque solo calculan; puedes apagarlo en **Usar las herramientas matemáticas sin preguntar**. Entonces el chat pide permiso en cada llamada y lleva el turno él mismo, con las mismas reglas, porque el motor no puede preguntarte.
+
+#### Desde fuera de la app
+- **Agente**: `/v1/chat/completions` con la cabecera `X-Tosh-Agent: on`. Sin cabecera también, si activas **Responder con las herramientas por la API**. La respuesta trae un objeto `tosh` con `version`, `intent`, `outcome`, las llamadas con su `status`, los `validated_results` y las pasadas del modelo.
+- **Inferencia en bruto**: con `X-Tosh-Agent: off`, o con `tools`, `grammar`, `json_schema` o `response_format` en la petición. Es el modelo tal cual, sin ninguna de esas garantías.
+- **Herramientas directas**: `GET /tools` y `POST /tools` `{"tool": "scientific_compute", "params": {...}}`. Una llamada, sin modelo.
+
+En streaming llegan avisos de progreso con `delta` vacío y la respuesta entera al final, ya comprobada. Cerrar la conexión detiene el turno.
+
+Los campos `_source`, `_reviewed` y `_trust` son internos: el motor los pone con una clave que ningún cliente ve, y si los manda un cliente se descartan.
+
+```
+curl http://127.0.0.1:8080/v1/chat/completions -H 'X-Tosh-Agent: on' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"messages":[{"role":"user","content":"Integra x^3/(e^x-1) de 0 a infinito"}]}'
+```
+"""),
         DocSection(title: "Rendimiento de referencia", icon: "gauge.high", body: """
 Números medidos en el equipo de desarrollo (RX 6700 XT 12 GB, DDR4, macOS):
 
@@ -260,6 +283,8 @@ La generación de modelos MoE híbridos está limitada por el ancho de banda de 
 **La salida es texto sin sentido** — Verifica que "Estabilidad AMD dGPU" esté activada en Ajustes. Es la causa #1 en GPUs AMD discretas.
 
 **Va muy lento (2-8 t/s)** — Activa "Copiar pesos a VRAM (--no-mmap)". Si ya está activo, la VRAM puede estar saturada: sube "Expertos MoE en CPU" un par de capas.
+
+**Hackintosh más lento de lo esperado** — Si OpenCore inyecta `ATY,Henbury` en `DeviceProperties`, prueba a quitarlo: en una RX 6600 XT la generación subió de 14 a 20 t/s.
 
 **La velocidad colapsa de repente** — VRAM desbordada. Sube el ncmoe o reduce el contexto.
 
@@ -486,6 +511,29 @@ Terminal agents and SDKs built on the Anthropic format, not just OpenAI's. The e
 - The server accepts both `Authorization: Bearer` and `x-api-key`, the header these clients use.
 - Check your client's docs for its exact config file name; many only read those variables at startup, so restart it after changing them.
 """),
+        DocSection(title: "Math tools and the agent", icon: "function", body: """
+With **Symbolic math (SymPy)** or **Scientific computing (NumPy and SciPy)** on (chat settings → Agents), the engine carries ten tools with 70 operations: expressions, equations, matrices and verification with SymPy; numerical integrals and equations, optimization, fitting, statistics and signals with SciPy. Infinity is written `oo` and `-oo`.
+
+#### The Tosh agent
+The engine runs the turn, not the app: it decides whether the question asks for a computation, makes it go through a tool or ask for what is missing, checks every call against your message before running it, and only lets the answer state numbers from your message or from a validated result. The app's chat and the web chat use it; the tool cards show each call, what was read and whether it was validated or refused.
+
+The math tools are used without asking, since they only compute; you can turn that off with **Use the math tools without asking**. The chat then asks before each call and runs the turn itself, with the same rules, since the engine cannot ask you.
+
+#### From outside the app
+- **Agent**: `/v1/chat/completions` with the header `X-Tosh-Agent: on`. Without the header too, if **Answer with the tools over the API** is on. The reply carries a `tosh` object with `version`, `intent`, `outcome`, the calls with their `status`, the `validated_results` and the model passes.
+- **Raw inference**: with `X-Tosh-Agent: off`, or with `tools`, `grammar`, `json_schema` or `response_format` in the request. It is the model as it is, without any of those guarantees.
+- **Direct tools**: `GET /tools` and `POST /tools` `{"tool": "scientific_compute", "params": {...}}`. One call, no model.
+
+When streaming, progress chunks with an empty `delta` arrive first and the whole answer at the end, already checked. Closing the connection stops the turn.
+
+The `_source`, `_reviewed` and `_trust` fields are internal: the engine sets them with a key no client sees, and a client that sends them has them dropped.
+
+```
+curl http://127.0.0.1:8080/v1/chat/completions -H 'X-Tosh-Agent: on' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"messages":[{"role":"user","content":"Integrate x^3/(e^x-1) from 0 to infinity"}]}'
+```
+"""),
         DocSection(title: "Reference performance", icon: "gauge.high", body: """
 Numbers measured on the development machine (RX 6700 XT 12 GB, DDR4, macOS):
 
@@ -504,6 +552,8 @@ Hybrid MoE generation is RAM-bandwidth-bound: a faster GPU won't improve it, but
 **Output is gibberish** — Save the server log and report the model, quantization and GPU; the bundled engine already applies the discrete-GPU safety mode.
 
 **Very slow (2-8 t/s)** — Enable "Copy weights to VRAM (--no-mmap)". If already on, VRAM may be saturated: raise "MoE experts on CPU" a couple of layers.
+
+**Hackintosh slower than expected** — If OpenCore injects `ATY,Henbury` in `DeviceProperties`, try removing it: on an RX 6600 XT generation went from 14 to 20 t/s.
 
 **Speed suddenly collapses** — VRAM overflow. Raise ncmoe or reduce context.
 

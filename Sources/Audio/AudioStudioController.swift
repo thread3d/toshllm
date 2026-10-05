@@ -687,6 +687,7 @@ final class AudioStudioController: ObservableObject {
         request.httpMethod = "POST"
         request.timeoutInterval = 600
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("off", forHTTPHeaderField: "X-Tosh-Agent")
         if let apiKey, !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }

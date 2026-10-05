@@ -6,11 +6,11 @@ import SwiftUI
 
 // MARK: - Markdown rendering
 
-private enum MDBlock: Equatable {
+enum MDBlock: Equatable {
     case paragraph(String)
     case header(Int, String)
     case bullet([String])
-    case numbered([String])
+    case numbered(Int, [String])   // start number, items
     case code(String, String)   // language, content
     case math(String)
     case quote(String)
@@ -108,20 +108,29 @@ struct RichText: View {
 
     // MARK: parser
 
-    private static func parse(_ raw: String) -> [MDBlock] {
+    static func parse(_ raw: String) -> [MDBlock] {
         var blocks: [MDBlock] = []
         var lines = raw.split(separator: "\n", omittingEmptySubsequences: false)[...]
         var paragraph: [String] = []
         var bullets: [String] = []
         var numbers: [String] = []
+        var numberStart = 1
+        // Indented lines right after a list item are its continuation, not
+        // literal text, so their indentation is dropped.
+        var afterListItem = false
 
         func flush() {
             if !paragraph.isEmpty {
-                blocks.append(.paragraph(paragraph.joined(separator: "\n")))
+                let text = paragraph.joined(separator: "\n")
+                if let formula = standaloneMath(text) {
+                    blocks.append(.math(formula))
+                } else {
+                    blocks.append(.paragraph(text))
+                }
                 paragraph = []
             }
             if !bullets.isEmpty { blocks.append(.bullet(bullets)); bullets = [] }
-            if !numbers.isEmpty { blocks.append(.numbered(numbers)); numbers = [] }
+            if !numbers.isEmpty { blocks.append(.numbered(numberStart, numbers)); numbers = [] }
         }
 
         while let line = lines.first {
@@ -129,18 +138,24 @@ struct RichText: View {
             let l = String(line)
 
             let trimmed = l.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("$$") || trimmed == "\\[" {
+            if !trimmed.isEmpty, l.first?.isWhitespace != true { afterListItem = false }
+            if trimmed.hasPrefix("$$") || trimmed.hasPrefix("\\[") {
                 flush()
-                let bracketed = trimmed == "\\["
-                let closing = bracketed ? "\\]" : "$$"
-                if !bracketed, trimmed.count > 4, trimmed.hasSuffix("$$") {
-                    blocks.append(.math(String(trimmed.dropFirst(2).dropLast(2))))
+                let closing = trimmed.hasPrefix("\\[") ? "\\]" : "$$"
+                let opening = trimmed.dropFirst(2)
+                if opening.count >= 2, opening.hasSuffix(closing) {
+                    blocks.append(.math(String(opening.dropLast(2))))
                     continue
                 }
-                var formula: [String] = []
+                var formula = opening.isEmpty ? [] : [String(opening)]
+                // The closing delimiter may share a line with the last row.
                 while let next = lines.first {
                     lines = lines.dropFirst()
-                    if next.trimmingCharacters(in: .whitespaces) == closing { break }
+                    let t = next.trimmingCharacters(in: .whitespaces)
+                    if t.hasSuffix(closing) {
+                        if t.count > 2 { formula.append(String(t.dropLast(2))) }
+                        break
+                    }
                     formula.append(String(next))
                 }
                 blocks.append(.math(formula.joined(separator: "\n")))
@@ -189,15 +204,24 @@ struct RichText: View {
                 blocks.append(.rule)
             } else if l.range(of: #"^\s*[-*+] "#, options: .regularExpression) != nil {
                 if !paragraph.isEmpty || !numbers.isEmpty { flush() }
-                bullets.append(l.replacingOccurrences(of: #"^\s*[-*+] "#, with: "", options: .regularExpression))
-            } else if l.range(of: #"^\s*\d+[.)] "#, options: .regularExpression) != nil {
+                afterListItem = true
+                bullets.append(String(l.replacingOccurrences(of: #"^\s*[-*+] "#, with: "", options: .regularExpression)
+                    .drop(while: \.isWhitespace)))
+            } else if let marker = l.range(of: #"^\s*\d+[.)] "#, options: .regularExpression) {
                 if !paragraph.isEmpty || !bullets.isEmpty { flush() }
-                numbers.append(l.replacingOccurrences(of: #"^\s*\d+[.)] "#, with: "", options: .regularExpression))
-            } else if l.trimmingCharacters(in: .whitespaces).isEmpty {
+                // A list split by blank lines or paragraphs keeps counting
+                // from the number written in the source.
+                if numbers.isEmpty { numberStart = Int(l[marker].filter(\.isNumber).prefix(9)) ?? 1 }
+                afterListItem = true
+                numbers.append(String(l[marker.upperBound...].drop(while: \.isWhitespace)))
+            } else if trimmed.isEmpty {
                 flush()
+            } else if let formula = standaloneMath(l) {
+                flush()
+                blocks.append(.math(formula))
             } else {
                 if !bullets.isEmpty || !numbers.isEmpty { flush() }
-                paragraph.append(l)
+                paragraph.append(afterListItem ? String(l.drop(while: \.isWhitespace)) : l)
             }
         }
         flush()
@@ -251,6 +275,7 @@ struct RichText: View {
     }
 
     private static func format(_ s: String) -> AttributedString {
+        let s = symbolizingMath(s)
         var attr = (try? AttributedString(markdown: s, options: .init(
             allowsExtendedAttributes: false,
             interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(s)
@@ -263,23 +288,145 @@ struct RichText: View {
         return attr
     }
 
-    /// Delimiters must hug non-space text and the body look like LaTeX, so that
-    /// prose about `$HOME … $PATH` or `$10 … $25` is not a formula.
+    /// Shared with the KaTeX page through `inlineMathScript`. Delimiters must hug
+    /// text and a body starting with a digit must be a whole number expression,
+    /// so `$HOME … $PATH` or `$10 … $25` is not a formula.
     static let inlineMathPattern =
-        #"\\\(([^\n]{1,160}?)\\\)|(?<![\\$])\$(?![\s\d])([^\n$]{1,160}?)(?<![\s\\$])\$(?!\$)"#
+        #"\\\(([^\n]{1,160}?)\\\)|(?<![\\$])\$(?![\s\d])([^\n$]{1,160}?)(?<![\s\\$])\$(?!\$)|(?<![\\$\w])\$(\d[^\n$]{0,160}?)(?<![\s\\$])\$(?![\w$])"#
 
-    static func looksLikeFormula(_ body: String) -> Bool {
-        body.count <= 3 || body.contains { "\\^_{}".contains($0) }
+    /// Short bodies, anything with LaTeX syntax, or plain numbers joined by
+    /// operators (`84`, `-4`, `3.14`, `1/84`).
+    static let formulaBodyPattern =
+        #"^(?:[\s\S]{1,3}|[\s\S]*[\\^_{}][\s\S]*|-?\d+(?:[.,]\d+)*(?:\s*[-+*/=<>]\s*-?\d+(?:[.,]\d+)*)*)$"#
+    /// `\(…\)` is explicit math, so an operator is also enough (`\(x + y\)`).
+    static let parenBodyPattern = #"[=+\-*/<>]"#
+
+    private static let formulaBodyRegex = try? NSRegularExpression(pattern: formulaBodyPattern)
+    private static let parenBodyRegex = try? NSRegularExpression(pattern: parenBodyPattern)
+
+    static func looksLikeFormula(_ body: String, parenthesized: Bool = false) -> Bool {
+        let range = NSRange(body.startIndex..., in: body)
+        if parenthesized, parenBodyRegex?.firstMatch(in: body, range: range) != nil { return true }
+        return formulaBodyRegex?.firstMatch(in: body, range: range) != nil
+    }
+
+    /// A paragraph or line that is one large `$…$` or `\(…\)` formula is display math:
+    /// the inline length limit is for formulas embedded in prose.
+    static func standaloneMath(_ paragraph: String) -> String? {
+        let t = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body: Substring
+        if t.count > 4, t.hasPrefix("\\("), t.hasSuffix("\\)") {
+            body = t.dropFirst(2).dropLast(2)
+            if body.contains("\\(") || body.contains("\\)") { return nil }
+        } else if t.count > 2, t.hasPrefix("$"), !t.hasPrefix("$$"), t.hasSuffix("$") {
+            body = t.dropFirst().dropLast()
+            if body.contains("$") { return nil }
+        } else {
+            return nil
+        }
+        let formula = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let large = formula.contains("\\begin{") || formula.contains("\n") || formula.count > 160
+        guard large, looksLikeFormula(formula) else { return nil }
+        return formula
+    }
+
+    /// JavaScript twin of `inlineMathBodies`, built from the same two patterns.
+    /// `toshTokenizeMath` swaps each formula for a placeholder token.
+    static var inlineMathScript: String {
+        let encode = { (value: String) in
+            (try? String(data: JSONEncoder().encode(value), encoding: .utf8)) ?? "\"\""
+        }
+        return """
+        const toshMathPattern = new RegExp(\(encode(inlineMathPattern)), 'gu');
+        const toshFormulaBody = new RegExp(\(encode(formulaBodyPattern)), 'u');
+        const toshParenBody = new RegExp(\(encode(parenBodyPattern)), 'u');
+        function toshTokenizeMath(raw) {
+          const formulas = [];
+          const text = raw.replace(toshMathPattern, (match, paren, dollar, number) => {
+            const body = paren ?? dollar ?? number;
+            if (!toshFormulaBody.test(body) && !(paren !== undefined && toshParenBody.test(body))) return match;
+            formulas.push(body);
+            return `TOSHMATH${formulas.length - 1}TOKEN`;
+          });
+          return { text, formulas };
+        }
+        """
+    }
+
+    /// LaTeX commands with a single Unicode glyph, so `$\neq$` renders as text
+    /// wherever the line is shown, not only in paragraphs.
+    static let mathSymbols: [String: String] = [
+        "to": "→", "rightarrow": "→", "leftarrow": "←", "gets": "←", "leftrightarrow": "↔",
+        "Rightarrow": "⇒", "Leftarrow": "⇐", "Leftrightarrow": "⇔", "implies": "⇒", "iff": "⇔",
+        "longrightarrow": "⟶", "longleftarrow": "⟵", "mapsto": "↦", "uparrow": "↑", "downarrow": "↓",
+        "neq": "≠", "ne": "≠", "leq": "≤", "le": "≤", "geq": "≥", "ge": "≥", "approx": "≈",
+        "sim": "∼", "simeq": "≃", "equiv": "≡", "propto": "∝", "ll": "≪", "gg": "≫",
+        "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆", "supset": "⊃", "supseteq": "⊇",
+        "cup": "∪", "cap": "∩", "emptyset": "∅", "forall": "∀", "exists": "∃", "neg": "¬",
+        "land": "∧", "wedge": "∧", "lor": "∨", "vee": "∨", "times": "×", "cdot": "·", "div": "÷",
+        "pm": "±", "mp": "∓", "ast": "∗", "circ": "∘", "infty": "∞", "partial": "∂", "nabla": "∇",
+        "sum": "∑", "prod": "∏", "int": "∫", "ldots": "…", "dots": "…", "cdots": "⋯",
+        "degree": "°", "checkmark": "✓",
+        "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε",
+        "zeta": "ζ", "eta": "η", "theta": "θ", "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ",
+        "nu": "ν", "xi": "ξ", "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "phi": "φ",
+        "varphi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω", "Gamma": "Γ", "Delta": "Δ",
+        "Theta": "Θ", "Lambda": "Λ", "Pi": "Π", "Sigma": "Σ", "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+    ]
+
+    private static let inlineMathRegex = try? NSRegularExpression(pattern: inlineMathPattern)
+    private static let mathCommandRegex = try? NSRegularExpression(pattern: #"\\([A-Za-z]+)"#)
+
+    /// Rewrites formulas made only of known symbols and plain operands (`$a \neq b$`)
+    /// as text; anything with scripts, braces or other commands is left for KaTeX.
+    /// Code spans are skipped.
+    static func symbolizingMath(_ value: String) -> String {
+        guard value.contains("\\"), let regex = inlineMathRegex, let commands = mathCommandRegex
+        else { return value }
+        let segments = value.components(separatedBy: "`")
+        return segments.enumerated().map { index, segment in
+            guard index.isMultiple(of: 2), segment.contains("\\") else { return segment }
+            var out = segment
+            let matches = regex.matches(in: segment, range: NSRange(segment.startIndex..., in: segment))
+            for match in matches.reversed() {
+                guard let whole = Range(match.range, in: out),
+                      let bodyRange = [1, 2, 3].lazy.compactMap({ Range(match.range(at: $0), in: segment) }).first
+                else { continue }
+                let body = String(segment[bodyRange])
+                let ns = NSRange(body.startIndex..., in: body)
+                var text = body
+                var known = true
+                for command in commands.matches(in: body, range: ns).reversed() {
+                    guard let r = Range(command.range, in: text),
+                          let nameRange = Range(command.range(at: 1), in: body),
+                          let glyph = mathSymbols[String(body[nameRange])]
+                    else { known = false; break }
+                    text.replaceSubrange(r, with: glyph)
+                }
+                guard known, text != body,
+                      text.range(of: #"^[\p{L}\p{N}\p{Sm}\p{So}\s.,;:+\-=<>()\[\]|/*!'…·]*$"#,
+                                 options: .regularExpression) != nil
+                else { continue }
+                out.replaceSubrange(whole, with: text)
+            }
+            return out
+        }.joined(separator: "`")
     }
 
     static func containsInlineMath(_ value: String) -> Bool {
-        guard let regex = try? NSRegularExpression(pattern: inlineMathPattern) else { return false }
+        !inlineMathBodies(value).isEmpty
+    }
+
+    /// Bodies of the formulas the KaTeX page will typeset in `value`.
+    static func inlineMathBodies(_ value: String) -> [String] {
+        guard let regex = inlineMathRegex else { return [] }
         let range = NSRange(value.startIndex..., in: value)
-        return regex.matches(in: value, range: range).contains { match in
-            (1...2).contains { group in
-                guard let r = Range(match.range(at: group), in: value) else { return false }
-                return looksLikeFormula(String(value[r]))
-            }
+        return regex.matches(in: value, range: range).compactMap { match in
+            guard let group = (1...3).first(where: { match.range(at: $0).location != NSNotFound }),
+                  let r = Range(match.range(at: group), in: value)
+            else { return nil }
+            let body = String(value[r])
+            return looksLikeFormula(body, parenthesized: group == 1) ? body : nil
         }
     }
 }
@@ -337,15 +484,9 @@ private struct MDBlockView: View, Equatable {
     var body: some View {
         switch block {
         case .paragraph(let s):
-            if RichText.containsInlineMath(s) {
-                InlineMathText(source: s)
-            } else {
-                Text(RichText.inline(s)).textSelection(.enabled)
-            }
+            InlineMarkdown(source: s)
         case .header(let level, let s):
-            Text(RichText.inline(s))
-                .chatFont(level <= 1 ? .heading1 : level == 2 ? .heading2 : .heading3, weight: .bold)
-                .textSelection(.enabled)
+            InlineMarkdown(source: s, heading: level <= 1 ? .heading1 : level == 2 ? .heading2 : .heading3)
                 .padding(.top, 2)
         case .bullet(let items):
             VStack(alignment: .leading, spacing: 3) {
@@ -354,24 +495,21 @@ private struct MDBlockView: View, Equatable {
                         if let done = RichText.taskState(item) {
                             Image(systemName: done ? "checkmark.square" : "square")
                                 .font(.callout).foregroundStyle(.secondary)
-                            Text(RichText.inline(String(item.dropFirst(4)))).textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
+                            InlineMarkdown(source: String(item.dropFirst(4)))
                         } else {
                             Text("•").foregroundStyle(.secondary)
-                            Text(RichText.inline(item)).textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
+                            InlineMarkdown(source: item)
                         }
                     }
                 }
             }
-        case .numbered(let items):
+        case .numbered(let start, let items):
             VStack(alignment: .leading, spacing: 3) {
                 ForEach(Array(items.enumerated()), id: \.offset) { i, item in
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
-                        Text("\(i + 1).").foregroundStyle(.secondary)
+                        Text("\(start + i).").foregroundStyle(.secondary)
                             .chatFont(.code, design: .monospaced)
-                        Text(RichText.inline(item)).textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        InlineMarkdown(source: item)
                     }
                 }
             }
@@ -393,6 +531,25 @@ private struct MDBlockView: View, Equatable {
             MDTable(headers: headers, rows: rows)
         case .rule:
             Divider().padding(.vertical, 2)
+        }
+    }
+}
+
+/// One line-level renderer for paragraphs, list items and headings: formulas
+/// go to KaTeX, everything else stays native text.
+private struct InlineMarkdown: View {
+    let source: String
+    var heading: ChatFont.Base?
+
+    var body: some View {
+        if RichText.containsInlineMath(RichText.symbolizingMath(source)) {
+            InlineMathText(source: source, base: heading ?? .body, bold: heading != nil)
+        } else if let heading {
+            Text(RichText.inline(source)).chatFont(heading, weight: .bold).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            Text(RichText.inline(source)).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
