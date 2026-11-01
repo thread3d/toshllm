@@ -22,6 +22,8 @@ struct ChatAttachment: Identifiable, Codable, Equatable {
     var byteCount: Int? = nil
     var durationSeconds: Double? = nil
     var videoFrameArea: Int? = nil
+    /// SHA-256 of the file's bytes, which tells the same file attached again from another with its name.
+    var digest: String? = nil
 
     // mtmd samples video at ~4 fps with no cap; Qwen-VL bills each frame by its
     // pixels (≈1 token / 32x32) up to a per-frame cap.
@@ -90,11 +92,24 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     /// What the model wrote before the tool calls of this round. It is not an answer, so it is never
     /// the body; it is dropped once a math call of the round does not succeed.
     var interim: String? = nil
+    /// An agent's request for the map of this answer, sent back as it came, and the map once fetched.
+    var mapRequest: String? = nil
+    var map: ChatMap? = nil
+    /// A figure the agent drew with the answer in a plane of its own, such as a tract from its deed's calls.
+    var sketches: [ChatSketch]? = nil
+    /// Lines of the answer a later turn needs, as the agent marked them: kept as written when the answer is summarized.
+    var kept: String? = nil
+
+    /// Tokens an image costs a vision model at the chat's largest image size, on the high side (Qwen-VL: a token per
+    /// 28x28 pixels).
+    static let tokensPerImageMegapixel = 1300
 
     var estimatedTokens: Int {
         let text = role == "assistant" ? parts.body + (settledInterim ?? "") : wireContent
         let attached = (attachments ?? []).reduce(0) { $0 + $1.estimatedTokens }
-        return max(1, text.count / 4) + attached
+        let megapixels = min(4, max(1, UserDefaults.standard.double(forKey: SettingsKeys.chatMaxImageMegapixels)))
+        let images = (imageURIs ?? []).count * Int(megapixels * Double(Self.tokensPerImageMegapixel))
+        return max(1, text.count / 4) + attached + images
     }
 
     /// The interim text once it may be shown and sent back: every math call of the round succeeded.
@@ -172,6 +187,10 @@ struct Conversation: Identifiable, Codable {
     /// Last exchange's context tokens, per chat so the bar follows the open
     /// conversation and persists with the KV cache. Optional for old JSON.
     var contextUsed: Int? = nil
+    /// How many messages the conversation had when the server counted `contextUsed`: past that it is stale.
+    var contextUsedAt: Int? = nil
+    /// What the agent marked to keep of the answers summarized so far, oldest first.
+    var kept: [String]? = nil
 }
 
 struct ChatBranch: Identifiable, Codable, Equatable {
@@ -228,6 +247,14 @@ struct ChatProject: Identifiable, Codable, Equatable {
 
 struct StreamError: LocalizedError {
     let message: String
+    /// The server ended the turn with this error: resuming the stream would only replace it.
+    var fromServer = false
+    /// The engine failed on the GPU.
+    var gpu = false
+    /// The stream was cut before the answer ended and could not be resumed.
+    var cut = false
+    /// The request did not fit the context: the tokens the engine counted for it.
+    var contextTokens: Int? = nil
     var errorDescription: String? { message }
 }
 
@@ -251,6 +278,10 @@ final class LiveStream: ObservableObject {
     @Published var speed: Double?
     /// Prompt-processing progress 0…1 before the first token; nil otherwise.
     @Published var prefillProgress: Double?
+    /// What the server's agent says it is doing, such as reading a page, until the answer starts.
+    @Published var agentStatus: String?
+    private(set) var startedAt = Date()
+    private(set) var statusSince = Date()
 
     private var latestReasoning = ""
     private var lastReasoningPublish = Date.distantPast
@@ -269,6 +300,15 @@ final class LiveStream: ObservableObject {
         lastTailPublish = .distantPast
         speed = nil
         prefillProgress = nil
+        agentStatus = nil
+        startedAt = Date()
+        statusSince = startedAt
+    }
+
+    func setStatus(_ text: String) {
+        guard text != agentStatus else { return }
+        agentStatus = text
+        statusSince = Date()
     }
 
     var snapshot: StreamSnapshot {
@@ -396,6 +436,8 @@ final class ChatStore: ObservableObject {
     @Published var projects: [ChatProject] = []
     @Published var currentID: UUID?
     @Published var generating = false
+    @Published var mapLoading: Set<UUID> = []
+    @Published var mapFailed: Set<UUID> = []
     /// Conversation currently streaming, so its live bubble only shows there.
     @Published var generatingConvID: UUID?
     @Published var compacting = false
@@ -421,6 +463,48 @@ final class ChatStore: ObservableObject {
     func setContextUsed(_ value: Int?, for id: UUID) {
         guard let i = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[i].contextUsed = value
+        conversations[i].contextUsedAt = value == nil ? nil : conversations[i].messages.count
+    }
+
+    /// The context the conversation takes: the server's count of its last exchange while no message came after it,
+    /// else an estimate from its text, attachments and images, said to be one.
+    var contextReading: (tokens: Int, estimated: Bool)? {
+        guard let i = currentIndex else { return nil }
+        return Self.contextReading(conversations[i], toolTokens: toolTokens)
+    }
+
+    nonisolated static func contextReading(_ c: Conversation, toolTokens: Int) -> (tokens: Int, estimated: Bool) {
+        if let used = current(c) { return (used, false) }
+        return (contextEstimate(c) + toolTokens, true)
+    }
+
+    /// The server's count while no message came after it; a count of nothing is no count, as a conversation never
+    /// takes no tokens.
+    nonisolated private static func current(_ c: Conversation) -> Int? {
+        guard let used = c.contextUsed, used > 0, c.contextUsedAt == c.messages.count else { return nil }
+        return used
+    }
+
+    /// What the next request sends, as the app can estimate it: the summary and what it kept, and the messages
+    /// after it that are not archived.
+    nonisolated static func contextEstimate(_ c: Conversation) -> Int {
+        let skipped = ChatMemoryService.archivedIndices(c.archived)
+        let start = min(c.summarizedCount ?? 0, c.messages.count)
+        let messages = c.messages.indices.filter { $0 >= start && !skipped.contains($0) }
+            .reduce(0) { $0 + c.messages[$1].estimatedTokens }
+        let summary = ((c.summary ?? "").count + (c.kept ?? []).reduce(0) { $0 + $1.count }) / 4
+        return messages + summary
+    }
+
+    /// The fill that decides when to summarize: the server's count while it is current, else the estimate, so a turn
+    /// that reported nothing, such as an agent's answer by rules, never reads as an empty context.
+    nonisolated static func contextForDecisions(_ c: Conversation, toolTokens: Int = 0) -> Int {
+        current(c) ?? contextEstimate(c) + toolTokens
+    }
+
+    /// Tokens as the context meter shows them: tenths under ten thousand, so a small conversation is not "0k".
+    nonisolated static func kiloTokens(_ tokens: Int) -> String {
+        tokens < 10_000 ? String(format: "%.1fk", Double(tokens) / 1000) : "\(tokens / 1000)k"
     }
 
     /// Set when the engine refuses the server agent, until the engine starts again.
@@ -430,10 +514,16 @@ final class ChatStore: ObservableObject {
 
     /// A progress event of the server agent: the calls it ran show as cards, ahead of the answer.
     func agentEvent(_ event: [String: Any], conversation id: UUID) {
-        lastStreamActivity = Date()
+        liveness.note(text: false)
         switch event["type"] as? String {
         case "intent":
             lastMathIntent = (event["intent"] as? String).flatMap(MathIntent.init(rawValue:))
+        case "progress":
+            if let label = event["label"] as? String, !label.isEmpty { live.setStatus(String(label.prefix(120))) }
+        case "pass":
+            if event["state"] as? String == "start", let n = event["n"] as? Int {
+                live.setStatus(Localizer().t("El modelo está pensando (pasada %@)", "The model is thinking (pass %@)", String(n)))
+            }
         case "tool_call":
             guard let call = event["call"] as? [String: Any],
                   let i = conversations.firstIndex(where: { $0.id == id }),
@@ -443,16 +533,21 @@ final class ChatStore: ObservableObject {
             let arguments: String = {
                 if let text = call["arguments"] as? String { return text }
                 guard let value = call["arguments"], JSONSerialization.isValidJSONObject(value),
-                      let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+                      let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
                 else { return "{}" }
                 return String(decoding: data, as: UTF8.self)
             }()
             let result = call["result"] as? String ?? ""
             let serverID = call["id"] as? String ?? UUID().uuidString
             let now = Date()
-            let toolCall = ChatToolCall(serverID: serverID, name: call["tool"] as? String ?? "", arguments: arguments,
-                                        result: result, state: call["state"] as? String == "completed" ? .completed : .failed,
-                                        startedAt: now, finishedAt: now)
+            // an agent that only reports the call's status still shows its successful calls as such
+            let accepted = call["state"] as? String == "accepted" || call["status"] as? String == "accepted"
+            let completed = accepted || (call["state"] as? String).map { $0 == "completed" } ?? (call["status"] as? String == "ok")
+            let summary = (call["summary"] as? String).map { String($0.prefix(400)) }
+            var toolCall = ChatToolCall(serverID: serverID, name: call["tool"] as? String ?? "", arguments: arguments,
+                                        result: result, state: completed ? .completed : .failed,
+                                        startedAt: now, finishedAt: now, summary: summary?.isEmpty == false ? summary : nil)
+            toolCall.accepted = accepted ? true : nil
             let reply = ChatMessage(role: "tool", content: ToolResultLimit.apply(result), toolCallID: serverID)
             if let current = agentPassMessage[id], current.pass == pass,
                let j = conversations[i].messages.firstIndex(where: { $0.id == current.messageID }) {
@@ -475,8 +570,9 @@ final class ChatStore: ObservableObject {
     private var watchdog: Task<Void, Never>?
     /// Where the running reply is streamed from, so Stop can cancel it on the engine too.
     private var activeStream: (port: Int, identity: String)?
-    private var lastStreamActivity = Date()
-    private var sawFirstToken = false
+    private var liveness = StreamLiveness()
+    /// Estimated tokens of the tool definitions the last request sent, which the context holds before any reply.
+    @Published private(set) var toolTokens = 0
     private var slotConvID: UUID?
     private var agentContext: AgentRunContext?
 
@@ -490,8 +586,7 @@ final class ChatStore: ObservableObject {
     nonisolated let headless: Bool
 
     private var fileURL: URL {
-        let dir = storageDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ToshLLM")
+        let dir = storageDirectory ?? AppSupport.directory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("conversations.json")
     }
@@ -568,9 +663,7 @@ final class ChatStore: ObservableObject {
     /// Erases the stored conversations without a store: the settings window can
     /// outlive the chat window, and then nothing holds them in memory.
     static func eraseStoredConversations() {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ToshLLM")
-        try? FileManager.default.removeItem(at: dir.appendingPathComponent("conversations.json"))
+        try? FileManager.default.removeItem(at: AppSupport.directory.appendingPathComponent("conversations.json"))
         let slots = ServerSettings.primarySlotCacheDir
         guard let files = try? FileManager.default.contentsOfDirectory(at: slots,
                                                                       includingPropertiesForKeys: nil)
@@ -799,7 +892,8 @@ final class ChatStore: ObservableObject {
                         sampling: ChatSamplingSettings = ChatSamplingSettings(),
                         modalities: ModelModalities? = nil,
                         continuationInstruction: String? = nil,
-                        agentRun: AgentRunContext? = nil) {
+                        agentRun: AgentRunContext? = nil,
+                        agentDeclined: Bool = false) {
         generating = true
         generatingConvID = conversations[i].id
         live.reset()
@@ -817,6 +911,7 @@ final class ChatStore: ObservableObject {
         } ?? system)
         let toolsEnabled = UserDefaults.standard.bool(forKey: SettingsKeys.agentToolsEnabled)
             || SymPyToolsService.isEnabled || ScientificToolsService.isEnabled
+            || !EngineExtensions.chatToolPrefixes().isEmpty
         let javaScriptEnabled = UserDefaults.standard.bool(forKey: SettingsKeys.jsSandboxEnabled)
         let memoryToolsEnabled = ChatMemoryService.isEnabled
         let agentTurnLimit = Self.configuredAgentTurnLimit
@@ -828,38 +923,31 @@ final class ChatStore: ObservableObject {
         let userTexts = conversations[i].messages.filter { $0.role == "user" }.map(\.wireContent)
         let request = agentRun == nil ? userTexts.last : nil
         let agentHistory = Self.agentHistory(system: systemWithCwd, summary: conversations[i].summary,
-                                             messages: conversations[i].messages, from: conversations[i].summarizedCount ?? 0)
-        let agentAllowed = agentRun == nil && continuationInstruction == nil && !Self.serverAgentMissing
+                                             messages: conversations[i].messages, from: conversations[i].summarizedCount ?? 0,
+                                             modalities: modalities, kept: conversations[i].kept)
+        // an agent that takes the chat's tools also gets the rounds after the chat runs the calls it handed back
+        let clientToolsAgent = EngineExtensions.active().contains(where: \.agentTakesClientTools)
+        let agentAllowed = (agentRun == nil || clientToolsAgent && agentRun?.instruction == nil && agentRun?.finalizing != true)
+            && continuationInstruction == nil && !Self.serverAgentMissing && !agentDeclined
         var history = Self.requestHistory(system: systemWithCwd,
                                           summary: conversations[i].summary,
                                           messages: conversations[i].messages,
                                           from: conversations[i].summarizedCount ?? 0,
                                           archived: conversations[i].archived,
-                                          modalities: modalities)
+                                          modalities: modalities, kept: conversations[i].kept,
+                                          trimBefore: Self.trimStart(conversations[i], limit: Self.contextLimitSetting(),
+                                                                     toolTokens: toolTokens))
         if let note = continuationInstruction ?? agentRun?.instruction ?? (holdText ? MathGrounding.standingNote : nil) {
             history.append(["role": "user", "content": note])
         }
 
         // Reasoning off can come from the toggle or a typed /no_think; a typed
-        // switch overrides the toggle for this turn. Not persisted to history.
+        // switch overrides the toggle for this turn.
         var reasoningOff = !thinking || sampling.reasoningEffort == "off"
         if let last = history.lastIndex(where: { ($0["role"] as? String) == "user" }) {
             let typed = Self.messageText(history[last]["content"])
             if typed.contains("/no_think") { reasoningOff = true }
             else if typed.contains("/think") { reasoningOff = false }
-
-            if reasoningOff, !typed.contains("/no_think") {
-                if let s = history[last]["content"] as? String {
-                    history[last]["content"] = s + "\n/no_think"
-                } else if var parts = history[last]["content"] as? [[String: Any]] {
-                    if let ti = parts.firstIndex(where: { ($0["type"] as? String) == "text" }) {
-                        parts[ti]["text"] = ((parts[ti]["text"] as? String) ?? "") + "\n/no_think"
-                    } else {
-                        parts.insert(["type": "text", "text": "/no_think"], at: 0)
-                    }
-                    history[last]["content"] = parts
-                }
-            }
         }
 
         conversations[i].messages.append(ChatMessage(role: "assistant", content: ""))
@@ -875,7 +963,7 @@ final class ChatStore: ObservableObject {
                 self?.live.update(reasoning: snap.reasoning, visible: snap.visible, speed: snap.speed)
                 let prefilling = snap.reasoning.isEmpty && snap.visible.isEmpty
                 self?.live.setPrefillProgress(prefilling ? snap.progress : nil)
-                self?.noteStreamActivity()
+                self?.noteStreamActivity(text: !prefilling)
                 let n = snap.visible.count
                 let ms = n > 12000 ? 600 : n > 6000 ? 350 : n > 2500 ? 180 : 80
                 try? await Task.sleep(for: .milliseconds(ms))
@@ -892,12 +980,17 @@ final class ChatStore: ObservableObject {
             var accumulator = ChatStreamAccumulator()
             var availableTools = agentRun?.tools ?? []
             var hold = holdText
+            var dropLeadingSpace = false
+            // text of an agent pass that may still end in tool calls: shown live, replaced by the answer
+            var drafted = false
             var gate = false
             var agentTurn = false
             var retryWithoutAgent = false
             // what the agent's last pass held, which is what the context meter shows; usage sums every pass
             var agentPassTokens: Int?
             var agentMeta: [String: Any]?
+            // tokens a request that did not fit the context needed, as the engine counted them
+            var contextNeeded: Int?
             var lastFlush = Date.distantPast
             var cancelled = false
             var reportedError = false
@@ -932,13 +1025,13 @@ final class ChatStore: ObservableObject {
             }
 
             func drain(_ bytes: URLSession.AsyncBytes) async throws -> Bool {
-                for try await line in bytes.lines {
+                for try await line in bytes.streamLines {
                     if Task.isCancelled { throw CancellationError() }
                     bytesReceived += line.utf8.count + 1
-                    // the agent sends no tokens until its answer is checked; its keep-alives show it is working
+                    // between the passes the agent sends keep-alives, which show it is working
                     if agentTurn, line.hasPrefix(":") {
                         let owner = self
-                        await MainActor.run { owner?.lastStreamActivity = Date() }
+                        await MainActor.run { owner?.liveness.note(text: false) }
                         continue
                     }
                     if agentTurn, line.hasPrefix("data: "), line.contains("\"tosh\""),
@@ -946,17 +1039,46 @@ final class ChatStore: ObservableObject {
                        let tosh = object["tosh"] as? [String: Any] {
                         guard let event = tosh["event"] as? [String: Any] else {
                             agentMeta = tosh
+                            // a turn that ends with no answer after a draft keeps none of it
+                            if drafted {
+                                accumulator.visible = ""
+                                drafted = false
+                                flush()
+                            }
                             if let event = try accumulator.consume(line), event.completed { return true }
                             continue
                         }
                         if event["type"] as? String == "pass", event["state"] as? String == "end" {
                             agentPassTokens = ((event["prompt_tokens"] as? Int) ?? 0) + ((event["completion_tokens"] as? Int) ?? 0)
                         }
+                        // a pass whose answer needs no check streams; its text goes if the pass ends in tool calls
+                        if event["type"] as? String == "pass", event["state"] as? String == "start" {
+                            hold = event["live"] as? Bool != true
+                        } else if event["type"] as? String == "retract" {
+                            accumulator.visible = ""
+                            drafted = false
+                            dropLeadingSpace = true
+                            lastFlush = .distantPast
+                            flush()
+                        } else if event["type"] as? String == "draft", let text = event["content"] as? String, !text.isEmpty {
+                            drafted = true
+                            accumulator.visible += text
+                            flush()
+                        }
                         let owner = self
                         await MainActor.run { owner?.agentEvent(event, conversation: convID) }
                         continue
                     }
+                    if drafted, line.hasPrefix("data: "), line.contains("\"content\":\""), !line.contains("\"content\":\"\"") {
+                        accumulator.visible = ""
+                        drafted = false
+                    }
                     guard let event = try accumulator.consume(line) else { continue }
+                    // the engine separates the answer from retracted text for clients that keep it
+                    if dropLeadingSpace, !accumulator.visible.isEmpty {
+                        accumulator.visible = String(accumulator.visible.drop(while: \.isWhitespace))
+                        dropLeadingSpace = accumulator.visible.isEmpty
+                    }
                     if let progress = event.progress { buffer.writeProgress(progress) }
                     if event.receivedContent {
                         let now = Date()
@@ -986,6 +1108,8 @@ final class ChatStore: ObservableObject {
                     }
                     if javaScriptEnabled { availableTools.append(JavaScriptSandboxService.tool) }
                     if memoryToolsEnabled { availableTools.append(contentsOf: ChatMemoryService.tools) }
+                    if ChatMapTool.isEnabled { availableTools.append(ChatMapTool.tool) }
+                    if ChatMapTool.isEnabled && ChatRoadRoute.isEnabled { availableTools.append(ChatRoadRoute.tool) }
                     availableTools += await ToshMCPService.shared.discoverTools()
                     if ToolSupport.isBlocked(ToolSupport.currentModelIdentity) { availableTools = [] }
                     if let enabledToolNames {
@@ -994,12 +1118,16 @@ final class ChatStore: ObservableObject {
                     }
                 }
                 // only math tools: the server agent runs the turn. A math tool the user still approves call by
-                // call keeps it in this loop, since the server cannot ask
-                agentTurn = agentAllowed && !availableTools.isEmpty
-                    && availableTools.allSatisfy {
-                        MathTranscriptionService.isMathTool($0.name)
-                            && ChatToolsService.isAlwaysAllowed($0.name, bundled: $0.mcpServerID == nil)
-                    }
+                // call keeps it in this loop, since the server cannot ask. MCP servers shared with the engine
+                // are only reached through that agent, like the servers a build bundles with its own agent.
+                let toolsAllowed = !ToolSupport.isBlocked(ToolSupport.currentModelIdentity)
+                let active = EngineExtensions.active()
+                let engineShared = toolsAllowed
+                    && (MCPServerStore.load().contains(where: \.sharedWithEngine) || active.contains { !($0.manifest.servers ?? [:]).isEmpty })
+                // an extension that brings its own agent gets every turn first; it may hand back those that are not its own
+                let extensionAgent = toolsAllowed && active.contains(where: \.hasAgent)
+                agentTurn = agentAllowed
+                    && (extensionAgent || (availableTools.isEmpty ? engineShared : !Self.hasOwnTools(availableTools)))
                 if agentTurn { hold = true }
 
                 var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
@@ -1052,9 +1180,17 @@ final class ChatStore: ObservableObject {
                 if !samplerOrder.isEmpty { body["samplers"] = samplerOrder }
                 if let activeModel { body["model"] = activeModel }
                 // a request for a computed result may not be answered before a math tool is called
+                // what the agent cannot run itself: its extension's servers and the math ones are on its side
+                let clientTools = availableTools.filter { tool in
+                    !MathTranscriptionService.isMathTool(tool.name)
+                        && !EngineExtensions.chatToolPrefixes(active).contains { tool.name.hasPrefix($0) }
+                }
                 if agentTurn {
-                    body["messages"] = agentHistory
-                    body["tosh"] = ["max_rounds": agentTurnLimit]
+                    body["messages"] = clientToolsAgent ? history : agentHistory
+                    // the agent writes its progress in the app's language; its answer follows the user's
+                    var tosh: [String: Any] = ["max_rounds": agentTurnLimit, "locale": Localizer().language]
+                    if !clientToolsAgent && Self.hasOwnTools(availableTools) { tosh["client_tools"] = true }
+                    body["tosh"] = tosh
                 } else if let request, availableTools.contains(where: { MathTranscriptionService.isMathTool($0.name) }) {
                     let (intent, asked) = await MathIntent.decide(request, context: Array(userTexts.dropLast()), port: port)
                     AppLog.chat.notice("math intent \(intent.rawValue, privacy: .public)\(asked ? " (model)" : "", privacy: .public)")
@@ -1066,7 +1202,13 @@ final class ChatStore: ObservableObject {
                     let owner = self
                     await MainActor.run { owner?.lastMathIntent = nil }
                 }
-                if agentTurn || agentRun?.finalizing == true {
+                if agentTurn && clientToolsAgent {
+                    let definitions = clientTools.compactMap(\.openAIDefinition)
+                    if !definitions.isEmpty {
+                        body["tools"] = definitions
+                        body["tool_choice"] = "auto"
+                    }
+                } else if agentTurn || agentRun?.finalizing == true {
                     // no tools: the agent's are on the server, and a last round only states what was validated
                 } else if gate || agentRun?.mathGuard.next == .mathOnly {
                     // after a refused math call: correct it or ask, never answer from memory
@@ -1077,6 +1219,11 @@ final class ChatStore: ObservableObject {
                     body["tools"] = availableTools.compactMap(\.openAIDefinition)
                     body["tool_choice"] = "auto"
                 }
+                let schemas = (body["tools"] as? [[String: Any]])
+                    .flatMap { try? JSONSerialization.data(withJSONObject: $0) }?.count ?? 0
+                // about four characters per token in a JSON schema
+                let toolOwner = self
+                await MainActor.run { toolOwner?.toolTokens = schemas / 4 }
                 if reasoningOff {
                     body["chat_template_kwargs"] = ["enable_thinking": false]
                     // For templates that ignore enable_thinking (Qwen3.6 still
@@ -1108,13 +1255,15 @@ final class ChatStore: ObservableObject {
                     // The error body explains the cause (e.g. context overflow);
                     // surface it instead of a generic "bad server response".
                     var raw = ""
-                    for try await line in bytes.lines {
+                    for try await line in bytes.streamLines {
                         raw += line
                         if raw.count > 4000 { break }
                     }
                     // an engine started without the agent: this turn and the next ones run in the app
                     retryWithoutAgent = agentTurn && status == 400 && raw.contains("runs no Tosh agent")
-                    throw StreamError(message: Self.describeServerError(status: status, body: raw))
+                    throw StreamError(message: Self.describeServerError(status: status, body: raw),
+                                      gpu: Self.isGPUFailure(Self.errorObject(raw)),
+                                      contextTokens: Self.contextTokens(Self.errorObject(raw)))
                 }
 
                 var completed = false
@@ -1122,7 +1271,7 @@ final class ChatStore: ObservableObject {
                 do {
                     completed = try await drain(bytes)
                 } catch {
-                    if error is CancellationError { throw error }
+                    if error is CancellationError || (error as? StreamError)?.fromServer == true { throw error }
                     resumeError = error
                 }
 
@@ -1155,10 +1304,13 @@ final class ChatStore: ObservableObject {
                     }
                 }
                 if !completed {
-                    throw resumeError ?? StreamError(message: "The response stream ended before completion")
+                    if let server = resumeError as? StreamError, server.fromServer { throw server }
+                    throw StreamError(message: (resumeError ?? StreamError(message: "The response stream ended before completion"))
+                                        .localizedDescription, cut: true)
                 }
             } catch {
-                if error is CancellationError {
+                // a stop cancels the task, and URLSession may report that as its own error or a cut stream
+                if error is CancellationError || Task.isCancelled || (error as? URLError)?.code == .cancelled {
                     cancelled = true
                 } else if retryWithoutAgent {
                     AppLog.chat.notice("the engine runs no agent; the chat runs the math tools itself")
@@ -1167,12 +1319,22 @@ final class ChatStore: ObservableObject {
                     AppLog.chat.error("stream failed: \(error.localizedDescription)")
                     let store = self
                     let raw = error.localizedDescription
+                    let stream = error as? StreamError
                     // the engine kills the turn when the model writes the call in the wrong
                     // shape, and it does it on every tool, so the model stops getting them
                     let rejected = raw.contains("peg-native") && !availableTools.isEmpty
                     if rejected { ToolSupport.block(ToolSupport.currentModelIdentity) }
+                    // a stream cut by the restart that followed a GPU failure is that failure
+                    let gpu = stream?.gpu == true
+                        || (stream?.cut == true && GPURecovery.shared.restarted(port: port, since: tSent))
+                    // a draft that a failed turn leaves is no answer
+                    if drafted { accumulator.visible = "" }
+                    contextNeeded = stream?.contextTokens
                     let message = rejected
                         ? "Este modelo escribe mal las llamadas a herramientas y el motor cortó la respuesta; se le han desactivado, vuelve a enviar / this model writes tool calls in the wrong shape and the engine stopped the answer; they are now off for it, send again"
+                        : gpu ? Self.gpuFailureMessage(told: stream?.gpu == true ? raw : nil,
+                                                       outlook: stream?.gpu == true ? GPURecovery.shared.outlook(port: port) : .restarting)
+                        : stream?.cut == true ? Self.cutConnectionMessage()
                         : raw
                     await MainActor.run { store?.lastError = message }
                 }
@@ -1187,7 +1349,9 @@ final class ChatStore: ObservableObject {
             }
             let ttft: Double? = tFirst.map { $0.timeIntervalSince(tSent) * 1000 }
             let hasVisibleAnswer = !accumulator.visible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let streamedText = hasVisibleAnswer ? composed() : ""
+            // a turn that ended inside its reasoning keeps it, under the warning, instead of losing it
+            let keepsReasoning = !accumulator.reasoning.isEmpty && !cancelled && !reportedError
+            let streamedText = hasVisibleAnswer || keepsReasoning ? composed() : ""
             let finalUsage = accumulator.usage
             let finalAccept = accumulator.mtpAccept
             let finalTimings: ChatTimings? = {
@@ -1229,22 +1393,40 @@ final class ChatStore: ObservableObject {
             let wasAgentTurn = agentTurn
             let passTokens = agentPassTokens
             let finalMeta = agentMeta
+            let needed = contextNeeded
+            let declined = wasAgentTurn && !wasCancelled && !didReportError && !hasVisibleAnswer
+                && finalToolCalls.isEmpty && Self.agentDeclined(finalMeta)
             let (shouldDeliverQueued, followed): (Bool, Bool) = await MainActor.run {
-                if retry, let index = store?.conversations.firstIndex(where: { $0.id == convID }) {
-                    Self.serverAgentMissing = true
+                if retry || declined, let index = store?.conversations.firstIndex(where: { $0.id == convID }) {
+                    if retry { Self.serverAgentMissing = true }
+                    else { AppLog.chat.notice("the agent left this turn to the chat's own tools") }
                     store?.finish(conversation: convID, text: "", speed: nil)
                     store?.stream(into: index, port: port, temperature: temperature, maxTokens: maxTokens,
-                                  system: system, thinking: thinking, sampling: sampling, modalities: modalities)
+                                  system: system, thinking: thinking, sampling: sampling, modalities: modalities,
+                                  agentDeclined: declined)
                     return (false, true)
                 }
                 if !wasCancelled && !didReportError && hadReasoning && !hasVisibleAnswer
                     && finalToolCalls.isEmpty && closing == nil {
                     store?.lastError = Self.emptyResponseMessage(finishReason: finalFinishReason)
+                } else if !wasCancelled && !didReportError && hasVisibleAnswer && finalToolCalls.isEmpty
+                            && finalFinishReason == "length" && !answer.hasSuffix("incomplete._")
+                            && !answer.hasSuffix("incompleta._") {
+                    // an answer cut at its token limit must not read as a finished one, nor one the context cut
+                    // as cut by its limit: Continue would not fit
+                    store?.lastError = Self.cutByContext(usage: finalUsage, maxTokens: maxTokens,
+                                                         context: Self.contextLimitSetting())
+                        ? Self.contextCutMessage() : Self.cutAnswerMessage()
+                } else if !wasCancelled && !didReportError && !hasVisibleAnswer && !hadReasoning
+                            && finalToolCalls.isEmpty && closing == nil {
+                    store?.lastError = Self.noAnswerMessage()
                 }
                 store?.lastTurnUsedServerAgent = wasAgentTurn
-                if wasAgentTurn, let passTokens {
+                if wasAgentTurn, let used = ((finalMeta?["context"] as? [String: Any])?["used"] as? NSNumber)?.intValue {
+                    store?.setContextUsed(used, for: convID)
+                } else if wasAgentTurn, let passTokens {
                     store?.setContextUsed(passTokens, for: convID)
-                } else if let finalUsage {
+                } else if !wasAgentTurn, let finalUsage {
                     store?.setContextUsed(finalUsage.prompt + finalUsage.completion, for: convID)
                 }
                 let shouldDeliverQueued = store?.queuedMessage?.conversationID == convID
@@ -1289,6 +1471,19 @@ final class ChatStore: ObservableObject {
                 store?.finish(conversation: convID, text: shown, speed: finalSpeed,
                               mtpAccept: finalAccept, timings: finalTimings,
                               toolCalls: finalToolCalls, interim: round.interim)
+                // what the request that did not fit needed fills the meter, and the summary below frees it
+                if let needed { store?.setContextUsed(needed, for: convID) }
+                if wasAgentTurn, followUp == nil, let kept = finalMeta?["keep"] as? String, !kept.isEmpty {
+                    store?.keepLines(kept, conversation: convID)
+                }
+                if wasAgentTurn, followUp == nil, let request = finalMeta?["map_request"] as? [String: Any] {
+                    store?.attachMapRequest(request, conversation: convID, port: port)
+                }
+                if wasAgentTurn, followUp == nil,
+                   let sketches = (finalMeta?["sketches"] as? [[String: Any]])?.compactMap(ChatSketch.init),
+                   !sketches.isEmpty {
+                    store?.attachSketches(sketches, conversation: convID)
+                }
                 if shouldDeliverQueued {
                     if !finalToolCalls.isEmpty { store?.interruptPendingToolCalls(conversation: convID) }
                 } else if !wasCancelled && !didReportError && !finalToolCalls.isEmpty {
@@ -1335,6 +1530,7 @@ final class ChatStore: ObservableObject {
                     conversations[i].messages[j].timings = timings
                     conversations[i].messages[j].toolCalls = toolCalls.isEmpty ? nil : toolCalls
                     conversations[i].messages[j].model = ServerSettings.activeRouterModel()
+                    if toolCalls.isEmpty { Self.carryDrawnMap(&conversations[i], to: j) }
                 }
             }
             conversations[i].updated = Date()
@@ -1500,7 +1696,7 @@ final class ChatStore: ObservableObject {
         guard let request = pendingToolPermission else { return }
         pendingToolPermission = nil
         if decision == .deny {
-            let result = "Tool execution was denied by the user."
+            let result = request.name == ChatRoadRoute.toolName ? ChatRoadRoute.declined : "Tool execution was denied by the user."
             completeToolCall(request, result: result, state: .denied)
             advanceToolPermissions(conversation: request.conversationID)
             return
@@ -1530,6 +1726,15 @@ final class ChatStore: ObservableObject {
                         self?.runMemoryTool(request.name, arguments: arguments)
                             ?? ToolExecutionResult(content: "No open conversation.", isError: true)
                     }
+                } else if request.name == ChatMapTool.toolName {
+                    result = await MainActor.run {
+                        self?.drawMap(arguments: arguments, for: request)
+                            ?? ToolExecutionResult(content: "No open conversation.", isError: true)
+                    }
+                } else if request.name == ChatRoadRoute.toolName {
+                    let routed = await ChatRoadRoute.route(arguments: arguments, loc: Localizer())
+                    await MainActor.run { self?.attachMap(routed.map, for: request) }
+                    result = routed.result
                 } else if request.name == "exec_shell_command" {
                     result = try await ChatToolsService.executeStreaming(
                         name: request.name, arguments: arguments, port: context.port,
@@ -1582,13 +1787,16 @@ final class ChatStore: ObservableObject {
               let j = conversations[i].messages.firstIndex(where: { $0.id == request.messageID }),
               let k = conversations[i].messages[j].toolCalls?.firstIndex(where: { $0.id == request.callID })
         else { return }
+        let accepted = state == .completed && ToolResultStatus.acceptedOnly(result)
         conversations[i].messages[j].toolCalls?[k].state = state
         conversations[i].messages[j].toolCalls?[k].result = result
+        conversations[i].messages[j].toolCalls?[k].accepted = accepted ? true : nil
         conversations[i].messages[j].toolCalls?[k].finishedAt = Date()
         conversations[i].messages[j].settleInterim()
         let serverID = conversations[i].messages[j].toolCalls?[k].serverID ?? request.callID.uuidString
         // The card keeps the whole output; only what the model reads is capped.
-        conversations[i].messages.append(ChatMessage(role: "tool", content: ToolResultLimit.apply(result),
+        conversations[i].messages.append(ChatMessage(role: "tool",
+                                                     content: (accepted ? ToolResultStatus.note : "") + ToolResultLimit.apply(result),
                                                      toolCallID: serverID,
                                                      imageURIs: imageURIs.isEmpty ? nil : imageURIs))
         conversations[i].updated = Date()
@@ -1669,24 +1877,19 @@ final class ChatStore: ObservableObject {
 
     // MARK: stall watchdog
 
-    /// Called from the stream whenever a token reaches the UI; resets the
-    /// inactivity timer and marks that generation (not prefill) has begun.
-    func noteStreamActivity() {
-        lastStreamActivity = Date()
-        sawFirstToken = true
+    /// Called from the stream whenever something reaches the UI: prompt progress or text.
+    func noteStreamActivity(text: Bool) {
+        liveness.note(text: text)
     }
 
     private func startWatchdog(port: Int) {
         watchdog?.cancel()
-        lastStreamActivity = Date()
-        sawFirstToken = false
+        liveness = StreamLiveness()
         watchdog = Task { [weak self] in
             while true {
                 try? await Task.sleep(for: .seconds(5))
                 guard let self, !Task.isCancelled, self.generating else { return }
-                let idle = Date().timeIntervalSince(self.lastStreamActivity)
-                let limit: TimeInterval = self.sawFirstToken ? 30 : 180
-                if idle > limit {
+                if self.liveness.stalled() {
                     self.handleStreamStall()
                     return
                 }
@@ -1702,31 +1905,51 @@ final class ChatStore: ObservableObject {
         task = nil
         watchdog = nil
         ServerManager.shared.active.stop()
-        lastError = Self.stallMessage
+        lastError = Self.stallMessage(moe: ServerSettings.modelIsMoE(
+            at: UserDefaults.standard.string(forKey: SettingsKeys.modelPath) ?? ""))
         generating = false
         generatingConvID = nil
         live.reset()
         save()
     }
 
-    nonisolated static var stallMessage: String {
-        "El motor dejó de responder y se detuvo para liberar memoria. Suele pasar con modelos MoE grandes en GPU AMD: usa un modelo denso (8B) o sube 'Expertos MoE en CPU'. / The engine stopped responding and was stopped to free memory. This happens with large MoE models on AMD GPUs: use a dense model (8B) or raise 'MoE experts on CPU'."
+    nonisolated static func stallMessage(moe: Bool) -> String {
+        moe
+            ? "El motor dejó de responder y se detuvo para liberar memoria. Suele pasar con modelos MoE grandes en GPU AMD: usa un modelo denso (8B) o sube 'Expertos MoE en CPU'. / The engine stopped responding and was stopped to free memory. This happens with large MoE models on AMD GPUs: use a dense model (8B) or raise 'MoE experts on CPU'."
+            : "El motor dejó de responder y se detuvo para liberar memoria. / The engine stopped responding and was stopped to free memory."
+    }
+
+    /// Tools the chat runs itself, beyond the math ones the agent covers; the map tools never count, so turning
+    /// them on takes no turn away from the server agent.
+    nonisolated static func hasOwnTools(_ tools: [BuiltinToolInfo]) -> Bool {
+        tools.contains {
+            ![ChatMapTool.toolName, ChatRoadRoute.toolName].contains($0.name)
+                && !(MathTranscriptionService.isMathTool($0.name) && ChatToolsService.isAlwaysAllowed($0.name, bundled: $0.mcpServerID == nil))
+        }
+    }
+
+    /// The agent ran nothing and left the turn to the chat.
+    nonisolated static func agentDeclined(_ meta: [String: Any]?) -> Bool {
+        meta?["version"] as? Int == 1 && meta?["outcome"] as? String == "declined"
     }
 
     // MARK: auto-compaction
 
     /// The conversation as the server agent takes it: what the user and the answers said. Tool calls
-    /// stay out, since the agent refuses them: the tools run on the server.
-    nonisolated static func agentHistory(system: String, summary: String?, messages: [ChatMessage], from start: Int)
-        -> [[String: Any]] {
+    /// stay out, since the agent refuses them: the tools run on the server. Only the last request carries
+    /// its images and audio; an agent that cannot use them hands the turn back.
+    nonisolated static func agentHistory(system: String, summary: String?, messages: [ChatMessage], from start: Int,
+                                         modalities: ModelModalities? = nil, kept: [String]? = nil) -> [[String: Any]] {
         var sys = system.trimmingCharacters(in: .whitespaces)
-        if let summary, !summary.isEmpty {
-            sys += (sys.isEmpty ? "" : "\n\n") + "Summary of the earlier part of this conversation:\n" + summary
+        if let earlier = summarySystem(summary, kept: kept) {
+            sys += (sys.isEmpty ? "" : "\n\n") + earlier
         }
         var history: [[String: Any]] = sys.isEmpty ? [] : [["role": "system", "content": sys]]
-        for message in messages[min(max(0, start), messages.count)...] {
+        let last = messages.lastIndex { $0.role == "user" }
+        for (index, message) in messages.enumerated() where index >= min(max(0, start), messages.count) {
             if message.role == "user" {
-                history.append(["role": "user", "content": message.wireContent])
+                let parts = index == last ? mediaParts(message, text: message.wireContent, modalities: modalities) : nil
+                history.append(["role": "user", "content": parts ?? message.wireContent])
             } else if message.role == "assistant", (message.toolCalls ?? []).isEmpty {
                 let body = message.parts.body.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !body.isEmpty { history.append(["role": "assistant", "content": body]) }
@@ -1738,19 +1961,25 @@ final class ChatStore: ObservableObject {
     nonisolated static func requestHistory(system: String, summary: String?,
                                            messages: [ChatMessage], from start: Int,
                                            archived: [ArchivedBlock]? = nil,
-                                           modalities: ModelModalities? = nil) -> [[String: Any]] {
+                                           modalities: ModelModalities? = nil,
+                                           kept: [String]? = nil, trimBefore: Int = 0) -> [[String: Any]] {
         var history: [[String: Any]] = []
         var sys = system.trimmingCharacters(in: .whitespaces)
-        if let summary, !summary.isEmpty {
-            sys += (sys.isEmpty ? "" : "\n\n")
-                + "Summary of the earlier part of this conversation:\n" + summary
+        if let earlier = summarySystem(summary, kept: kept) {
+            sys += (sys.isEmpty ? "" : "\n\n") + earlier
         }
         if !sys.isEmpty { history.append(["role": "system", "content": sys]) }
         let safeStart = min(max(0, start), messages.count)
         let skipped = ChatMemoryService.archivedIndices(archived)
         history += messages[safeStart...].enumerated().compactMap { offset, m -> [String: Any]? in
             guard !skipped.contains(safeStart + offset) else { return nil }
+            // in a conversation near the end of its context, older turns go without their media and with their tool
+            // results cut down, before the summary takes them
+            let trimmed = safeStart + offset < trimBefore
             if m.role == "tool", let callID = m.toolCallID {
+                guard !trimmed else {
+                    return ["role": "tool", "tool_call_id": callID, "content": ToolResultLimit.shortened(m.content)]
+                }
                 guard let uris = m.imageURIs, !uris.isEmpty, modalities?.vision != false else {
                     return ["role": "tool", "tool_call_id": callID, "content": m.content]
                 }
@@ -1760,43 +1989,83 @@ final class ChatStore: ObservableObject {
             }
             let text = m.role == "assistant" ? m.parts.body : m.wireContent
             if m.role == "assistant", let calls = m.toolCalls, !calls.isEmpty {
+                // the engine rejects the whole request over one call whose arguments are not a JSON object,
+                // as when the model cut it short; the call's result already tells it that it failed
                 let payload: [[String: Any]] = calls.map { call in
                     ["id": call.serverID ?? call.id.uuidString,
                      "type": "function",
-                     "function": ["name": call.name, "arguments": call.arguments]]
+                     "function": ["name": call.name,
+                                  "arguments": (try? ChatToolsService.parseArguments(call.arguments)) == nil ? "{}" : call.arguments]]
                 }
                 let said = [text, m.settledInterim ?? ""].filter { !$0.isEmpty }.joined(separator: "\n\n")
                 return ["role": "assistant", "content": said, "tool_calls": payload]
             }
             guard m.role != "assistant" || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return nil }
-            // A user turn with images uses the OpenAI multimodal content array
-            // (text part + image_url parts); everything else stays a plain string.
-            let media = m.attachments?.filter { $0.mediaKind != nil && $0.base64Payload != nil } ?? []
-            if m.role == "user", !(m.imageURIs ?? []).isEmpty || !media.isEmpty {
-                var parts: [[String: Any]] = []
-                if !text.isEmpty { parts.append(["type": "text", "text": text]) }
-                if modalities?.vision != false {
-                    for uri in m.imageURIs ?? [] {
-                        parts.append(["type": "image_url", "image_url": ["url": uri]])
-                    }
-                }
-                for attachment in media {
-                    guard let data = attachment.base64Payload else { continue }
-                    if attachment.mediaKind == "audio" {
-                        guard modalities?.audio != false else { continue }
-                        parts.append(["type": "input_audio",
-                                      "input_audio": ["data": data, "format": attachment.audioInputFormat]])
-                    } else if modalities?.video != false {
-                        parts.append(["type": "input_video",
-                                      "input_video": ["data": data, "format": attachment.videoInputFormat]])
-                    }
-                }
+            if m.role == "user", trimmed, mediaParts(m, text: text, modalities: modalities) != nil {
+                return ["role": m.role, "content": text + "\n\n" + mediaLeftOut]
+            }
+            if m.role == "user", let parts = mediaParts(m, text: text, modalities: modalities) {
                 return ["role": m.role, "content": parts]
             }
             return ["role": m.role, "content": text]
         }
         return history
+    }
+
+    nonisolated static let keptHeader = "Kept from earlier answers, as written:"
+    nonisolated static let mediaLeftOut = "[The images, audio or video sent with this message earlier are not sent again, to save context.]"
+    /// How many of the lines an agent marked are kept through summaries, newest first.
+    nonisolated static let keptLimit = 20
+
+    /// The part of the system message that stands for the summarized messages: their summary, then what the agent
+    /// marked to keep of its answers, as written, which the agent finds its own state by.
+    nonisolated static func summarySystem(_ summary: String?, kept: [String]?) -> String? {
+        var parts: [String] = []
+        if let summary, !summary.isEmpty { parts.append("Summary of the earlier part of this conversation:\n" + summary) }
+        if let kept, !kept.isEmpty { parts.append(keptHeader + "\n" + kept.joined(separator: "\n---\n")) }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+
+    /// Where older turns start going without media and with shorter tool results: before the last two exchanges,
+    /// once the conversation passes 85% of the context; nowhere before that.
+    nonisolated static func trimStart(_ c: Conversation, limit: Int, toolTokens: Int = 0) -> Int {
+        guard limit > 0, Double(contextForDecisions(c, toolTokens: toolTokens)) > 0.85 * Double(limit) else { return 0 }
+        let users = c.messages.indices.filter { c.messages[$0].role == "user" }
+        return users.count >= 2 ? users[users.count - 2] : 0
+    }
+
+    func keepLines(_ text: String, conversation id: UUID) {
+        guard let i = conversations.firstIndex(where: { $0.id == id }),
+              let j = conversations[i].messages.indices.last, conversations[i].messages[j].role == "assistant" else { return }
+        conversations[i].messages[j].kept = text
+        save()
+    }
+
+    /// A user turn with images, audio or video as the OpenAI multimodal content array (text part + media
+    /// parts), or nil when the model takes none of them and it stays a plain string.
+    nonisolated static func mediaParts(_ m: ChatMessage, text: String, modalities: ModelModalities?) -> [[String: Any]]? {
+        let media = m.attachments?.filter { $0.mediaKind != nil && $0.base64Payload != nil } ?? []
+        guard !(m.imageURIs ?? []).isEmpty || !media.isEmpty else { return nil }
+        var parts: [[String: Any]] = []
+        if !text.isEmpty { parts.append(["type": "text", "text": text]) }
+        if modalities?.vision != false {
+            for uri in m.imageURIs ?? [] {
+                parts.append(["type": "image_url", "image_url": ["url": uri]])
+            }
+        }
+        for attachment in media {
+            guard let data = attachment.base64Payload else { continue }
+            if attachment.mediaKind == "audio" {
+                guard modalities?.audio != false else { continue }
+                parts.append(["type": "input_audio",
+                              "input_audio": ["data": data, "format": attachment.audioInputFormat]])
+            } else if modalities?.video != false {
+                parts.append(["type": "input_video",
+                              "input_video": ["data": data, "format": attachment.videoInputFormat]])
+            }
+        }
+        return parts.contains { $0["type"] as? String != "text" } ? parts : nil
     }
 
     /// Plain text of a message's content, whether it's a string or the
@@ -1826,6 +2095,38 @@ final class ChatStore: ObservableObject {
         return cutoff
     }
 
+
+    /// A map a tool call of this turn drew goes under the answer: the call itself is shown in a block of tools,
+    /// which draws no map.
+    nonisolated static func carryDrawnMap(_ conversation: inout Conversation, to answer: Int) {
+        let start = (conversation.messages[..<answer].lastIndex { $0.role == "user" } ?? -1) + 1
+        var layers: [ChatMap.Layer] = []
+        for k in start..<answer where conversation.messages[k].role == "assistant" {
+            if let map = conversation.messages[k].map {
+                layers += map.layers
+                conversation.messages[k].map = nil
+            }
+        }
+        guard !layers.isEmpty else { return }
+        conversation.messages[answer].map = ChatMap(layers: (conversation.messages[answer].map?.layers ?? []) + layers)
+    }
+
+    /// Draws the map the model asked for on the message that asked for it; the answer takes it when it ends.
+    private func drawMap(arguments: [String: Any], for request: PendingToolPermission) -> ToolExecutionResult {
+        let conversation = conversations.first(where: { $0.id == request.conversationID })
+        let asked = conversation?.messages.last(where: { $0.role == "user" })?.content ?? ""
+        let drawn = ChatMapTool.draw(arguments: arguments, loc: Localizer(), request: asked)
+        attachMap(drawn.map, for: request)
+        return drawn.result
+    }
+
+    /// Adds a tool's layers to the message that called it, beside those of another call of the same message.
+    private func attachMap(_ map: ChatMap?, for request: PendingToolPermission) {
+        guard let map, let i = conversations.firstIndex(where: { $0.id == request.conversationID }),
+              let j = conversations[i].messages.firstIndex(where: { $0.id == request.messageID }) else { return }
+        conversations[i].messages[j].map = ChatMap(layers: (conversations[i].messages[j].map?.layers ?? []) + map.layers)
+        save()
+    }
 
     func runMemoryTool(_ name: String, arguments: [String: Any]) -> ToolExecutionResult {
         guard ChatMemoryService.isEnabled else {
@@ -1871,11 +2172,7 @@ final class ChatStore: ObservableObject {
         let note = (arguments["note"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let d = UserDefaults.standard
         let limit = d.object(forKey: SettingsKeys.ctx) == nil ? 16384 : d.integer(forKey: SettingsKeys.ctx)
-        let skipped = ChatMemoryService.archivedIndices(conversations[i].archived)
-        let used = conversations[i].contextUsed
-            ?? conversations[i].messages.enumerated()
-                .filter { $0.offset >= (conversations[i].summarizedCount ?? 0) && !skipped.contains($0.offset) }
-                .reduce(0) { $0 + $1.element.estimatedTokens }
+        let used = Self.contextForDecisions(conversations[i], toolTokens: toolTokens)
         if let percent = ChatMemoryService.archiveRefusal(used: used, limit: limit) {
             return ToolExecutionResult(
                 content: "Not archived: the context is \(percent)% full, so every turn still fits. Answer from the conversation.",
@@ -1951,7 +2248,8 @@ final class ChatStore: ObservableObject {
             ? 16384 : d.integer(forKey: SettingsKeys.ctx)
         guard enabled, !generating, !compacting, limit > 0,
               let i = conversations.firstIndex(where: { $0.id == id }),
-              let used = conversations[i].contextUsed, Double(used) / Double(limit) > 0.7 else { return }
+              Double(Self.contextForDecisions(conversations[i], toolTokens: toolTokens)) / Double(limit) > 0.7
+        else { return }
         let start = conversations[i].summarizedCount ?? 0
         guard let cutoff = Self.compactionCutoff(messages: conversations[i].messages,
                                                  alreadyCompacted: start,
@@ -1977,15 +2275,8 @@ final class ChatStore: ObservableObject {
 
     private func compact(conversation id: UUID, index i: Int,
                          from start: Int, through cutoff: Int, port: Int) {
-        var prompt = ""
-        if let prior = conversations[i].summary, !prior.isEmpty {
-            prompt += "Previous summary:\n" + prior + "\n\n"
-        }
-        prompt += "Conversation to summarize:\n\n"
-        for m in conversations[i].messages[start..<cutoff] {
-            prompt += (m.role == "user" ? "User: " : "Assistant: ")
-                + (m.role == "assistant" ? m.parts.body : m.content) + "\n\n"
-        }
+        let prompt = Self.summaryPrompt(prior: conversations[i].summary, messages: conversations[i].messages[start..<cutoff],
+                                        limit: Self.contextLimitSetting())
 
         compacting = true
         AppLog.chat.info("compacting conversation through message \(cutoff)")
@@ -2002,9 +2293,33 @@ final class ChatStore: ObservableObject {
         compacting = false
         guard let summary, let i = conversations.firstIndex(where: { $0.id == id }),
               cutoff <= conversations[i].messages.count else { return }
+        let start = min(conversations[i].summarizedCount ?? 0, cutoff)
+        let marked = conversations[i].messages[start..<cutoff].compactMap(\.kept).filter { !$0.isEmpty }
+        conversations[i].kept = Array(((conversations[i].kept ?? []) + marked).suffix(Self.keptLimit))
         conversations[i].summary = summary
         conversations[i].summarizedCount = cutoff
+        // the server's count was of the conversation before the summary: the meter estimates until the next turn
+        conversations[i].contextUsed = nil
+        conversations[i].contextUsedAt = nil
         save()
+    }
+
+    /// The messages a summary is asked for, each cut to its share of half the context when together they would not
+    /// fit: a summary that fails for being too long leaves the conversation as full as it was.
+    nonisolated static func summaryPrompt(prior: String?, messages: ArraySlice<ChatMessage>, limit: Int) -> String {
+        var prompt = ""
+        if let prior, !prior.isEmpty { prompt += "Previous summary:\n" + prior + "\n\n" }
+        prompt += "Conversation to summarize:\n\n"
+        let texts = messages.map { ($0.role == "user" ? "User: " : "Assistant: ") + ($0.role == "assistant" ? $0.parts.body : $0.content) }
+        // four characters a token, half the context for the messages
+        let budget = max(2000, limit * 2 - prompt.count)
+        let total = texts.reduce(0) { $0 + $1.count }
+        let share = total > budget ? max(200, budget / max(1, texts.count)) : Int.max
+        for text in texts {
+            prompt += (text.count > share ? String(text.prefix(share * 2 / 3)) + " […] " + String(text.suffix(share / 3)) : text)
+                + "\n\n"
+        }
+        return prompt
     }
 
     /// Non-streamed completion that condenses old turns. Returns nil on any
@@ -2045,19 +2360,22 @@ final class ChatStore: ObservableObject {
 
     /// Maps llama-server HTTP errors ({"error":{"message":…}}) to readable,
     /// actionable text, following the same bilingual style as Server.diagnose.
-    nonisolated private static func describeServerError(status: Int, body: String) -> String {
+    nonisolated static func describeServerError(status: Int, body: String) -> String {
         var message = body
         if let data = body.data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let err = obj["error"] as? [String: Any],
            let m = err["message"] as? String {
+            if let told = failureMessage(err) { return told }
             message = m
         }
         if message.lowercased().contains("reasoning effort")
             || message.lowercased().contains("reasoning_effort") {
             return "El modelo no acepta ese esfuerzo de razonamiento; elige otro o «Predeterminado del modelo» en los ajustes del chat. El motor respondió: \(message.prefix(200)) / the model does not accept that reasoning effort; pick another one or “Model default” in the chat settings. The engine answered: \(message.prefix(200))"
         }
-        if message.lowercased().contains("context") {
+        // only the engine's own wording: other errors may quote the model's text, which can say anything
+        if message.range(of: #"(?i)^(the )?(request|input) .{0,40}(exceeds the available|is larger than the max) context size|^context size has been exceeded"#,
+                         options: .regularExpression) != nil {
             return "Contexto lleno: el mensaje, los archivos adjuntos y el historial juntos superan el contexto. Sube el contexto en Ajustes, adjunta menos o inicia un chat nuevo / context full: your message, attached files and history together exceed the context. Raise the context size in Settings, attach less, or start a new chat"
         }
         // std::bad_function_call comes from both a context overflow on a tool turn
@@ -2068,21 +2386,112 @@ final class ChatStore: ObservableObject {
         return "HTTP \(status): \(message.prefix(300))"
     }
 
+    nonisolated static func errorObject(_ body: String) -> [String: Any]? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object["error"] as? [String: Any]
+    }
+
+    nonisolated static func isGPUFailure(_ error: [String: Any]?) -> Bool {
+        guard let error else { return false }
+        return error["type"] as? String == "engine_gpu_error"
+            || (error["message"] as? String ?? "").range(of: #"(?i)^compute error|error state|kIOAccel|failed to process mtmd"#,
+                                                        options: .regularExpression) != nil
+    }
+
+    /// What the user is told after a GPU failure: whether the server restarts, or already did so too recently to again.
+    nonisolated static func gpuFailureMessage(told: String?, outlook: GPURecovery.Outlook) -> String {
+        let loc = Localizer()
+        let failure = told ?? loc.t("El motor falló en la GPU mientras procesaba la petición, así que no terminó.",
+                                    "The engine failed on the GPU while processing the request, so it did not finish.")
+        let next = outlook == .restarting
+            ? loc.t("El servidor se reinicia solo; vuelve a enviar el mensaje cuando esté listo.",
+                    "The server restarts by itself; send the message again once it is ready.")
+            : loc.t("El servidor ya se reinició solo por un fallo de la GPU hace menos de 10 minutos, así que esta vez no: reinícialo desde el panel del servidor y vuelve a enviar el mensaje.",
+                    "The server already restarted by itself after a GPU failure less than 10 minutes ago, so it does not this time: restart it from the server panel and send the message again.")
+        return failure + " " + next
+    }
+
+    nonisolated static func cutConnectionMessage() -> String {
+        Localizer().t("La conexión con el servidor se cortó antes de que terminara la respuesta, así que está incompleta. Vuelve a enviar el mensaje.",
+                      "The connection to the server was cut before the answer ended, so it is incomplete. Send the message again.")
+    }
+
     nonisolated static func streamedError(from object: [String: Any]) -> String? {
         guard let error = object["error"] else { return nil }
         if let details = error as? [String: Any],
            let message = details["message"] as? String, !message.isEmpty {
-            return message
+            return failureMessage(details) ?? message
         }
         if let message = error as? String, !message.isEmpty { return message }
         return "El motor interrumpió la respuesta / the engine interrupted the response"
     }
 
-    nonisolated static func emptyResponseMessage(finishReason: String?) -> String {
-        if finishReason == "length" {
-            return "El modelo agotó el máximo de tokens durante el razonamiento; aumenta Máx. o desactiva Razonamiento / the model used all max tokens while reasoning; raise Max or disable Reasoning"
+    /// The engine's own failures, by the type the server or its agent gives them: a request too large for the
+    /// context and a GPU that failed while working. An agent's message already says it; the engine's raw one does not.
+    nonisolated static func failureMessage(_ error: [String: Any]) -> String? {
+        let loc = Localizer()
+        let type = error["type"] as? String ?? ""
+        let message = error["message"] as? String ?? ""
+        // whether the server restarts is told where the failure reaches the chat, which knows the server
+        if isGPUFailure(error) {
+            return type == "engine_gpu_error" ? message
+                : loc.t("El motor falló en la GPU mientras procesaba la petición, así que no terminó.",
+                        "The engine failed on the GPU while processing the request, so it did not finish.")
         }
-        return "El modelo terminó el razonamiento sin producir una respuesta visible; intenta regenerar o desactiva Razonamiento / the model finished reasoning without a visible answer; regenerate or disable Reasoning"
+        if type == "exceed_context_size_error",
+           let tokens = (error["n_prompt_tokens"] as? NSNumber)?.intValue, let context = (error["n_ctx"] as? NSNumber)?.intValue {
+            return loc.t("La petición necesita %@ tokens pero el contexto admite %@: el mensaje, los adjuntos y el historial no caben. Si hay mensajes antiguos, la app los resume ahora y puedes volver a enviar el mensaje; si no, sube el contexto en Ajustes, adjunta menos o inicia un chat nuevo.",
+                         "The request needs %@ tokens but the context holds %@: the message, attachments and history do not fit. If there are older messages, the app summarizes them now and the message can be sent again; otherwise raise the context size in Settings, attach less, or start a new chat.",
+                         String(tokens), String(context))
+        }
+        return nil
+    }
+
+    nonisolated static func contextTokens(_ error: [String: Any]?) -> Int? {
+        guard let error, error["type"] as? String == "exceed_context_size_error" else { return nil }
+        return (error["n_prompt_tokens"] as? NSNumber)?.intValue
+    }
+
+    nonisolated static func contextLimitSetting() -> Int {
+        let d = UserDefaults.standard
+        return d.object(forKey: SettingsKeys.ctx) == nil ? 16384 : d.integer(forKey: SettingsKeys.ctx)
+    }
+
+    /// Whether an answer stopped for "length" ran out of context rather than of its own limit: it did not write as
+    /// many tokens as it was allowed, or it filled the context, which the engine stops at one token before the end.
+    nonisolated static func cutByContext(usage: (prompt: Int, completion: Int)?, maxTokens: Int, context: Int) -> Bool {
+        guard let usage else { return false }
+        if context > 0 && usage.prompt + usage.completion + 1 >= context { return true }
+        return maxTokens > 0 && usage.completion < maxTokens
+    }
+
+    nonisolated static func contextCutMessage() -> String {
+        let loc = Localizer()
+        return loc.t("La respuesta se cortó porque la conversación llenó el contexto del modelo, así que está incompleta. La app resume los mensajes antiguos si puede; Continuar no cabría hasta entonces.",
+                     "The answer was cut because the conversation filled the model's context, so it is incomplete. The app summarizes older messages if it can; Continue would not fit until then.")
+    }
+
+    nonisolated static func noAnswerMessage() -> String {
+        let loc = Localizer()
+        return loc.t("El servidor terminó el turno sin respuesta; vuelve a enviar el mensaje.",
+                     "The server ended the turn without an answer; send the message again.")
+    }
+
+    nonisolated static func cutAnswerMessage() -> String {
+        let loc = Localizer()
+        return loc.t("La respuesta se cortó al llegar al máximo de tokens, así que está incompleta. Sube Máx. tokens o pulsa Continuar.",
+                     "The answer was cut at the max tokens limit, so it is incomplete. Raise Max tokens or press Continue.")
+    }
+
+    nonisolated static func emptyResponseMessage(finishReason: String?) -> String {
+        let loc = Localizer()
+        if finishReason == "length" {
+            return loc.t("El modelo agotó el máximo de tokens durante el razonamiento; aumenta Máx. o desactiva Razonamiento.",
+                         "The model used all max tokens while reasoning; raise Max or turn Reasoning off.")
+        }
+        return loc.t("El modelo terminó el razonamiento sin producir una respuesta visible; intenta regenerar o desactiva Razonamiento.",
+                     "The model finished reasoning without a visible answer; regenerate or turn Reasoning off.")
     }
 
     func stop() {
@@ -2179,6 +2588,12 @@ final class ChatStore: ObservableObject {
     func enableAllTools() {
         guard let i = currentIndex else { return }
         conversations[i].enabledToolNames = nil
+        save()
+    }
+
+    func disableAllTools() {
+        guard let i = currentIndex else { return }
+        conversations[i].enabledToolNames = []
         save()
     }
 
@@ -2318,6 +2733,9 @@ private struct ChatComposerTextEditor: NSViewRepresentable {
     var isFocused: FocusState<Bool>.Binding
     let fontSize: CGFloat
     let onSubmit: () -> Void
+    /// Files dropped on the text become attachments; dropped text is inserted as before.
+    var onDropFiles: ([URL]) -> Void = { _ in }
+    var onDragTargeted: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -2334,6 +2752,8 @@ private struct ChatComposerTextEditor: NSViewRepresentable {
         let textView = ComposerTextView()
         textView.delegate = context.coordinator
         textView.onSubmit = onSubmit
+        textView.onDropFiles = onDropFiles
+        textView.onDragTargeted = onDragTargeted
         textView.isRichText = false
         textView.importsGraphics = false
         textView.allowsUndo = true
@@ -2357,6 +2777,8 @@ private struct ChatComposerTextEditor: NSViewRepresentable {
         guard let textView = scrollView.documentView as? ComposerTextView else { return }
         context.coordinator.parent = self
         textView.onSubmit = onSubmit
+        textView.onDropFiles = onDropFiles
+        textView.onDragTargeted = onDragTargeted
         textView.font = .systemFont(ofSize: fontSize)
         textView.textColor = .labelColor
         textView.insertionPointColor = .controlAccentColor
@@ -2397,6 +2819,37 @@ private struct ChatComposerTextEditor: NSViewRepresentable {
 
     final class ComposerTextView: NSTextView {
         var onSubmit: (() -> Void)?
+        var onDropFiles: (([URL]) -> Void)?
+        var onDragTargeted: ((Bool) -> Void)?
+
+        private func droppedFiles(_ sender: NSDraggingInfo) -> [URL] {
+            sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                  options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        }
+
+        // A plain text view inserts a dropped file's path; the chat attaches the file instead.
+        override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+            guard !droppedFiles(sender).isEmpty else { return super.draggingEntered(sender) }
+            onDragTargeted?(true)
+            return .copy
+        }
+
+        override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+            droppedFiles(sender).isEmpty ? super.draggingUpdated(sender) : .copy
+        }
+
+        override func draggingExited(_ sender: NSDraggingInfo?) {
+            onDragTargeted?(false)
+            super.draggingExited(sender)
+        }
+
+        override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+            let files = droppedFiles(sender)
+            guard !files.isEmpty else { return super.performDragOperation(sender) }
+            onDragTargeted?(false)
+            onDropFiles?(files)
+            return true
+        }
 
         override func keyDown(with event: NSEvent) {
             let isReturn = event.keyCode == 36 || event.keyCode == 76
@@ -2460,6 +2913,8 @@ struct NativeChatView: View {
     @State private var attachments: [ChatAttachment] = []
     @State private var images: [String] = []   // attached images as data URIs (vision models)
     @State private var attachError: String?
+    @State private var chatDropTargeted = false
+    @State private var textDropTargeted = false
     @State private var ocrPending = 0
     @State private var transcriptionPending = 0
     @State private var transcriptionQueue: [PendingSpeechTranscription] = []
@@ -2685,6 +3140,26 @@ struct NativeChatView: View {
             conversationHeader
             messagesScroll
             inputArea
+        }
+        // Files dropped anywhere on the chat become attachments.
+        .dropDestination(for: URL.self) { urls, _ in
+            addAttachments(urls: urls)
+            return true
+        } isTargeted: { chatDropTargeted = $0 }
+        .overlay {
+            if chatDropTargeted || textDropTargeted {
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8, 5]))
+                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                    .overlay {
+                        Label(loc.t("Suelta para adjuntar", "Drop to attach"), systemImage: "paperclip")
+                            .font(.headline)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.regularMaterial, in: Capsule())
+                    }
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
         }
     }
 
@@ -2955,7 +3430,7 @@ struct NativeChatView: View {
                 case .message(let msg):
                     messageRow(msg, isNewest: msg.id == newestID)
                         .flippedUpsideDown()
-                        .id(msg.id)
+                        .id(row.id)
                 case .tools(let rounds):
                     toolsRow(rounds)
                         .flippedUpsideDown()
@@ -3067,6 +3542,14 @@ struct NativeChatView: View {
                         chat.deleteMessageAndFollowing(msg.id)
                     })
                     .equatable()
+                if msg.role == "assistant", let sketches = msg.sketches, !sketches.isEmpty {
+                    ChatSketchList(sketches: sketches)
+                }
+                if msg.role == "assistant", msg.map != nil || msg.mapRequest != nil {
+                    ChatMapSection(message: msg, loading: chat.mapLoading.contains(msg.id),
+                                   failed: chat.mapFailed.contains(msg.id),
+                                   onShow: { chat.loadMap(for: msg.id, port: port) })
+                }
             }
         }
     }
@@ -3159,11 +3642,6 @@ struct NativeChatView: View {
         .padding(.horizontal, 18)
         .padding(.top, 8)
         .padding(.bottom, 16)
-        // Files dropped anywhere on the composer become attachments.
-        .dropDestination(for: URL.self) { urls, _ in
-            addAttachments(urls: urls)
-            return true
-        }
         .onChange(of: attachments) { scheduleDraftSave() }
         .onChange(of: images) { scheduleDraftSave() }
             .alert(loc.t("Problema con la voz", "Voice problem"),
@@ -3278,7 +3756,9 @@ struct NativeChatView: View {
                 text: $draft,
                 isFocused: $inputFocused,
                 fontSize: ChatFont.Base.body.points * chatFontScale,
-                onSubmit: send)
+                onSubmit: send,
+                onDropFiles: { addAttachments(urls: $0) },
+                onDragTargeted: { textDropTargeted = $0 })
         }
             .frame(height: 64)
             .onChange(of: draft) { _, value in
@@ -3617,8 +4097,8 @@ struct NativeChatView: View {
                         customJSON = ""
                         agenticMaxTurns = 10
                         pasteLongTextLength = 2500
-                        maxImageMegapixels = 1
-                        pdfAsImages = false
+                        maxImageMegapixels = ProductDefaults.double(SettingsKeys.chatMaxImageMegapixels, or: 1)
+                        pdfAsImages = ProductDefaults.bool(SettingsKeys.chatPDFAsImages, or: false)
                     }
                     .buttonStyle(.link)
                     .font(.caption)
@@ -3977,16 +4457,43 @@ struct NativeChatView: View {
     }
 
     private var toolsPopover: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label(loc.t("Herramientas del chat", "Chat tools"),
-                      systemImage: "wrench.and.screwdriver")
-                    .font(.headline)
-                Spacer()
-                Button(loc.t("Activar todas", "Enable all"), systemImage: "checkmark.circle") {
-                    chat.enableAllTools()
+        let selected = chat.current?.enabledToolNames.map(Set.init)
+        let enabledCount = selected.map { s in availableTools.filter { s.contains($0.name) }.count }
+            ?? availableTools.count
+        return VStack(alignment: .leading, spacing: 10) {
+            Label(loc.t("Herramientas del chat", "Chat tools"),
+                  systemImage: "wrench.and.screwdriver")
+                .font(.headline)
+            if !availableTools.isEmpty {
+                HStack(spacing: 12) {
+                    Button(loc.t("Activar todas", "Enable all"), systemImage: "checkmark.circle") {
+                        chat.enableAllTools()
+                    }
+                    .disabled(enabledCount == availableTools.count)
+                    .help(loc.t("Marca todas las herramientas para esta conversación",
+                                "Checks every tool for this conversation"))
+                    Button(loc.t("Desactivar todas", "Disable all"), systemImage: "circle") {
+                        chat.disableAllTools()
+                    }
+                    .disabled(enabledCount == 0)
+                    .help(loc.t("Desmarca todas las herramientas para elegir solo las que necesites",
+                                "Unchecks every tool so you can pick only the ones you need"))
+                    Spacer()
+                    Text(loc.t("%@ de %@", "%@ of %@", "\(enabledCount)", "\(availableTools.count)"))
+                        .font(.caption)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
+                .controlSize(.small)
+            }
+            if let agent = EngineExtensions.active().first(where: \.hasAgent) {
+                Label(loc.t("%@ recibe cada mensaje primero; los que no son de lo suyo pueden volver a estas herramientas.",
+                            "%@ gets every message first; the ones outside its own field can come back to these tools.",
+                            agent.manifest.name.pick(spanish: loc.isSpanish)),
+                      systemImage: "puzzlepiece.extension")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Divider()
             ForEach(availableTools) { tool in
@@ -4132,7 +4639,7 @@ struct NativeChatView: View {
                         Text(a.name).lineLimit(1)
                         if a.mediaKind == nil {
                             Text("~\(a.estimatedTokens)t")
-                                .font(.system(size: 9, design: .monospaced))
+                                .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                         } else {
                             Button(loc.t("Vista previa", "Preview"), systemImage: "play.circle") {
@@ -4256,8 +4763,19 @@ struct NativeChatView: View {
     private static let maxAttachBytes = 40 * 1024 * 1024
     private static let maxAttachChars = 400_000
 
+    /// Files attached together: when every name carries a number ("page1", "page10", "735") they are a sequence and go
+    /// in its order; otherwise the names say none, so they keep the order they came in.
+    nonisolated static func pageOrder(_ urls: [URL]) -> [URL] {
+        let numbered = urls.allSatisfy {
+            $0.deletingPathExtension().lastPathComponent.rangeOfCharacter(from: .decimalDigits) != nil
+        }
+        guard numbered else { return urls }
+        return urls.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
     private func addAttachments(urls: [URL]) {
         var errors: [String] = []
+        let urls = Self.pageOrder(urls)
         for url in urls {
             let name = url.lastPathComponent
             let ext = (name as NSString).pathExtension.lowercased()
@@ -4303,7 +4821,9 @@ struct NativeChatView: View {
                 guard let uri = Self.imageDataURI(from: data, maxMegapixels: maxImageMegapixels) else {
                     errors.append(loc.t("%@: no se pudo procesar la imagen", "%@: couldn't process the image", "\(name)")); continue
                 }
-                images.append(uri); continue
+                // the same file dropped or picked again is already attached
+                if !images.contains(uri) { images.append(uri) }
+                continue
             }
 
             var text: String
@@ -4312,11 +4832,18 @@ struct NativeChatView: View {
                     errors.append(loc.t("%@: no se pudo abrir el PDF", "%@: couldn't open the PDF", "\(name)")); continue
                 }
                 if pdfAsImages && visionAvailable {
+                    // the PDF's own text goes with its pages: what an image blurs, the text layer still says
+                    if let layer = Self.pdfTextLayer(pdf, maxChars: Self.maxAttachChars) {
+                        let digest = FileHash.sha256(of: data) + ".text"
+                        if !attachments.contains(where: { $0.digest == digest }) {
+                            attachments.append(ChatAttachment(name: name + " (text layer)", content: layer, digest: digest))
+                        }
+                    }
                     ocrPending += 1
                     Task { @MainActor in
                         let pages = Self.pdfImageURIs(pdf, maxPages: 20,
                                                       maxMegapixels: maxImageMegapixels)
-                        images.append(contentsOf: pages)
+                        images.append(contentsOf: pages.filter { !images.contains($0) })
                         ocrPending -= 1
                         if pages.isEmpty {
                             attachError = (attachError.map { $0 + "\n" } ?? "")
@@ -4330,9 +4857,11 @@ struct NativeChatView: View {
                 } else {
                     // No text layer (scanned PDF) → OCR the page images on-device
                     // (Vision framework), asynchronously so the UI doesn't block.
+                    let digest = FileHash.sha256(of: data)
+                    guard !attachments.contains(where: { $0.digest == digest }) else { continue }
                     let pendingID = UUID()
                     attachments.append(ChatAttachment(id: pendingID, name: name,
-                        content: loc.t("(extrayendo texto por OCR…)", "(extracting text via OCR…)")))
+                        content: loc.t("(extrayendo texto por OCR…)", "(extracting text via OCR…)"), digest: digest))
                     ocrPending += 1
                     Task { @MainActor in
                         let ocr = await Self.ocrPDF(data: data, maxPages: 20, maxChars: Self.maxAttachChars)
@@ -4444,6 +4973,27 @@ struct NativeChatView: View {
         return "data:image/jpeg;base64," + jpeg.base64EncodedString()
     }
 
+    /// The PDF's own text page by page, "[Page N]" before each and an end line after it, or nil when it has too
+    /// little text to be a text layer, as a scan without one has. A layer cut at `maxChars` says in which page, so
+    /// nothing takes it for the whole document.
+    nonisolated static func pdfTextLayer(_ document: PDFDocument, maxChars: Int) -> String? {
+        let pages = (0..<document.pageCount).map {
+            document.page(at: $0)?.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+        guard pages.joined().filter({ !$0.isWhitespace }).count >= 80 else { return nil }
+        var text = "", length = 0
+        for (index, body) in pages.enumerated() {
+            let block = (index == 0 ? "" : "\n") + "[Page \(index + 1)]\n" + body
+            if length + block.count > maxChars {
+                text += block.prefix(maxChars - length)
+                return text + "\n[Text layer cut in page \(index + 1) of \(pages.count)]\n[End of text layer]"
+            }
+            text += block
+            length += block.count
+        }
+        return text + "\n[End of text layer]"
+    }
+
     @MainActor
     private static func pdfImageURIs(_ document: PDFDocument, maxPages: Int,
                                      maxMegapixels: Double) -> [String] {
@@ -4527,7 +5077,8 @@ struct NativeChatView: View {
                 }
 
                 if server.state == .running && contextLimit > 0 {
-                    let used = chat.contextUsed ?? 0
+                    let reading = chat.contextReading ?? (chat.toolTokens, true)
+                    let used = reading.tokens
                     let fraction = Double(used) / Double(contextLimit)
                     HStack(spacing: 5) {
                         Label(loc.t("Contexto", "Context"), systemImage: "memorychip")
@@ -4535,12 +5086,21 @@ struct NativeChatView: View {
                         ProgressView(value: min(fraction, 1))
                             .frame(width: 76)
                             .tint(fraction > 0.9 ? .red : fraction > 0.8 ? .orange : .accentColor)
-                        Text("\(used / 1000)k / \(contextLimit / 1000)k")
+                        Text((reading.estimated ? "≈" : "") + ChatStore.kiloTokens(used) + " / \(contextLimit / 1000)k")
                             .font(.system(size: 10, design: .monospaced))
                             .foregroundStyle(fraction > 0.8 ? .orange : .secondary)
                     }
                     .help(loc.t("Tokens usados por el historial y la última respuesta. Al superar 70%, la app intenta resumir los turnos antiguos.",
-                                "Tokens used by history and the latest response. Past 70%, the app attempts to summarize older turns."))
+                                "Tokens used by history and the latest response. Past 70%, the app attempts to summarize older turns.")
+                          + (reading.estimated
+                             ? " " + loc.t("≈: estimado a partir del texto y los adjuntos, porque el servidor no contó este turno; el próximo turno da la cifra exacta.",
+                                           "≈: estimated from the text and attachments, as the server did not count this turn; the next turn gives the exact figure.")
+                             : "")
+                          + (chat.toolTokens >= 1000
+                             ? " " + loc.t("Las definiciones de las herramientas activas ocupan unos %@k.",
+                                           "The definitions of the active tools take about %@k of it.",
+                                           "\(chat.toolTokens / 1000)")
+                             : ""))
                 }
 
                 if server.state == .running && contextMaySlowGeneration && chat.canCompactCurrent {
@@ -4783,7 +5343,7 @@ struct ConversationListView: View {
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
 
-            Text("ToshLLM · macOS")
+            Text("\(AppInfo.name) · macOS")
                 .font(.system(size: 10, weight: .medium))
                 .tracking(1.5)
                 .foregroundStyle(.tertiary)
@@ -4948,7 +5508,7 @@ struct ConversationListView: View {
     private func exportArchive() {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "ToshLLM-conversations.json"
+        panel.nameFieldStringValue = "\(AppInfo.name)-conversations.json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try chat.exportArchiveData().write(to: url, options: .atomic)
@@ -4962,7 +5522,7 @@ struct ConversationListView: View {
     private func exportJSONL() {
         let panel = NSSavePanel()
         if let jsonl = UTType(filenameExtension: "jsonl") { panel.allowedContentTypes = [jsonl] }
-        panel.nameFieldStringValue = "ToshLLM-conversations.jsonl"
+        panel.nameFieldStringValue = "\(AppInfo.name)-conversations.jsonl"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             try chat.exportJSONLData().write(to: url, options: .atomic)

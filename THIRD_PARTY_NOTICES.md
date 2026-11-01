@@ -52,3 +52,19 @@ libraries of the GCC runtime, in `scipy/.dylibs`:
 
 Their source is GCC, at <https://gcc.gnu.org>. The tests, benchmarks, headers and static
 libraries of both wheels are removed at build time and are not redistributed.
+
+## Maps (`Contents/Resources/rich-content/maplibre` and the web chat)
+
+The chat's maps are drawn with these libraries, bundled into `toshmap.js` by
+`scripts/build-map.sh` and into the web chat's bundle. Their license texts are in
+[`Assets/rich-content/maplibre/licenses`](Assets/rich-content/maplibre/licenses) and are copied into the app
+next to `toshmap.js`.
+
+| Component | Version | License | Text |
+|---|---|---|---|
+| MapLibre GL JS | 6.11.2 | BSD-3-Clause | `LICENSE.maplibre-gl.txt` |
+| PMTiles | 4.5.0 | BSD-3-Clause | `LICENSE.pmtiles.txt` |
+| Protomaps basemaps | 5.7.2 | BSD-3-Clause, CC0 design, MIT icons | `LICENSE.protomaps-basemaps.txt` |
+
+Map data is not redistributed. The online map is OpenFreeMap, and both it and PMTiles regions
+from Protomaps carry OpenStreetMap data (ODbL), credited on every map.

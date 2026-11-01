@@ -20,6 +20,8 @@ struct ImageGenComponent: Identifiable {
     let urlString: String
     let fileName: String
     let sizeGB: Double
+    /// Names the catalog downloaded this file under before; a copy already on disk still counts.
+    var formerFileNames: [String] = []
     var id: String { fileName }
 
     /// The sd-cli argument this file is passed as.
@@ -108,9 +110,15 @@ struct ImageGenModel: Identifiable {
     /// plus the aux card holding the moved components.
     func fitsGPU(mainVRAM: Double, auxVRAM: Double?) -> Bool {
         guard let auxVRAM else { return fitsVRAMClass(mainVRAM) }
-        return auxVRAM >= totalGB - residentGB
+        return auxHolds(auxVRAM)
             && !ImageGenLimits.baseSizes(vramGB: mainVRAM, residentGB: residentGB,
                                          attnVRAMSq: attnVRAMSq, maxLongEdge: maxLongEdge).isEmpty
+    }
+
+    /// The components moved to an aux GPU have to fit on it.
+    func auxHolds(_ auxVRAM: Double?) -> Bool {
+        guard let auxVRAM else { return true }
+        return auxVRAM >= totalGB - residentGB
     }
 
     /// A transformer (DiT) ships its denoiser as a diffusion model file; the UNet models
@@ -133,6 +141,12 @@ struct ImageGenModel: Identifiable {
     /// VAE tile (px) that replaces the `--vae-tile-size` in `extraArgs` on cards with 12 GB
     /// or more: fewer, larger tiles decode faster but need a bigger VAE buffer.
     var largeVAETile: Int? = nil
+    /// Noise levels a step-distilled model was trained on, ending at 0. They replace the
+    /// scheduler and fix the step count.
+    var sigmas: [Double] = []
+
+    /// Steps a run takes: a fixed schedule wins over the requested count.
+    func steps(_ requested: Int) -> Int { sigmas.isEmpty ? requested : sigmas.count - 1 }
 
     var id: String { name }
     var totalGB: Double { components.reduce(0) { $0 + $1.sizeGB } }
@@ -302,17 +316,22 @@ enum ImageGenCatalog {
         defaultSteps: 20, cfgScale: 2.5, minVRAMGB: 16,
         extraArgs: ["--backend", "vae=cpu"])
 
-    /// Qwen-Image 2.1 (7B MMDiT, Apache). Writes legible text and edits from
-    /// reference images. Its encoder is Qwen3-VL-8B, which runs off the card.
-    private static func qwenImage21(_ name: String, detailES: String, detailEN: String,
-                                    file: String, sizeGB: Double, minVRAMGB: Double,
-                                    recommendable: Bool) -> ImageGenModel {
+    /// Turbo's distilled schedule (`sample_sigmas` of its model_index.json) plus the final 0.
+    static let qwenImage21TurboSigmas = [1.0, 0.978453, 0.95418, 0.926626, 0.89508,
+                                         0.845148, 0.704534, 0.414568, 0.0]
+
+    /// Qwen-Image 2.1 (7B MMDiT, non-commercial license). Writes legible text and edits from
+    /// reference images; Turbo shares its VAE and the Qwen3-VL-8B encoder, which runs off the card.
+    static func qwenImage21(_ name: String, detailES: String, detailEN: String,
+                            repo: String = "leejet/Qwen-Image-2.1-GGUF", revision: String = "main",
+                            file: String, formerFile: String? = nil, sizeGB: Double, minVRAMGB: Double,
+                            recommendable: Bool, turbo: Bool = false) -> ImageGenModel {
         ImageGenModel(
             name: name, detailES: detailES, detailEN: detailEN,
             components: [
                 ImageGenComponent(kind: .diffusion,
-                    urlString: "https://huggingface.co/leejet/Qwen-Image-2.1-GGUF/resolve/main/\(file)",
-                    fileName: file, sizeGB: sizeGB),
+                    urlString: "https://huggingface.co/\(repo)/resolve/\(revision)/\(file)",
+                    fileName: file, sizeGB: sizeGB, formerFileNames: formerFile.map { [$0] } ?? []),
                 ImageGenComponent(kind: .vae,
                     urlString: "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors",
                     fileName: "qwen_image_2.1_vae_bf16.safetensors", sizeGB: 0.68),
@@ -323,47 +342,88 @@ enum ImageGenCatalog {
                     urlString: "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
                     fileName: "mmproj-Qwen3VL-8B-Instruct-F16.gguf", sizeGB: 1.16),
             ],
-            // The published recipe: 25 steps at guidance 1, Euler on the simple schedule.
-            // 2048 completes on a card without a display and hangs one that draws the desktop.
-            defaultSteps: 25, cfgScale: 1.0, minVRAMGB: minVRAMGB, recommendable: recommendable,
+            // The published recipes: 25 steps (Turbo: its own 8) at guidance 1 with Euler; a card
+            // that draws the desktop stops at 1920.
+            defaultSteps: turbo ? qwenImage21TurboSigmas.count - 1 : 25, cfgScale: 1.0,
+            minVRAMGB: minVRAMGB, recommendable: recommendable,
             maxLongEdge: 2048, displayMaxLongEdge: 1920, nativeLongEdge: 2048,
             halfPartials: true,
             maxReferenceImages: 16,
             // 384 px VAE tiles: 256 pays per tile and 512 grows the mid-block attention faster than it saves.
-            extraArgs: ["--sampling-method", "euler", "--scheduler", "simple", "--vae-tile-size", "384"],
-            largeVAETile: 640)
+            extraArgs: ["--sampling-method", "euler"] + (turbo ? [] : ["--scheduler", "simple"])
+                + ["--vae-tile-size", "384"],
+            largeVAETile: 640,
+            sigmas: turbo ? qwenImage21TurboSigmas : [])
     }
 
     static let qwenImage21Q3 = qwenImage21(
         "Qwen-Image 2.1 (Q3)",
-        detailES: "7B. Escribe texto legible y edita desde imágenes de referencia. Versión ligera para 8 GB.",
-        detailEN: "7B. Writes legible text and edits from reference images. Light build for 8 GB cards.",
+        detailES: "7B. Escribe texto legible y edita desde imágenes de referencia. Versión ligera para 8 GB. Licencia no comercial.",
+        detailEN: "7B. Writes legible text and edits from reference images. Light build for 8 GB cards. Non-commercial license.",
         file: "qwen_image_2.1-Q3_K.gguf", sizeGB: 3.27, minVRAMGB: 8, recommendable: false)
 
     static let qwenImage21Q4 = qwenImage21(
         "Qwen-Image 2.1",
-        detailES: "7B. Escribe texto legible dentro de la imagen y edita desde imágenes de referencia.",
-        detailEN: "7B. Writes legible text inside the image and edits from reference images.",
+        detailES: "7B. Escribe texto legible dentro de la imagen y edita desde imágenes de referencia. Licencia no comercial.",
+        detailEN: "7B. Writes legible text inside the image and edits from reference images. Non-commercial license.",
         file: "qwen_image_2.1-Q4_K.gguf", sizeGB: 4.20, minVRAMGB: 12, recommendable: false)
 
     static let qwenImage21Q6 = qwenImage21(
         "Qwen-Image 2.1 (Q6)",
-        detailES: "7B con más precisión. Mismo ritmo que la Q4.",
-        detailEN: "7B at higher precision, at the same pace as the Q4 build.",
+        detailES: "7B con más precisión. Mismo ritmo que la Q4. Licencia no comercial.",
+        detailEN: "7B at higher precision, at the same pace as the Q4 build. Non-commercial license.",
         file: "qwen_image_2.1-Q6_K.gguf", sizeGB: 6.00, minVRAMGB: 12, recommendable: false)
 
     static let qwenImage21Q8 = qwenImage21(
         "Qwen-Image 2.1 (Q8)",
-        detailES: "7B casi sin pérdida, para tarjetas de 16 GB en adelante.",
-        detailEN: "7B at near-lossless precision, for 16 GB cards and up.",
+        detailES: "7B casi sin pérdida, para tarjetas de 16 GB en adelante. Licencia no comercial.",
+        detailEN: "7B at near-lossless precision, for 16 GB cards and up. Non-commercial license.",
         file: "qwen_image_2.1-Q8_0.gguf", sizeGB: 7.69, minVRAMGB: 16, recommendable: false)
+
+    /// Pinned to the commit that was measured, so the URL keeps serving those files. The AtomicChat
+    /// builds offered before still run when they are already on disk.
+    private static let qwenImage21TurboRepo = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
+    private static let qwenImage21TurboRevision = "5d1f9f759ea877ae556cda88dbec958b62ad3809"
+
+    static let qwenImage21TurboQ3 = qwenImage21(
+        "Qwen-Image 2.1 Turbo (Q3)",
+        detailES: "7B en 8 pasos en vez de 25. Texto legible y edición desde referencias. Versión ligera para 8 GB. Licencia no comercial.",
+        detailEN: "7B in 8 steps instead of 25. Legible text and edits from references. Light build for 8 GB cards. Non-commercial license.",
+        repo: qwenImage21TurboRepo, revision: qwenImage21TurboRevision,
+        file: "qwen-image-2.1-turbo-Q3_K_XL.gguf", formerFile: "Qwen-Image-2.1-Turbo-AD-Q3_K.gguf",
+        sizeGB: 3.61, minVRAMGB: 8, recommendable: false, turbo: true)
+
+    static let qwenImage21TurboQ4 = qwenImage21(
+        "Qwen-Image 2.1 Turbo",
+        detailES: "7B en 8 pasos en vez de 25. Escribe texto legible y edita desde imágenes de referencia. Licencia no comercial.",
+        detailEN: "7B in 8 steps instead of 25. Writes legible text and edits from reference images. Non-commercial license.",
+        repo: qwenImage21TurboRepo, revision: qwenImage21TurboRevision,
+        file: "qwen-image-2.1-turbo-Q4_K_M.gguf", formerFile: "Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
+        sizeGB: 4.20, minVRAMGB: 12, recommendable: false, turbo: true)
+
+    static let qwenImage21TurboQ6 = qwenImage21(
+        "Qwen-Image 2.1 Turbo (Q6)",
+        detailES: "7B en 8 pasos, con más precisión. Licencia no comercial.",
+        detailEN: "7B in 8 steps, at higher precision. Non-commercial license.",
+        repo: qwenImage21TurboRepo, revision: qwenImage21TurboRevision,
+        file: "qwen-image-2.1-turbo-Q6_K_XL.gguf", formerFile: "Qwen-Image-2.1-Turbo-AD-Q6_K.gguf",
+        sizeGB: 6.72, minVRAMGB: 12, recommendable: false, turbo: true)
+
+    static let qwenImage21TurboQ8 = qwenImage21(
+        "Qwen-Image 2.1 Turbo (Q8)",
+        detailES: "7B en 8 pasos, casi sin pérdida, para tarjetas de 16 GB en adelante. Licencia no comercial.",
+        detailEN: "7B in 8 steps at near-lossless precision, for 16 GB cards and up. Non-commercial license.",
+        repo: qwenImage21TurboRepo, revision: qwenImage21TurboRevision,
+        file: "qwen-image-2.1-turbo-Q8_0.gguf", formerFile: "Qwen-Image-2.1-Turbo-Q8_0.gguf",
+        sizeGB: 7.64, minVRAMGB: 16, recommendable: false, turbo: true)
 
     /// Curated order (small to large). Z-Image sits before SDXL so it wins the
     /// 8-12 GB tie as the recommended pick (validated for photorealism on AMD);
     /// klein 9B sits before schnell to win the 16 GB tie the same way.
-    static let models: [ImageGenModel] = [sd15, zImageTurbo, sdxlTurbo, qwenImage21Q3,
-                                          flux2Klein4B, qwenImage21Q4, flux2Klein9B, fluxSchnell,
-                                          qwenImage21Q6, qwenImage, qwenImage21Q8, flux2Dev]
+    static let models: [ImageGenModel] = [sd15, zImageTurbo, sdxlTurbo, qwenImage21Q3, qwenImage21TurboQ3,
+                                          flux2Klein4B, qwenImage21Q4, qwenImage21TurboQ4, flux2Klein9B,
+                                          fluxSchnell, qwenImage21Q6, qwenImage21TurboQ6, qwenImage,
+                                          qwenImage21Q8, qwenImage21TurboQ8, flux2Dev]
 
     /// The best model this GPU can run: the highest min-VRAM tier that fits, and
     /// within a tie the earliest listed (curated preference).
@@ -473,7 +533,7 @@ enum ImageGenLimits {
                           attnVRAMSq: Double = 0, maxLongEdge: Int = .max,
                           streamedAttention: Bool = true) -> [Int] {
         let candidates = [512, 640, 768, 896, 1024, 1152, 1280, 1440,
-                          1600, 1792, 2048, 2304, 2560, 3072]
+                          1600, 1792, 1920, 2048, 2304, 2560, 3072]
         return candidates.filter { base in
             guard base <= maxLongEdge else { return false }
             let short = max(256, Int((Double(base) * 9 / 16 / 64).rounded()) * 64)
@@ -508,13 +568,11 @@ enum ImageGenLimits {
         return count <= 2 ? full : max(256 * 256, 2 * full / count)
     }
 
-    /// Command buffers to split each diffusion step into so none exceeds the
-    /// watchdog. 1024x1024 (~1.05M px) is safe as one buffer; scale up from there,
-    /// capped at 4 (n_cb>4 crashes AMD).
+    /// Command buffers per diffusion step, short enough that the driver's hang check never trips;
+    /// 8 is the engine's maximum.
     static func nCB(width: Int, height: Int) -> Int {
         let px = width * height
-        if px <= 1_150_000 { return 1 }
-        return min(4, Int((Double(px) / 550_000).rounded(.up)))
+        return min(8, max(1, Int((Double(px) / 450_000).rounded(.up))))
     }
 }
 
@@ -579,6 +637,8 @@ enum ImageFastMode: String, CaseIterable, Identifiable {
 
     /// cache-dit and easycache work on transformer models only; spectrum also on UNets.
     func supports(_ model: ImageGenModel) -> Bool {
+        // a distilled schedule has no redundant step to reuse
+        if !model.sigmas.isEmpty { return self == .off }
         switch self {
         case .off, .spectrum: return true
         case .cacheDit, .easycache: return model.isTransformer
@@ -720,6 +780,7 @@ final class ImageGenerator: ObservableObject {
                   referenceImagePaths: [String] = [],
                   fastMode: ImageFastMode = .off) {
         guard !isBusy else { return }
+        let steps = model.steps(steps)
         // A reference that went missing would shift every <imageN> after it, so the run
         // stops instead of editing against the wrong picture.
         let refs = Array(referenceImagePaths.filter { !$0.isEmpty }.prefix(max(0, model.maxReferenceImages)))
@@ -753,6 +814,11 @@ final class ImageGenerator: ObservableObject {
             "-p", prompt,
             "--cfg-scale", String(format: "%.1f", model.cfgScale),
             "--steps", String(steps),
+        ]
+        if !model.sigmas.isEmpty {
+            args += ["--sigmas", model.sigmas.map { String($0) }.joined(separator: ",")]
+        }
+        args += [
             "-W", String(width), "-H", String(height),
             "--seed", String(seed),
             // Tiled VAE decode keeps each Metal command buffer under the AMD GPU

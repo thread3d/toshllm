@@ -90,8 +90,12 @@ struct ChatToolCall: Identifiable, Codable, Equatable {
     var arguments: String
     var result: String?
     var state: ChatToolCallState = .pending
+    /// The service took the operation in and has not said it finished: done as a call, not as an operation.
+    var accepted: Bool? = nil
     var startedAt: Date?
     var finishedAt: Date?
+    /// A readable line about the result, from the agent that ran the call.
+    var summary: String?
 }
 
 struct PendingToolPermission: Identifiable, Equatable {

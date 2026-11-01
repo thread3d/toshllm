@@ -18,6 +18,13 @@ struct HardwareInfo {
     var gpus: [GPUDevice]
 
     var bestGPU: GPUDevice? { gpus.max(by: { $0.vramMB < $1.vramMB }) }
+    /// The brand string without trademarks or clock, which only crowd a narrow label.
+    var cpuShortName: String {
+        var name = cpuBrand.replacingOccurrences(of: "(R)", with: "").replacingOccurrences(of: "(TM)", with: "")
+        if let at = name.range(of: "@") { name = String(name[..<at.lowerBound]) }
+        name = name.replacingOccurrences(of: " CPU", with: "")
+        return name.split(separator: " ").joined(separator: " ")
+    }
     var vramGB: Double { Double(bestGPU?.vramMB ?? 0) / 1024 }
     /// Total VRAM across the split-eligible GPUs (iGPUs are never auto-selected).
     /// Only meaningful for a multi-GPU layer split.
@@ -125,6 +132,19 @@ struct ModelSpec {
     var activeParamsB: Double = 0
     /// Exact f16 KV bytes per token from the GGUF geometry; 0 = fall back to the heuristic.
     var kvBytesPerToken: Double = 0
+    /// Routed expert banks from the GGUF tensor table; 0 = unknown, the estimate guesses from the size.
+    var expertGB: Double = 0
+    /// Tables the engine reads from disk on demand (Flash-Next's per-layer embeddings): not loaded.
+    var lazyGB: Double = 0
+
+    /// What the engine actually loads into RAM or VRAM.
+    var weightsGB: Double { max(0.1, fileGB - lazyGB) }
+
+    mutating func apply(_ split: GGUFWeightSplit?) {
+        guard let split else { return }
+        expertGB = Double(split.expertBytes) / 1_073_741_824
+        lazyGB = Double(split.lazyBytes) / 1_073_741_824
+    }
 
     /// Reads the real KV geometry: multi-head models (llama-2, OLMo) cache eight times
     /// what the by-size heuristic assumes, enough to overflow VRAM and hang the driver.
@@ -147,14 +167,19 @@ struct ModelSpec {
     }
 
     /// For local models without catalog metadata
-    static func estimated(fileBytes: Int64, isMoE: Bool, name: String = "", path: String = "") -> ModelSpec {
+    static func estimated(fileBytes: Int64, isMoE: Bool, name: String = "", path: String = "",
+                          split: GGUFWeightSplit? = nil) -> ModelSpec {
         let gb = Double(fileBytes) / 1_073_741_824
+        let resolved = split ?? (path.isEmpty ? nil : GGUFMetadataCache.weightSplit(at: path))
+        let lazyGB = Double(resolved?.lazyBytes ?? 0) / 1_073_741_824
         // Q4 is roughly 0.57 GB per billion parameters
-        let params = gb / 0.57
+        let params = max(0.1, gb - lazyGB) / 0.57
         let active = isMoE ? (ModelName.activeParamsB(name) ?? params * 0.11) : 0
-        return ModelSpec(fileGB: gb, paramsB: params, layers: isMoE ? 48 : 40,
-                         isMoE: isMoE, activeParamsB: active,
-                         kvBytesPerToken: path.isEmpty ? 0 : kvBytesPerToken(atPath: path))
+        var spec = ModelSpec(fileGB: gb, paramsB: params, layers: isMoE ? 48 : 40,
+                             isMoE: isMoE, activeParamsB: active,
+                             kvBytesPerToken: path.isEmpty ? 0 : kvBytesPerToken(atPath: path))
+        spec.apply(resolved)
+        return spec
     }
 }
 
@@ -312,30 +337,31 @@ enum Estimator {
         let computeGB = 0.9 + spec.paramsB * 0.012 + scratchGB
 
         if !spec.isMoE {
-            let need = spec.fileGB * 1.03 + kvGB + computeGB
+            let need = spec.weightsGB * 1.03 + kvGB + computeGB
             if need <= vramBudget {
                 // Decode is bandwidth-bound: t/s ≈ VRAM bandwidth / bytes read per
                 // token, and a full-GPU dense model reads its whole file each token.
-                let tg = clampSpeed(effectiveBW / max(0.5, spec.fileGB), effective: effectiveBW)
+                let tg = clampSpeed(effectiveBW / max(0.5, spec.weightsGB), effective: effectiveBW)
                 return MemoryEstimate(vramGB: need, ramGB: 0.7, suggestedNcmoe: 0,
                                       level: .ideal, expectedSpeed: speedRange(tg))
             }
             // Partly on the CPU: every token still reads the whole model, so the
             // share left in RAM is read at RAM speed and sets the pace.
-            if spec.fileGB * 0.5 <= vramBudget && spec.fileGB < hw.ramGB * 0.6 {
+            if spec.weightsGB * 0.5 <= vramBudget && spec.weightsGB < hw.ramGB * 0.6 {
                 let onGPU = max(0, vramBudget - kvGB - computeGB)
-                let fracRAM = max(0, min(1, (spec.fileGB - onGPU) / max(0.5, spec.fileGB)))
-                let perToken = spec.fileGB * ((1 - fracRAM) / effectiveBW + fracRAM / bwRAM)
+                let fracRAM = max(0, min(1, (spec.weightsGB - onGPU) / max(0.5, spec.weightsGB)))
+                let perToken = spec.weightsGB * ((1 - fracRAM) / effectiveBW + fracRAM / bwRAM)
                 let tg = clampSpeed(1 / max(0.0001, perToken), effective: effectiveBW)
-                return MemoryEstimate(vramGB: vramBudget, ramGB: spec.fileGB - vramBudget + 2,
+                return MemoryEstimate(vramGB: vramBudget, ramGB: spec.weightsGB - vramBudget + 2,
                                       suggestedNcmoe: 0, level: .slow, expectedSpeed: speedRange(tg))
             }
             return MemoryEstimate(vramGB: need, ramGB: 0, suggestedNcmoe: 0, level: .no, expectedSpeed: "—")
         }
 
         // MoE: attention and shared layers in VRAM, experts split between VRAM and RAM
-        let overheadGB = 1.4 + kvGB + computeGB     // attention + KV + compute
-        let expertsGB = max(0, spec.fileGB - 1.3)
+        let denseGB = spec.expertGB > 0 ? max(0.3, spec.weightsGB - spec.expertGB) : 1.3
+        let overheadGB = denseGB + 0.1 + kvGB + computeGB     // attention + KV + compute
+        let expertsGB = spec.expertGB > 0 ? spec.expertGB : max(0, spec.weightsGB - 1.3)
         let vramForExperts = vramBudget - overheadGB
         let gpuExpertsGB = min(expertsGB, max(0, vramForExperts))
         let cpuExpertsGB = expertsGB - gpuExpertsGB
@@ -359,13 +385,13 @@ enum Estimator {
         // (slow) and the rest in VRAM, so more offload means fewer t/s. The quant
         // shows up as bytes-per-param = fileGB / total params.
         let active = spec.activeParamsB > 0 ? spec.activeParamsB : spec.paramsB * 0.11
-        let bytesPerParam = spec.fileGB / max(1, spec.paramsB)
+        let bytesPerParam = spec.weightsGB / max(1, spec.paramsB)
         let activeGB = active * bytesPerParam
         let perToken = activeGB * ((1 - fracRAM) / bwVRAM + fracRAM / bwRAM)
         let tg = clampSpeed(moeEff * (denseEff / 0.72) / max(0.0001, perToken), effective: effectiveBW)
 
         if ncmoe == 0 {
-            return MemoryEstimate(vramGB: spec.fileGB + overheadGB, ramGB: 0.7, suggestedNcmoe: 0,
+            return MemoryEstimate(vramGB: spec.weightsGB + overheadGB, ramGB: 0.7, suggestedNcmoe: 0,
                                   level: .ideal, expectedSpeed: speedRange(tg))
         }
         let level: FitLevel = fracRAM > 0.85 ? .slow : .good

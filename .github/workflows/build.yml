@@ -9,6 +9,10 @@ on:
       - "Package.swift"
       - "Package.resolved"
       - "helpers/**"
+      - "patches/**"
+      - "scripts/build-engines.sh"
+      - "scripts/build-sympy.sh"
+      - "scripts/test-engine.sh"
       - ".github/workflows/build.yml"
     tags: ["v*"]
   pull_request:
@@ -25,12 +29,14 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # a push only checks what it changed, so a later push must not cancel it
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Direct pushes to main only run the unit tests — a fast gate. The full app +
-  # DMG build for both CPU variants happens once, on the release tag (below), so
-  # a version-bump commit and its tag don't compile the app twice on the same SHA.
+  # Direct pushes to main run the unit tests, and the engine tests when the engine
+  # changed. The full app + DMG build for both CPU variants happens once, on the
+  # release tag (below), so a version-bump commit and its tag don't compile the app
+  # twice on the same SHA.
   test:
     if: github.event_name == 'push' && github.ref_type == 'branch'
     name: Unit tests
@@ -45,12 +51,12 @@ jobs:
           vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_helper.py
           vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-scientific/tests/test_scientific.py
           vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_agent.py
+          vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_remote.py
 
   build:
     # PRs validate a single variant; tags and manual runs build BOTH CPU variants
-    # (standard = AVX2, noavx2 = pre-AVX2 legacy) and ship a DMG for each. Branch
-    # pushes are handled by the test job above, so build is skipped for them.
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    # (standard = AVX2, noavx2 = pre-AVX2 legacy) and ship a DMG for each. A branch
+    # push only builds and tests the engines, and only when they changed.
     name: Build ${{ matrix.variant }} (x86_64)
     runs-on: macos-26
     # Apple's notary queue took 66 min on this account's first submission.
@@ -69,20 +75,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect documentation-only PR
-        if: github.event_name == 'pull_request'
+      # Tags and manual runs build everything; a PR builds unless it only touches documentation; a
+      # branch push builds and tests the engines when they or this workflow changed, and never the app.
+      - name: Decide what this run builds
         id: scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          if git diff --name-only "$BASE_SHA"...HEAD | grep -Ev '(^|/).*\.md$|^Assets/lang/|^scripts/(extract-strings|check-translations|translation-status|sync-translations)\.py$|^\.github/|^LICENSE$|^\.gitignore$' >/dev/null; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
+          docs='(^|/).*\.md$|^Assets/lang/|^scripts/(extract-strings|check-translations|translation-status|sync-translations)\.py$|^\.github/|^LICENSE$|^\.gitignore$'
+          engine='^patches/|^scripts/(build-engines|test-engine)\.sh$|^\.github/workflows/build\.yml$'
+          app=false; engines=false
+          if [ "$GITHUB_REF_TYPE" = tag ] || [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            app=true; engines=true
+          elif ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            # nothing to compare with (a new branch or a forced push): check all this event can
+            engines=true
+            [ "$GITHUB_EVENT_NAME" = pull_request ] && app=true
           else
-            echo "build=false" >> "$GITHUB_OUTPUT"
+            if [ "$GITHUB_EVENT_NAME" = pull_request ]; then range="$BASE_SHA...HEAD"; else range="$BASE_SHA..HEAD"; fi
+            changed=$(git diff --name-only "$range")
+            if [ -n "$changed" ]; then
+              echo "$changed" | grep -Eq "$engine" && engines=true
+              if [ "$GITHUB_EVENT_NAME" = pull_request ] && { [ "$engines" = true ] || echo "$changed" | grep -Evq "$docs"; }; then
+                app=true; engines=true
+              fi
+            fi
           fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+          echo "engines=$engines" >> "$GITHUB_OUTPUT"
+          echo "Builds the app: **$app**. Builds and tests the engines: **$engines**." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cache engine builds
-        if: github.event_name != 'pull_request' || steps.scope.outputs.build == 'true'
+        if: steps.scope.outputs.engines == 'true'
         uses: actions/cache@v5
         with:
           path: vendor
@@ -92,7 +116,7 @@ jobs:
       # Pinned CPython, SymPy, NumPy and SciPy, checked against their SHA-256. Rebuilt every
       # time: it is a download and an unpack, and the helper sources live outside the engine cache key.
       - name: Build math runtime (x86_64)
-        if: github.event_name != 'pull_request' || steps.scope.outputs.build == 'true'
+        if: steps.scope.outputs.app == 'true'
         run: |
           ARCH=x86_64 ./scripts/build-sympy.sh
           PY=vendor/tosh-sympy/python/bin/python3
@@ -103,16 +127,18 @@ jobs:
             "$PY" -I helpers/tosh-sympy/tests/test_helper.py
             "$PY" -I helpers/tosh-scientific/tests/test_scientific.py
             "$PY" -I helpers/tosh-sympy/tests/test_agent.py
+            "$PY" -I helpers/tosh-sympy/tests/test_remote.py
           else
             echo "x86_64 runtime cannot run on this runner; its tests ran in the unit test job"
           fi
 
+      # also on tags: the release job waits for this one, not for the unit test job of the push
       - name: Run unit tests
-        if: github.event_name == 'pull_request' && steps.scope.outputs.build == 'true'
+        if: steps.scope.outputs.app == 'true' && matrix.variant == 'standard'
         run: swift test
 
       - name: Build inference engines (x86_64)
-        if: github.event_name != 'pull_request' || steps.scope.outputs.build == 'true'
+        if: steps.scope.outputs.engines == 'true'
         run: |
           if [ ! -x vendor/llama.cpp/build-static/bin/llama-server ] || \
              [ ! -f vendor/llama.cpp/build-static/bin/default.metallib ] || \
@@ -125,8 +151,14 @@ jobs:
             echo "Using cached inference engines"
           fi
 
+      # On the engine of this variant; a failure, a missing binary or a runner that cannot run it fails the job
+      - name: Engine tests (x86_64)
+        if: steps.scope.outputs.engines == 'true'
+        timeout-minutes: 20
+        run: ./scripts/test-engine.sh -v
+
       - name: Build app (x86_64)
-        if: github.event_name != 'pull_request' || steps.scope.outputs.build == 'true'
+        if: steps.scope.outputs.app == 'true'
         run: TOSH_ARCH=x86_64 ./make-app.sh
 
       # Developer ID signing + notarization, skipped when the secrets are absent.
@@ -148,6 +180,8 @@ jobs:
           fi
           echo "$CERT_P12" | base64 -d > /tmp/cert.p12
           security create-keychain -p ci tosh.keychain
+          # a new keychain locks itself after 5 minutes, and codesign then waits for a password nobody can type
+          security set-keychain-settings -lut 21600 tosh.keychain
           security default-keychain -s tosh.keychain
           security list-keychains -d user -s tosh.keychain login.keychain-db
           security unlock-keychain -p ci tosh.keychain
@@ -170,8 +204,11 @@ jobs:
             case "$exe" in *.metallib) continue;; esac
             codesign --force --timestamp --options runtime -s "$IDENTITY" "$exe"
           done
-          codesign --force --timestamp --options runtime -s "$IDENTITY" "$APP"
+          # under the hardened runtime macOS never asks for the microphone without this entitlement
+          codesign --force --timestamp --options runtime --entitlements ToshLLM.entitlements -s "$IDENTITY" "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements - "$APP" 2>/dev/null | grep -q 'com.apple.security.device.audio-input' ||
+            { echo "::error::the signed app lost its microphone entitlement"; exit 1; }
 
           # Name it per variant: the notary history lists submissions by filename.
           ZIP=/tmp/ToshLLM-${{ matrix.variant }}.zip
@@ -212,12 +249,34 @@ jobs:
             spctl -a -vvv -t open --context context:primary-signature "$dmg"
           done
 
+      # The app needs macOS 14; on macOS 12 the engine runs alone. Only this zip is built for
+      # macOS 12 and Metal 2.4, in its own directory: the DMGs above are unchanged.
+      - name: Package macOS 12 engine
+        if: matrix.variant == 'noavx2' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        env:
+          SIGN_IDENTITY: ${{ steps.sign.outputs.identity }}
+          NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          [[ "$VERSION" == v* ]] || VERSION="dev-${GITHUB_SHA::7}"
+          [ -z "$SIGN_IDENTITY" ] || security unlock-keychain -p ci tosh.keychain
+          ./scripts/make-engine-zip.sh "$VERSION"
+          if [ -n "$SIGN_IDENTITY" ]; then
+            xcrun notarytool submit dist/toshllm-engine-*-macos12-x86_64.zip \
+              --apple-id "$NOTARY_APPLE_ID" --team-id "$NOTARY_TEAM_ID" \
+              --password "$NOTARY_PASSWORD" --wait
+          fi
+
       - name: Upload artifact
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
           name: dmg-${{ matrix.variant }}
-          path: dist/*.dmg
+          path: |
+            dist/*.dmg
+            dist/toshllm-engine-*.zip
 
   # Collect both variants' DMGs and publish one release with both assets, so the
   # updater can pick the matching one per install (AppInfo.isNoAVX2).
@@ -238,7 +297,7 @@ jobs:
           merge-multiple: true
 
       - name: Checksums
-        run: (cd dist && shasum -a 256 *.dmg > checksums.txt && cat checksums.txt)
+        run: (cd dist && shasum -a 256 *.dmg *.zip > checksums.txt && cat checksums.txt)
 
       # Pull the section for this tag's version out of CHANGELOG.md so the
       # release body shows the human-written notes; generate_release_notes then
@@ -262,6 +321,7 @@ jobs:
         with:
           files: |
             dist/*.dmg
+            dist/toshllm-engine-*.zip
             dist/checksums.txt
           body_path: release-notes.md
           generate_release_notes: true

@@ -30,6 +30,8 @@ struct MCPServer: Identifiable, Codable, Equatable {
     var arguments: [String] = []
     var environment: [String: String] = [:]
     var workingDirectory = ""
+    /// Approved by the administrator: the engine starts this server and its agent may call the tools.
+    var engineAccess: Bool?
 
     var credentialAccount: String { "mcp-headers-\(id.uuidString)" }
 
@@ -42,6 +44,25 @@ struct MCPServer: Identifiable, Codable, Equatable {
 
     var isConfigured: Bool {
         transport.isLocal ? !command.trimmingCharacters(in: .whitespaces).isEmpty : !url.isEmpty
+    }
+
+    /// The engine launches local servers itself and reaches http(s) ones through the bundled relay,
+    /// which speaks Streamable HTTP and HTTP+SSE but not WebSocket.
+    var engineReachable: Bool {
+        if transport.isLocal { return true }
+        guard transport != .webSocket, let scheme = URL(string: url)?.scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
+    }
+
+    var sharedWithEngine: Bool { engineAccess == true && enabled && engineReachable && isConfigured }
+
+    /// The engine names its tools `<server>_<tool>`, and a tool name may only hold these characters.
+    var engineName: String {
+        let mapped = String(name.lowercased().unicodeScalars.map {
+            ($0.isASCII && CharacterSet.alphanumerics.contains($0)) ? Character($0) : "-"
+        })
+        let trimmed = mapped.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return trimmed.isEmpty ? "mcp" : trimmed
     }
 }
 

@@ -36,7 +36,7 @@ final class UpdateChecker: ObservableObject {
     /// Re-checks every hour while the app stays open, for people who never
     /// relaunch. Silent: it only lights up the existing update badge.
     func startPeriodicChecks(interval: TimeInterval = 3600) {
-        guard periodicTask == nil else { return }
+        guard AppInfo.updatesEnabled, periodicTask == nil else { return }
         periodicTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
@@ -49,7 +49,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     func check() async {
-        guard !checking else { return }
+        guard AppInfo.updatesEnabled, !checking else { return }
         checking = true
         defer { checking = false }
 

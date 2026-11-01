@@ -1,12 +1,18 @@
 #!/bin/zsh
-# Rebrands the prebuilt llama.cpp web UI (MIT) into Assets/web-ui, served with --path.
+# Builds the llama.cpp web UI (MIT) from vendor, with ToshLLM's patches (patches/llama/ui),
+# and rebrands it into Assets/web-ui, served with --path. A built dist can be given instead.
 # Only user-visible strings change; wire identifiers and storage keys are left alone.
 # A substitution that stops matching is a hard error, not a silent pass-through.
 set -e
 
 ROOT="${0:a:h:h}"
-SRC="${1:-$ROOT/vendor/llama.cpp/build-static/tools/ui/dist}"
 OUT="$ROOT/Assets/web-ui"
+if [ -n "$1" ]; then
+    SRC="$1"
+else
+    SRC="$(mktemp -d)/dist"
+    (cd "$ROOT/vendor/llama.cpp/tools/ui" && npm ci --no-audit --no-fund && LLAMA_UI_OUT_DIR="$SRC" npm run build)
+fi
 
 [ -f "$SRC/index.html" ] || { echo "no web UI assets at $SRC (build the engine first)"; exit 1; }
 

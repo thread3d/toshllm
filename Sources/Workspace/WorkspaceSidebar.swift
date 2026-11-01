@@ -15,7 +15,7 @@ struct WorkspaceSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
                 ToshLLMLogo(size: 38)
-                Text("ToshLLM").font(.system(size: 21, weight: .semibold))
+                Text(AppInfo.name).font(.system(size: 21, weight: .semibold))
             }
             .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 26)
             ScrollView {
@@ -54,7 +54,7 @@ struct WorkspaceSidebar: View {
                 .font(.system(size: 14))
                 .padding(.horizontal, 16)
             }
-            Text("ToshLLM · macOS")
+            Text("\(AppInfo.name) · macOS")
                 .font(.system(size: 10, weight: .medium)).tracking(1.6)
                 .foregroundStyle(.tertiary).padding(26)
         }

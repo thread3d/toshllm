@@ -1,0 +1,460 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 0993fb253..76b97763f 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -82,16 +82,19 @@ extern "C" {
+ 
+     GGML_API ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend);
+     GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
+     GGML_API size_t                     ggml_backend_get_alignment(ggml_backend_t backend);
+     GGML_API size_t                     ggml_backend_get_max_size(ggml_backend_t backend);
+ 
+     GGML_API void ggml_backend_tensor_set_async   (ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+     GGML_API void ggml_backend_tensor_get_async   (ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
++    // group the device-to-host reads between begin and end into as few waits as the backend allows
++    GGML_API void ggml_backend_read_batch_begin(ggml_backend_t backend);
++    GGML_API void ggml_backend_read_batch_end  (ggml_backend_t backend);
+     GGML_API void ggml_backend_tensor_set_2d_async(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+     GGML_API void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+ 
+     // "offset" refers to the offset in tensor->data for setting/getting data
+     GGML_API void ggml_backend_tensor_set   (      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+     GGML_API void ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
+     GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index db8f7b43b..34691d875 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -428,16 +428,28 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor *
+     if (backend->iface.set_tensor_async == NULL) {
+         ggml_backend_synchronize(backend);
+         ggml_backend_tensor_set(tensor, data, offset, size);
+     } else {
+         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
+     }
+ }
+ 
++void ggml_backend_read_batch_begin(ggml_backend_t backend) {
++    if (backend && backend->iface.read_batch_begin) {
++        backend->iface.read_batch_begin(backend);
++    }
++}
++
++void ggml_backend_read_batch_end(ggml_backend_t backend) {
++    if (backend && backend->iface.read_batch_end) {
++        backend->iface.read_batch_end(backend);
++    }
++}
++
+ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     GGML_ASSERT(backend);
+     GGML_ASSERT(tensor);
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
+ 
+     if (backend->iface.get_tensor_async == NULL) {
+         ggml_backend_synchronize(backend);
+@@ -1920,16 +1932,37 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
+                 GGML_LOG_INFO("%s: expert prefetch active: %d slots of %.2f MiB\n",
+                         __func__, sched->prefetch_n_slots, size / 1024.0 / 1024.0);
+             }
+             sched->prefetch_slots[i] = new_buf;
+             sched->prefetch_used[i] = false;
+         }
+     }
+     return true;
++}
++
++// whether a node that will be computed reads the tensor, directly or through a view
++static bool ggml_backend_sched_input_is_read(const ggml_cgraph * graph, const ggml_tensor * t) {
++    for (int i = 0; i < graph->n_nodes; i++) {
++        const ggml_tensor * node = graph->nodes[i];
++        if (!(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
++            continue;
++        }
++        if (node->view_src == t) {
++            return true;
++        }
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            if (node->src[j] == t) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     ggml_tensor * prev_ids_tensor = nullptr;
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
+     std::vector<int32_t> chunk_ids;
+@@ -1975,32 +2008,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             for (int i = 0; i < split->n_inputs; i++) {
+                 ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+                 if (b != split_backend && b->iface.read_batch_begin) {
+                     read_batch_backend = b;
+                     b->iface.read_batch_begin(b);
+                     break;
+                 }
+             }
++        }
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+             }
+         }
+ 
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++            // a tensor that only feeds a branch ggml_build_forward_select left out is never read
++            // here; on a discrete GPU each of these copies is a synchronous upload
++            if (!ggml_backend_sched_input_is_read(&split->graph, input_cpy)) {
++                continue;
++            }
++
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
+                     ggml_backend_synchronize(split_backend);
+                 }
+                 ggml_backend_tensor_copy(input, input_cpy);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 3fe87e824..6c6835640 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -3855,30 +3855,47 @@ void ggml_metal_device_read_batch_begin(ggml_metal_device_t dev) {
+     }
+     [dev->stage_lock lock];   // held until read_batch_end
+ 
+ void ggml_metal_device_read_batch_end(ggml_metal_device_t dev) {
+     if (dev->props.use_shared_buffers) {
+         return;
+     [dev->stage_lock unlock];
+ }
++
++static void ggml_metal_device_stage_batch_flush(ggml_metal_device_t dev);
++
++// a read batch drains every few MiB: larger batches wait less on a desktop host but copy out
++// of the staging buffer slower on a Xeon W one, and 4 MiB was the size that won on both
++static size_t ggml_metal_stage_batch_cap(void) {
++    return (size_t) 4*1024*1024;
++}
++
+ bool ggml_metal_device_stage_get(ggml_metal_device_t dev, struct ggml_metal_buffer_id bid_src, void * data, size_t size) {
+     if (size == 0) {
+         return true;
+     }
+     if (size > GGML_METAL_STAGE_BUF_MAX || bid_src.metal == nil) {
+         return false;
+     }
+ 
+     const uint64_t t0 = tosh_prof_on() ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+ 
+     [dev->stage_lock lock];
+ 
+     // inside an open read batch: queue the blit, defer the wait to batch end
++        if (ggml_metal_device_stage_buf(dev) == nil) {
+             [dev->stage_lock unlock];
++            return false;   // no buffer: caller falls back to the direct path
++        }
++        // a full batch drains and reopens, so a long run of reads still pays one wait per
++        // staging buffer instead of one per read
++        if (dev->stage_batch_n == 16 || dev->stage_batch_used + size > ggml_metal_stage_batch_cap()) {
++            ggml_metal_device_stage_batch_flush(dev);
++            // the caller sits in an autorelease pool that drains before the batch ends
+         [dev->stage_batch_enc copyFromBuffer:bid_src.metal
+                                 sourceOffset:bid_src.offs
+                                     toBuffer:dev->stage_buf
+                            destinationOffset:dev->stage_batch_used
+                                         size:size];
+         dev->stage_batch_items[dev->stage_batch_n++] =
+             (typeof(dev->stage_batch_items[0])) { data, dev->stage_batch_used, size };
+         dev->stage_batch_used += size;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index fe8f0a562..0fe22f2f4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2906,23 +2906,34 @@ private:
+     const bool skip_tensors;
+ 
+     size_t size_written = 0;
+ };
+ 
+ class llama_io_write_host : public llama_io_write_i {
+ public:
+     llama_io_write_host(
+-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
++            uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> * backends = nullptr) : ptr(p), buf_size(len), backends(backends) {}
+ 
+     ~llama_io_write_host() {
+-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
++        // on a discrete GPU each read is a round trip over the bus; batching them leaves one
++        // wait per staging buffer instead of one per tensor
++        if (backends) {
++            for (const auto & b : *backends) {
++                ggml_backend_read_batch_begin(b.get());
++            }
++        }
+         for (const auto & winfo : winfos) {
+             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+         }
++        if (backends) {
++            for (const auto & b : *backends) {
++                ggml_backend_read_batch_end(b.get());
++            }
++        }
+     }
+ 
+     void write(const void * src, size_t size) override {
+         if (size > buf_size) {
+             throw std::runtime_error("unexpectedly reached end of buffer");
+         }
+         memcpy(ptr, src, size);
+         ptr += size;
+@@ -2954,16 +2965,17 @@ private:
+ 
+     struct write_info {
+         ggml_tensor * tensor;
+         uint8_t * ptr;
+         size_t size;
+         size_t offset;
+     };
+     std::vector<write_info> winfos;
++    const std::vector<ggml_backend_ptr> * backends;
+ };
+ 
+ class llama_io_read_host : public llama_io_read_i {
+ public:
+     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+ 
+     ~llama_io_read_host() {
+         // flush the reads
+@@ -3380,17 +3392,17 @@ size_t llama_context::state_get_size() {
+         return state_write_data(io);
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
+         return 0;
+     }
+ }
+ 
+ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
+-    llama_io_write_host io(dst, size);
++    llama_io_write_host io(dst, size, &backends);
+     try {
+         return state_write_data(io);
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+         return 0;
+     }
+ }
+ 
+@@ -3420,17 +3432,17 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+     }
+ }
+ 
+ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+     std::unique_ptr<llama_io_write_i> io;
+     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+     } else {
+-        io = std::make_unique<llama_io_write_host>(dst, size);
++        io = std::make_unique<llama_io_write_host>(dst, size, &backends);
+     }
+ 
+     try {
+         io->write(&io_magic, sizeof(io_magic));
+         io->write(&seq_id, sizeof(seq_id));
+ 
+         return state_seq_write_data(*io, seq_id, flags);
+     } catch (const std::exception & err) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b60ff6660..ffad54935 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3906,23 +3906,27 @@ llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
+ ggml_tensor * llm_graph_context::build_rs(
+         llm_graph_input_rs * inp,
+         ggml_tensor * s,
+             int32_t   state_size,
+             int32_t   n_seqs,
+         const llm_graph_get_rows_fn & get_state_rows) const {
+     const auto * kv_state = inp->mctx;
+ 
++    // the ubatch states keep their own gather: the Metal gated_delta_net reads a single sequence's
++    // state from the cache only when it is fed by that gather, not by a view of a shared one
++    const llm_graph_get_rows_fn getter = get_state_rows ? get_state_rows : llm_graph_get_rows_fn(ggml_get_rows);
++
+     // a custom getter reads the states of the ubatch straight from the cache, so the gather skips the first
+     // state: it still holds the n_rs - n_seqs extra states and copies no state of a single sequence ubatch
+-    ggml_tensor * state_copy = get_state_rows ? inp->s_copy_tail : inp->s_copy;
++    ggml_tensor * state_copy = inp->s_copy_tail;
+ 
+     return build_rs(s, state_copy, inp->s_copy_main, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+-                    get_state_rows);
++                    getter);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+     llm_graph_input_rs * inp,
+     const llama_ubatch & ubatch,
+                    int   il) const {
+     const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 045489df7..8de54df64 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -673,23 +673,57 @@ struct llama_mmap::impl {
+ #endif
+ 
+     void * addr;
+     size_t size;
+ };
+ 
+ llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
+         const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+-llama_mmap::~llama_mmap() = default;
++
++llama_mmap::~llama_mmap() {
++    // unpin before the pages are unmapped by the impl destructor
++    if (host_reg_addr && host_unreg_fn) {
++        host_unreg_fn(host_reg_addr);
++    }
++}
+ 
+ size_t llama_mmap::size() const { return pimpl->size; }
+ void * llama_mmap::addr() const { return pimpl->addr; }
+ 
+ void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+ 
++size_t llama_mmap::register_host(size_t first, size_t last, bool (*reg_fn)(void *, size_t), void (*unreg_fn)(void *)) {
++#ifdef _POSIX_MAPPED_FILES
++    if (host_reg_addr || !reg_fn || !unreg_fn || last <= first) {
++        return 0;
++    }
++
++    // expand outward to the page boundaries retained by unmap_fragment
++    const size_t page_size = sysconf(_SC_PAGESIZE);
++    first = first & ~(page_size - 1);
++    last  = (last + page_size - 1) & ~(page_size - 1);
++
++    void * reg_addr = (uint8_t *) pimpl->addr + first;
++    if (!reg_fn(reg_addr, last - first)) {
++        return 0;
++    }
++
++    host_reg_addr  = reg_addr;
++    host_unreg_fn  = unreg_fn;
++    return last - first;
++#else
++    GGML_UNUSED(first);
++    GGML_UNUSED(last);
++    GGML_UNUSED(reg_fn);
++    GGML_UNUSED(unreg_fn);
++    return 0;
++#endif
++}
++
+ #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+ const bool llama_mmap::SUPPORTED  = true;
+ #else
+ const bool llama_mmap::SUPPORTED  = false;
+ #endif
+ 
+ // llama_mlock
+ 
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index 6c6393d57..d28af9a6d 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -53,21 +53,29 @@ struct llama_mmap {
+                const ranges & lazy_ranges = {});
+     ~llama_mmap();
+ 
+     size_t size() const;
+     void * addr() const;
+ 
+     void unmap_fragment(size_t first, size_t last);
+ 
++    // pin the pages backing [first, last) with a backend allocator for faster H2D copies,
++    // unpinned in the destructor before the pages are unmapped
++    // returns the number of bytes registered, 0 on failure
++    size_t register_host(size_t first, size_t last, bool (*reg_fn)(void *, size_t), void (*unreg_fn)(void *));
++
+     static const bool SUPPORTED;
+ 
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
++
++    void * host_reg_addr = nullptr;
++    void (*host_unreg_fn)(void *) = nullptr;
+ };
+ 
+ struct llama_mlock {
+     llama_mlock();
+     ~llama_mlock();
+ 
+     void init(void * ptr);
+     void grow_to(size_t target_size);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index c5280d77d..db94f09b8 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1919,23 +1919,39 @@ bool llama_model_loader::load_all_data(
+     if (validation_failed) {
+         throw std::runtime_error("found tensors with invalid data");
+     }
+ 
+     // check if this is the last call and do final cleanup
+     if (size_done >= size_data) {
+         // unmap offloaded tensors and metadata
+         if (use_mmap) {
++            // pin the pages backing the weights kept in system memory for faster H2D copies
++            bool (*reg_fn)(void *, size_t) = nullptr;
++            void (*unreg_fn)(void *) = nullptr;
++            for (size_t i = 0; i < ggml_backend_dev_count() && !reg_fn; i++) {
++                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
++                reg_fn   = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
++                unreg_fn = (void (*)(void *))         ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
++            }
++
+             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
+                 const auto & mmap_used = mmaps_used.at(idx);
+                 auto & mapping = mappings.at(idx);
+                 mapping->unmap_fragment(0, mmap_used.first);
+                 if (mmap_used.second != 0) {
+                     mapping->unmap_fragment(mmap_used.second, mapping->size());
+                 }
++                if (mmap_used.second > mmap_used.first) {
++                    size_t n_registered = mapping->register_host(mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
++                    if (n_registered > 0) {
++                        LLAMA_LOG_INFO("%s: pinned %.2f MiB of mapped model memory for faster H2D transfers\n",
++                                __func__, n_registered / 1024.0 / 1024.0);
++                    }
++                }
+             }
+         }
+         if (progress_callback) {
+             // Even though the model is done loading, we still honor
+             // cancellation since we need to free allocations.
+             return progress_callback(1.0f, progress_callback_user_data);
+         }
+     }

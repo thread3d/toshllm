@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "id": "clock",
+  "version": "1.0.0",
+  "name": {"es": "Reloj", "en": "Clock"},
+  "description": {
+    "es": "Ejemplo mínimo: la hora actual en cualquier zona horaria.",
+    "en": "Minimal example: the current time in any time zone."
+  },
+  "author": "ToshLLM",
+  "servers": {
+    "clock": {
+      "command": "{python}",
+      "args": ["-I", "-B", "{extension}/server.py"],
+      "timeout_ms": 10000
+    }
+  },
+  "settings": [
+    {
+      "id": "clock",
+      "title": {"es": "Reloj", "en": "Clock"},
+      "fields": [
+        {
+          "key": "TOSH_CLOCK_DEFAULT_ZONE",
+          "kind": "text",
+          "placeholder": "Europe/Madrid",
+          "title": {"es": "Zona por defecto", "en": "Default zone"},
+          "help": {
+            "es": "Zona IANA que se usa cuando la pregunta no nombra ninguna.",
+            "en": "IANA zone used when the question names none."
+          }
+        }
+      ]
+    }
+  ]
+}

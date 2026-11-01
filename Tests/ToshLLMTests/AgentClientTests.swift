@@ -49,6 +49,49 @@ final class AgentClientTests: XCTestCase {
         XCTAssertEqual(rows.count, 2, "the user message, then one block with both rounds")
     }
 
+    func testAnExtensionAgentHandsBackOnlyWhenTheChatHasToolsOfItsOwn() throws {
+        let defaults = UserDefaults.standard
+        let keys = ["toolPermission.always.builtin.sympy_solve", SettingsKeys.mathToolsAllowed]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, saved) { defaults.set(value, forKey: key) } }
+        keys.forEach(defaults.removeObject(forKey:))
+
+        let math = try BuiltinToolInfo(displayName: "Solve", name: "sympy_solve", writesData: false, definition: [:])
+        let file = try BuiltinToolInfo(displayName: "Read", name: "read_file", writesData: false, definition: [:])
+        let foreign = try BuiltinToolInfo(displayName: "Solve", name: "sympy_solve", definition: [:],
+                                          mcpServerID: UUID(), remoteName: "solve")
+        XCTAssertFalse(ChatStore.hasOwnTools([]))
+        XCTAssertFalse(ChatStore.hasOwnTools([math]), "the agent covers the bundled math tools")
+        XCTAssertTrue(ChatStore.hasOwnTools([math, file]))
+        XCTAssertTrue(ChatStore.hasOwnTools([foreign]), "a user's MCP server is not the helper")
+
+        XCTAssertTrue(ChatStore.agentDeclined(["version": 1, "outcome": "declined", "passes": 0]))
+        XCTAssertFalse(ChatStore.agentDeclined(["version": 1, "outcome": "answered"]))
+        XCTAssertFalse(ChatStore.agentDeclined(["version": 2, "outcome": "declined"]))
+        XCTAssertFalse(ChatStore.agentDeclined(nil))
+    }
+
+    func testAnyOtherToolShowsItsOperationAndLaidOutJSON() {
+        let call = ChatToolCall(name: "gis_query", arguments: #"{"operation":"count","target":"https:\/\/x\/MapServer"}"#,
+                                result: #"{"success": true, "data": {"count": 7}}"#, state: .completed)
+        let shown = ToolCallPresentation.make(call)
+        XCTAssertEqual(shown.title, "gis_query (count)")
+        XCTAssertEqual(shown.code?.contains("\"https://x/MapServer\""), true)
+        XCTAssertEqual(shown.result?.components(separatedBy: "\n").count, 6)
+        XCTAssertNil(ToolCallPresentation.indented("plain text"))
+        XCTAssertNil(ToolCallPresentation.indented("[" + String(repeating: "1,", count: 9000) + "1]"))
+    }
+
+    func testACallReportedOnlyByItsStatusShowsAsItWent() throws {
+        let (store, id) = store()
+        for (callID, status) in [("a", "ok"), ("b", "not_found")] {
+            store.agentEvent(["type": "tool_call", "pass": 1,
+                              "call": ["id": callID, "tool": "gis_query", "status": status, "result": "{}"]], conversation: id)
+        }
+        let messages = try XCTUnwrap(store.current?.messages)
+        XCTAssertEqual(messages[1].toolCalls?.map(\.state), [.completed, .failed])
+    }
+
     /// The ten math tools run without asking by default, so math turns go to the engine's agent; nothing
     /// else changes, and the user can turn it off.
     func testOnlyTheBundledMathToolsAreAllowedByDefault() {
@@ -85,5 +128,21 @@ final class AgentClientTests: XCTestCase {
         XCTAssertEqual(history.map { $0["role"] as? String }, ["system", "user", "assistant", "user"])
         XCTAssertEqual(history[2]["content"] as? String, "It is 6.49393940227.")
         XCTAssertFalse(history.contains { $0["tool_calls"] != nil })
+    }
+
+    func testOnlyTheLastRequestTakesItsImagesToTheAgent() {
+        var earlier = ChatMessage(role: "user", content: "What is this?")
+        earlier.imageURIs = ["data:image/png;base64,AAAA"]
+        var last = ChatMessage(role: "user", content: "")
+        last.imageURIs = ["data:image/jpeg;base64,BBBB"]
+        let messages = [earlier, ChatMessage(role: "assistant", content: "A cat."), last]
+        let history = ChatStore.agentHistory(system: "", summary: nil, messages: messages, from: 0)
+        XCTAssertEqual(history[0]["content"] as? String, "What is this?")
+        let parts = history[2]["content"] as? [[String: Any]]
+        XCTAssertEqual(parts?.count, 1)
+        XCTAssertEqual((parts?.first?["image_url"] as? [String: Any])?["url"] as? String, "data:image/jpeg;base64,BBBB")
+        let blind = ChatStore.agentHistory(system: "", summary: nil, messages: messages, from: 0,
+                                           modalities: ModelModalities(vision: false, audio: false, video: false))
+        XCTAssertEqual(blind[2]["content"] as? String, "")
     }
 }

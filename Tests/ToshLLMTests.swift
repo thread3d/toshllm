@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Engelbert Delgado <engeldlgado@gmail.com>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import AppKit
+import CoreText
+import PDFKit
 import XCTest
 @testable import ToshLLM
 
@@ -453,6 +456,43 @@ final class EstimatorTests: XCTestCase {
         XCTAssertEqual(Estimator.estimate(spec: spec, hw: smallRAM).level, .no)
     }
 
+    func testTableReadOnDemandIsNotCountedAsRAM() {
+        // Qwen3.8-Flash-Next Q2_0: 61.9 GiB on disk, 26.8 of them a table the engine reads from disk
+        var spec = ModelSpec(fileGB: 61.85, paramsB: 66, layers: 48, isMoE: true, activeParamsB: 6)
+        spec.lazyGB = 26.82
+        spec.expertGB = 31.64
+        func hw(_ ram: Double) -> HardwareInfo {
+            HardwareInfo(cpuBrand: "Test", physicalCores: 6, logicalCores: 12, ramGB: ram, arch: "x86_64",
+                         model: "", osVersion: "", gpus: [GPUDevice(index: 0, name: "Test GPU", vramMB: 12868)])
+        }
+        XCTAssertEqual(Estimator.estimate(spec: spec, hw: hw(32), ctx: 8192).level, .no)
+        XCTAssertNotEqual(Estimator.estimate(spec: spec, hw: hw(48), ctx: 8192).level, .no)
+        XCTAssertNotEqual(Estimator.estimate(spec: spec, hw: hw(64), ctx: 8192).level, .no)
+        spec.lazyGB = 0
+        spec.expertGB = 0
+        XCTAssertEqual(Estimator.estimate(spec: spec, hw: hw(64), ctx: 8192).level, .no,
+                       "counted as weights, the table keeps the model off a 64 GB Mac")
+    }
+
+    func testWeightSplitReadsSizesFromOffsets() {
+        var d = Data("GGUF".utf8)
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u64(_ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func str(_ s: String) { u64(UInt64(s.utf8.count)); d.append(contentsOf: s.utf8) }
+        u32(3); u64(3); u64(1)
+        str("general.alignment"); u32(4); u32(64)
+        let tensors: [(String, UInt64)] = [("blk.0.ffn_up_exps.weight", 0),
+                                           ("per_layer_token_embd.weight", 1 << 20),
+                                           ("blk.0.attn_q.weight", (1 << 20) + (5 << 30))]
+        for (name, offset) in tensors { str(name); u32(2); u64(16); u64(16); u32(8); u64(offset) }
+        let start = (UInt64(d.count) + 63) / 64 * 64
+        let split = GGUFMetadataCache.weightSplit(from: d, fileSize: start + (1 << 20) + (5 << 30) + 4096)
+        XCTAssertEqual(split?.expertBytes, 1 << 20)
+        XCTAssertEqual(split?.lazyBytes, 5 << 30)
+        XCTAssertNil(GGUFMetadataCache.weightSplit(from: d.prefix(40), fileSize: 1 << 40),
+                     "a header cut short is no answer, not an empty model")
+    }
+
     func testMoEFitsFullyAcrossMultiGPU() {
         // Two 16 GB cards (Lance's rig): the 35B MoE needs expert offload on one
         // card, but fits entirely in combined VRAM with the split enabled.
@@ -698,6 +738,36 @@ final class ImageGenTests: XCTestCase {
         XCTAssertEqual(ImageInstanceConfig().fastModeValue, .off)
     }
 
+    func testQwenImage21TurboRunsItsOwnSchedule() {
+        let base = ImageGenCatalog.qwenImage21Q4
+        let turbo = ImageGenCatalog.qwenImage21TurboQ4
+        XCTAssertEqual(turbo.sigmas.first, 1.0)
+        XCTAssertEqual(turbo.sigmas.last, 0.0)
+        XCTAssertEqual(turbo.defaultSteps, 8)
+        // the schedule fixes the count whatever the instance asks for
+        XCTAssertEqual(turbo.steps(25), 8)
+        XCTAssertEqual(turbo.steps(4), 8)
+        XCTAssertEqual(base.steps(25), 25)
+        XCTAssertTrue(base.sigmas.isEmpty)
+        XCTAssertEqual(turbo.cfgScale, 1.0)
+        XCTAssertFalse(turbo.extraArgs.contains("--scheduler"))
+        XCTAssertTrue(base.extraArgs.contains("--scheduler"))
+        XCTAssertEqual(ImageFastMode.easycache.args(for: turbo), [])
+        XCTAssertEqual(ImageFastMode.spectrum.args(for: turbo), [])
+        // the download stays on the commit that was measured, and the AtomicChat build 0.87.21 offered still counts
+        XCTAssertEqual(turbo.components.first?.urlString,
+                       "https://huggingface.co/unsloth/Qwen-Image-2.1-Turbo-GGUF/resolve/5d1f9f759ea877ae556cda88dbec958b62ad3809/qwen-image-2.1-turbo-Q4_K_M.gguf")
+        XCTAssertEqual(turbo.components.first?.formerFileNames, ["Qwen-Image-2.1-Turbo-AD-Q4_K.gguf"])
+        XCTAssertTrue(base.components.first!.urlString.contains("/resolve/main/"))
+        for m in [ImageGenCatalog.qwenImage21TurboQ3, ImageGenCatalog.qwenImage21TurboQ6, ImageGenCatalog.qwenImage21TurboQ8] {
+            XCTAssertEqual(m.steps(25), 8)
+            XCTAssertTrue(ImageGenCatalog.models.contains { $0.id == m.id })
+        }
+        // same VAE and encoder files as the base, so an installed base only adds the denoiser
+        XCTAssertEqual(Array(turbo.components.dropFirst().map(\.fileName)),
+                       Array(base.components.dropFirst().map(\.fileName)))
+    }
+
     func testReferenceImagesShareAPixelBudget() {
         XCTAssertNil(ImageGenLimits.referencePixels(count: 0, resolution: 1024))
         // one or two references keep full size, as the model was tuned
@@ -719,7 +789,22 @@ final class ImageGenTests: XCTestCase {
         XCTAssertFalse(ImageGenCatalog.zImageTurbo.halfPartials)
         XCTAssertEqual(q.maxLongEdge(drivesDisplay: false), 2048)
         XCTAssertEqual(q.maxLongEdge(drivesDisplay: true), 1920)
+        // the size picker offers that ceiling itself, not the step below it
+        XCTAssertEqual(ImageGenLimits.baseSizes(vramGB: 12, residentGB: ImageGenCatalog.qwenImage21TurboQ4.residentGB,
+                                                maxLongEdge: q.maxLongEdge(drivesDisplay: true)).max(), 1920)
         XCTAssertEqual(ImageGenCatalog.sd15.maxLongEdge(drivesDisplay: true), ImageGenCatalog.sd15.maxLongEdge)
+    }
+
+    func testVRAMClassWarnsButTheFrameEstimateDecides() {
+        // Qwen-Image 2.1 Q4 is sized for 12 GB, yet a 1024x1024 frame fits an 8 GB card
+        let q = ImageGenCatalog.qwenImage21Q4
+        XCTAssertFalse(q.fitsVRAMClass(8))
+        XCTAssertTrue(ImageGenLimits.fits(width: 1024, height: 1024, vramGB: 8, residentGB: q.residentGB))
+        XCTAssertFalse(ImageGenLimits.fits(width: 1024, height: 1024, vramGB: 4, residentGB: q.residentGB))
+        // an aux GPU still has to hold the encoder and VAE moved to it
+        XCTAssertTrue(q.auxHolds(nil))
+        XCTAssertTrue(q.auxHolds(q.totalGB - q.residentGB))
+        XCTAssertFalse(q.auxHolds(2))
     }
 
     func testRecommendationScalesWithVRAM() {
@@ -860,10 +945,12 @@ final class ImageGenTests: XCTestCase {
     }
 
     func testCommandBufferSplitClearsWatchdog() {
-        // 1024x1024 runs as one buffer; larger frames split, capped at 4.
-        XCTAssertEqual(ImageGenLimits.nCB(width: 1024, height: 1024), 1)
-        XCTAssertGreaterThan(ImageGenLimits.nCB(width: 1600, height: 900), 1)
-        XCTAssertLessThanOrEqual(ImageGenLimits.nCB(width: 1600, height: 1600), 4)
+        // small frames stay in one buffer
+        XCTAssertEqual(ImageGenLimits.nCB(width: 512, height: 512), 1)
+        // a 1024 frame already splits, and the largest use the engine's maximum
+        XCTAssertGreaterThan(ImageGenLimits.nCB(width: 1024, height: 1024), 1)
+        XCTAssertEqual(ImageGenLimits.nCB(width: 1920, height: 1920), 8)
+        XCTAssertEqual(ImageGenLimits.nCB(width: 2048, height: 2048), 8)
     }
 
     func testQueueTargetingRunsOnlyOnItsOwnInstance() {
@@ -945,6 +1032,18 @@ final class ServerSettingsTests: XCTestCase {
         try data.write(to: url)
     }
 
+    func testSlotsShareOneContextUnlessSeparated() {
+        var s = makeSettings()
+        s.parallelSlots = 4
+        XCTAssertEqual(s.arguments[s.arguments.firstIndex(of: "--parallel")! + 1], "4")
+        XCTAssertTrue(s.arguments.contains("--kv-unified"), "one pool keeps the chat's full window")
+        s.separateKV = true
+        XCTAssertFalse(s.arguments.contains("--kv-unified"))
+        s.parallelSlots = 1
+        s.separateKV = false
+        XCTAssertFalse(s.arguments.contains("--kv-unified"), "one slot has nothing to share")
+    }
+
     func testBaseArguments() {
         let args = makeSettings().arguments
         XCTAssertEqual(args[args.firstIndex(of: "--load-mode")! + 1], "none")
@@ -959,6 +1058,8 @@ final class ServerSettingsTests: XCTestCase {
         // One slot by default: retries resume aborted prefills (VS Code).
         XCTAssertEqual(args[args.firstIndex(of: "--parallel")! + 1], "1")
         XCTAssertEqual(args[args.firstIndex(of: "--cache-reuse")! + 1], "256")
+        XCTAssertTrue(args.contains("--no-reasoning-preserve"),
+                      "an empty reasoning block in every past turn makes the model stop mid-answer")
     }
 
     func testAutoMemoryPlanOwnsOffloadBatchAndCacheOnMoEModels() throws {
@@ -1225,6 +1326,34 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertNil(ServerSettings.mmprojPath(forModel: model.path))
     }
 
+    func testAProjectorOfAnotherFamilyIsOfferedWhenItMatchesTheDimension() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("toshllm-share-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func gguf(_ name: String, _ key: String, _ value: UInt32) -> String {
+            var data = Data("GGUF".utf8)
+            func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+            func u64(_ v: UInt64) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+            u32(3); u64(0); u64(1)
+            u64(UInt64(key.utf8.count)); data.append(contentsOf: key.utf8); u32(4); u32(value)
+            let url = dir.appendingPathComponent(name)
+            FileManager.default.createFile(atPath: url.path, contents: data)
+            return url.path
+        }
+        let model = gguf("Qwen3.8-9B-Q4_K_M.gguf", "qwen35.embedding_length", 4096)
+        let shared = gguf("Qwen3.5-9B-Q4_K_M.mmproj.gguf", "clip.vision.projection_dim", 4096)
+        _ = gguf("gemma-4-12b-it-Q4_K_M.mmproj.gguf", "clip.vision.projection_dim", 3840)
+
+        func resolved(_ p: [String]) -> [String] { p.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path } }
+        XCTAssertNil(ServerSettings.mmprojPath(forModel: model), "another family is never paired on its own")
+        XCTAssertEqual(resolved(ServerSettings.compatibleProjectors(forModel: model)), resolved([shared]))
+        XCTAssertTrue(ServerSettings.mightSupportVision(modelPath: model), "the control shows so the user can pick it")
+        XCTAssertFalse(ServerSettings.hasOwnProjector(forModel: model), "a shared projector is not the model's own")
+        _ = gguf("Qwen3.8-9B-Q4_K_M.mmproj.gguf", "clip.vision.projection_dim", 4096)
+        XCTAssertTrue(ServerSettings.hasOwnProjector(forModel: model))
+    }
+
     func testRenamedProjectorsPairUnambiguouslyInSharedFolder() throws {
         // Repos ship projectors under generic, identical names (mmproj-F16.gguf),
         // so the downloader saves them as <model>.mmproj.gguf. Two vision models
@@ -1370,6 +1499,16 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertNil(env["GGML_METAL_DEVICE_INDEX"], "gpuIndex -1 no debe fijar índice")
         XCTAssertTrue(env["PATH"]?.contains("/usr/local/bin") == true)
         XCTAssertTrue(env["PATH"]?.contains("/opt/homebrew/bin") == true)
+    }
+
+    func testAutomaticVRAMReserveLeavesTheEngineItsOwnShare() {
+        var s = makeSettings()
+        s.vramReserveMB = 0
+        XCTAssertNil(s.environment["GGML_METAL_VRAM_RESERVE_MB"])
+        XCTAssertEqual(ServerSettings.effectiveVramReserveMB(0, vramMB: 12_288), 983)
+        XCTAssertEqual(ServerSettings.effectiveVramReserveMB(0, vramMB: 8_192), 768)
+        XCTAssertEqual(ServerSettings.effectiveVramReserveMB(0, vramMB: 32_768), 1_536)
+        XCTAssertEqual(ServerSettings.effectiveVramReserveMB(2_048, vramMB: 12_288), 2_048)
     }
 
     func testSingleGPUSelectionPinsDeviceUnlessMultiGPUIsEnabled() {
@@ -1525,6 +1664,7 @@ final class ServerSettingsTests: XCTestCase {
         XCTAssertEqual(URL(fileURLWithPath: args[args.firstIndex(of: "-md")! + 1])
             .resolvingSymlinksInPath().path, canonicalDraft)
         XCTAssertEqual(args[args.firstIndex(of: "--spec-type")! + 1], "draft-mtp")
+        XCTAssertEqual(args[args.firstIndex(of: "--spec-draft-sampling")! + 1], "probabilistic")
     }
 
     func testModelPublishDateReadsCreationAndBaseModel() {
@@ -1858,6 +1998,17 @@ final class ChatMessageTests: XCTestCase {
         XCTAssertEqual(history[1]["tool_call_id"] as? String, "call_1")
     }
 
+    func testToolCallWithBrokenArgumentsGoesBackAsEmptyObject() throws {
+        let cut = ChatToolCall(serverID: "call_1", name: "run_python", arguments: #"{"code": "print(1"#,
+                               result: "invalid arguments", state: .failed)
+        let kept = ChatToolCall(serverID: "call_2", name: "get_datetime", arguments: #"{"tz":"UTC"}"#,
+                                result: "2026-07-21", state: .completed)
+        let history = ChatStore.requestHistory(system: "", summary: nil,
+                                               messages: [ChatMessage(role: "assistant", content: "", toolCalls: [cut, kept])], from: 0)
+        let calls = try XCTUnwrap(history.first?["tool_calls"] as? [[String: Any]])
+        XCTAssertEqual(calls.map { ($0["function"] as? [String: Any])?["arguments"] as? String }, ["{}", #"{"tz":"UTC"}"#])
+    }
+
     func testBuiltinToolMetadataPreservesDefinition() throws {
         let json: [String: Any] = [
             "display_name": "Read file", "tool": "read_file", "type": "builtin",
@@ -2028,6 +2179,60 @@ final class ChatMessageTests: XCTestCase {
         XCTAssertEqual(inputAudio["format"] as? String, "wav")
         let inputVideo = try XCTUnwrap(parts[2]["input_video"] as? [String: Any])
         XCTAssertEqual(inputVideo["format"] as? String, "mp4")
+    }
+
+    func testAPDFSentAsImagesCarriesItsTextLayerPageByPage() throws {
+        func pdf(_ pages: [String]) -> PDFDocument {
+            let data = NSMutableData()
+            var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+            let context = CGContext(consumer: CGDataConsumer(data: data)!, mediaBox: &box, nil)!
+            for text in pages {
+                context.beginPDFPage(nil)
+                let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [
+                    .font: NSFont.systemFont(ofSize: 10)]))
+                context.textPosition = CGPoint(x: 36, y: 700)
+                CTLineDraw(line, context)
+                context.endPDFPage()
+            }
+            context.closePDF()
+            return PDFDocument(data: data as Data)!
+        }
+        let course = "Thence North 29 degrees 52 minutes 04 seconds East 540.79 feet to the TRUE POINT OF BEGINNING"
+        let layer = try XCTUnwrap(NativeChatView.pdfTextLayer(pdf([course, course]), maxChars: 100_000))
+        XCTAssertTrue(layer.hasPrefix("[Page 1]\nThence North 29 degrees"))
+        XCTAssertTrue(layer.contains("\n[Page 2]\n"))
+        XCTAssertTrue(layer.hasSuffix("\n[Page 2]\n\(course)\n[End of text layer]"))
+        XCTAssertEqual(layer.components(separatedBy: "[Page ").count - 1, 2)
+        // a scan has no text of its own to send
+        XCTAssertNil(NativeChatView.pdfTextLayer(pdf(["", ""]), maxChars: 100_000))
+    }
+
+    func testAPDFTextLayerPastThePageImagesKeepsEveryPageAndACutOneSaysWhere() throws {
+        func pdf(_ count: Int) -> PDFDocument {
+            let data = NSMutableData()
+            var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+            let context = CGContext(consumer: CGDataConsumer(data: data)!, mediaBox: &box, nil)!
+            for page in 1...count {
+                context.beginPDFPage(nil)
+                let line = CTLineCreateWithAttributedString(NSAttributedString(
+                    string: "Course \(page): thence South 12 degrees 30 minutes West 100.00 feet", attributes: [
+                        .font: NSFont.systemFont(ofSize: 10)]))
+                context.textPosition = CGPoint(x: 36, y: 700)
+                CTLineDraw(line, context)
+                context.endPDFPage()
+            }
+            context.closePDF()
+            return PDFDocument(data: data as Data)!
+        }
+        // more pages than the 20 sent as images: the text of every one goes
+        let whole = try XCTUnwrap(NativeChatView.pdfTextLayer(pdf(36), maxChars: 400_000))
+        XCTAssertTrue(whole.contains("[Page 36]\nCourse 36: thence"))
+        XCTAssertTrue(whole.hasSuffix("100.00 feet\n[End of text layer]"))
+        XCTAssertFalse(whole.contains("cut"))
+        // past the size limit it ends where it was cut and says so before the end line
+        let cut = try XCTUnwrap(NativeChatView.pdfTextLayer(pdf(36), maxChars: 700))
+        XCTAssertTrue(cut.hasSuffix("\n[Text layer cut in page 10 of 36]\n[End of text layer]"), cut)
+        XCTAssertFalse(cut.contains("[Page 11]"))
     }
 
     func testMultimediaFormatsMatchLlamaWebUICompatibilityRules() {
@@ -2291,14 +2496,93 @@ final class CompactionTests: XCTestCase {
         XCTAssertEqual(decoded.wireContent, "hola")
     }
 
+    func testFilesAttachedTogetherGoInTheOrderTheirNamesGive() {
+        func order(_ names: [String]) -> [String] {
+            NativeChatView.pageOrder(names.map { URL(fileURLWithPath: "/tmp/" + $0) }).map(\.lastPathComponent)
+        }
+        XCTAssertEqual(order(["page10.png", "page2.png", "page1.png"]), ["page1.png", "page2.png", "page10.png"])
+        XCTAssertEqual(order(["739.jpg", "735.jpg", "737.jpg"]), ["735.jpg", "737.jpg", "739.jpg"])
+        XCTAssertEqual(order(["10.jpg", "9.jpg", "11.jpg"]), ["9.jpg", "10.jpg", "11.jpg"])
+        // names without a sequence keep the order they came in, never one made up from them
+        XCTAssertEqual(order(["scan.jpg", "back.jpg", "front.jpg"]), ["scan.jpg", "back.jpg", "front.jpg"])
+        XCTAssertEqual(order(["cover.jpg", "page2.jpg", "page1.jpg"]), ["cover.jpg", "page2.jpg", "page1.jpg"])
+    }
+
+    func testAnAttachmentIsToldApartByItsBytesNotItsName() throws {
+        // two scans named alike are different files; the same one attached again is not
+        let first = FileHash.sha256(of: Data("page one".utf8)), second = FileHash.sha256(of: Data("page two".utf8))
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(first, FileHash.sha256(of: Data("page one".utf8)))
+        // attachments saved before the digest existed still load
+        let json = #"{"id":"00000000-0000-0000-0000-000000000002","name":"scan.pdf","content":"text"}"#
+        XCTAssertNil(try JSONDecoder().decode(ChatAttachment.self, from: Data(json.utf8)).digest)
+    }
+
     func testStreamingErrorIsExtractedFromSuccessfulHTTPStream() {
-        let object: [String: Any] = ["error": ["message": "Compute error."]]
-        XCTAssertEqual(ChatStore.streamedError(from: object), "Compute error.")
+        let object: [String: Any] = ["error": ["message": "the model refused the request"]]
+        XCTAssertEqual(ChatStore.streamedError(from: object), "the model refused the request")
+    }
+
+    func testEngineFailuresAreToldAsSuch() throws {
+        // the engine's raw GPU failure says the request did not finish and the server restarts
+        let gpu = ChatStore.streamedError(from: ["error": ["code": 500, "message": "Compute error."]]) ?? ""
+        XCTAssertTrue(gpu.contains("GPU"), gpu)
+        XCTAssertNotEqual(gpu, "Compute error.")
+        // an agent's own text for it is kept; what the app does about it is added where the server is known
+        let told = ChatStore.streamedError(from: ["error": ["type": "engine_gpu_error", "message": "Agent text."]]) ?? ""
+        XCTAssertEqual(told, "Agent text.")
+        XCTAssertTrue(ChatStore.gpuFailureMessage(told: told, outlook: .restarting).hasPrefix("Agent text. "))
+        let context = ChatStore.streamedError(from: ["error": ["type": "exceed_context_size_error", "n_prompt_tokens": 22300,
+                                                                "n_ctx": 16384, "message": "request exceeds"]]) ?? ""
+        XCTAssertTrue(context.contains("22300") && context.contains("16384"), context)
+        // an error that quotes the model's text is not a full context because that text mentions one
+        let quoted = #"{"error":{"code":500,"message":"Failed to parse tool call arguments as JSON: last read: 'raise the context size'"}}"#
+        XCTAssertTrue(ChatStore.describeServerError(status: 500, body: quoted).hasPrefix("HTTP 500: Failed to parse"))
+        let full = #"{"error":{"code":400,"message":"request (70000 tokens) exceeds the available context size (65536 tokens), try increasing it"}}"#
+        XCTAssertTrue(ChatStore.describeServerError(status: 400, body: full).hasPrefix("Contexto lleno"))
+        // a server error inside the stream ends the turn: the app does not try to resume it
+        var accumulator = ChatStreamAccumulator()
+        XCTAssertThrowsError(try accumulator.consume(#"data: {"error":{"message":"Compute error."}}"#)) { error in
+            XCTAssertEqual((error as? StreamError)?.fromServer, true)
+            XCTAssertEqual((error as? StreamError)?.gpu, true)
+        }
+        XCTAssertThrowsError(try accumulator.consume(#"data: {"error":{"message":"The slot was released."}}"#)) { error in
+            XCTAssertEqual((error as? StreamError)?.gpu, false)
+        }
+        XCTAssertTrue(ChatStore.isGPUFailure(ChatStore.errorObject(#"{"error":{"code":500,"message":"Compute error."}}"#)))
+        XCTAssertFalse(ChatStore.cutAnswerMessage().isEmpty)
+    }
+
+    func testGPURecoveryRestartsOnceEveryTenMinutesAndSaysWhen() {
+        let recovery = GPURecovery()
+        let start = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(recovery.admit(port: 8080, at: start))
+        // one failure logs several lines: a single restart
+        XCTAssertFalse(recovery.admit(port: 8080, at: start.addingTimeInterval(1)))
+        XCTAssertEqual(recovery.outlook(port: 8080, at: start.addingTimeInterval(2)), .restarting)
+        // another failure within ten minutes is not restarted, and the chat does not promise it
+        XCTAssertFalse(recovery.admit(port: 8080, at: start.addingTimeInterval(120)))
+        XCTAssertEqual(recovery.outlook(port: 8080, at: start.addingTimeInterval(120)), .withheld)
+        XCTAssertNotEqual(ChatStore.gpuFailureMessage(told: nil, outlook: .withheld),
+                          ChatStore.gpuFailureMessage(told: nil, outlook: .restarting))
+        // each server counts its own
+        XCTAssertTrue(recovery.admit(port: 8081, at: start.addingTimeInterval(120)))
+        XCTAssertTrue(recovery.admit(port: 8080, at: start.addingTimeInterval(601)))
+        // a stream cut is the GPU's only when the restart came after its request was sent
+        XCTAssertTrue(recovery.restarted(port: 8080, since: start.addingTimeInterval(590)))
+        XCTAssertFalse(recovery.restarted(port: 8080, since: start.addingTimeInterval(650)))
+        XCTAssertFalse(recovery.restarted(port: 8082, since: start))
+        XCTAssertTrue(GPURecovery.reports("error: Caused GPU Timeout Error (00000002:kIOAccelCommandBufferCallbackErrorTimeout)"))
+        XCTAssertTrue(GPURecovery.reports("ggml_metal_graph_compute: backend is in error state from a previous command buffer failure"))
+        XCTAssertFalse(GPURecovery.reports("srv  log_server_r: request: POST /v1/chat/completions 127.0.0.1 200"))
+        // a cut connection is not told as a GPU failure
+        XCTAssertFalse(ChatStore.cutConnectionMessage().contains("GPU"))
     }
 
     func testReasoningOnlyLengthMessageExplainsTokenLimit() {
         let message = ChatStore.emptyResponseMessage(finishReason: "length")
-        XCTAssertTrue(message.contains("máximo de tokens"))
+        XCTAssertTrue(message.contains("máximo de tokens") || message.contains("max tokens"), message)
+        XCTAssertFalse(message.contains(" / "), "one language, not the pair")
     }
 }
 
@@ -2596,6 +2880,8 @@ final class RouterModeTests: XCTestCase {
         XCTAssertTrue(ini.contains("[moe-a3b]"))
         XCTAssertTrue(ini.contains("model = /models/dense-4b.gguf"))
         XCTAssertTrue(ini.contains("n-cpu-moe = 12"))
+        XCTAssertEqual(ini.components(separatedBy: "reasoning-preserve = false").count - 1, 2,
+                       "every model the router loads drops preserved reasoning")
         // Dense entry has no ncmoe line: no false n-cpu-moe on a model with no experts.
         let denseSection = ini.components(separatedBy: "\n\n").first { $0.contains("dense-4b") } ?? ""
         XCTAssertFalse(denseSection.contains("n-cpu-moe"))

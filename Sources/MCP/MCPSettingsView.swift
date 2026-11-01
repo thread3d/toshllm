@@ -219,6 +219,24 @@ private struct MCPServerEditor: View {
 
                     if server.transport.isLocal { localArgumentsCard } else { headersCard }
 
+                    if server.engineReachable {
+                        SettingsRowGroup {
+                            SettingsRow(icon: "checkmark.shield",
+                                        title: loc.t("Disponible para el agente del servidor", "Available to the server agent"),
+                                        subtitle: loc.t("Se aplica al reiniciar el servidor", "Applies when the server restarts"),
+                                        help: server.transport.isLocal
+                                            ? loc.t("Vale para todo el servidor, no para un chat ni un cliente: el motor arranca este programa con los permisos de tu usuario, sin aislamiento, y su agente llama a sus herramientas cuando una petición lo necesita, venga de esta app, del chat web o de cualquier cliente de la API que llegue al agente. Ningún otro camino lo ve. Apruébalo solo si confías en el programa.",
+                                                    "It applies to the whole server, not to one chat or client: the engine starts this program with your user's permissions, without isolation, and its agent calls the tools whenever a request needs them, whether it comes from this app, the web chat or any API client that reaches the agent. No other path sees it. Only approve programs you trust.")
+                                            : loc.t("Vale para todo el servidor, no para un chat ni un cliente: el motor llega a este servidor remoto por un puente local y su agente llama a sus herramientas cuando una petición lo necesita, venga de esta app, del chat web o de cualquier cliente de la API que llegue al agente. Las cabeceras siguen en el Llavero y llegan al puente por el entorno del motor. Apruébalo solo si confías en el servidor.",
+                                                    "It applies to the whole server, not to one chat or client: the engine reaches this remote server through a local relay and its agent calls the tools whenever a request needs them, whether it comes from this app, the web chat or any API client that reaches the agent. The headers stay in the Keychain and reach the relay through the engine's environment. Only approve servers you trust.")) {
+                                SettingsToggle(isOn: Binding(get: { server.engineAccess == true },
+                                                             set: { server.engineAccess = $0 }))
+                                    .help(loc.t("Aprobar este servidor para el agente del motor",
+                                                "Approve this server for the engine's agent"))
+                            }
+                        }
+                    }
+
                     if server.transport.isLocal {
                         notice(loc.t("Este servidor se ejecuta en tu equipo con tus permisos. Añade solo programas en los que confíes.",
                                      "This server runs on your machine with your permissions. Only add programs you trust."),
@@ -230,7 +248,7 @@ private struct MCPServerEditor: View {
                 }
                 .padding(18)
             }
-            .frame(height: server.transport.isLocal ? 440 : 360)
+            .frame(height: server.transport.isLocal ? 520 : 360)
 
             Divider()
             footer

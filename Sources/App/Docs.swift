@@ -205,7 +205,7 @@ Endpoints útiles:
 
 También hay un chat web minimalista en la raíz (`http://127.0.0.1:8080`) para usar desde el navegador.
 
-**Peticiones simultáneas:** el ajuste del mismo nombre (Ajustes → Inferencia y contexto) controla cuántas peticiones concurrentes acepta el servidor. En 1 (el valor por defecto), las peticiones se encolan una tras otra en vez de competir por la GPU, y una petición cortada por timeout retoma el procesamiento donde se quedó en el siguiente intento.
+**Peticiones simultáneas:** el ajuste del mismo nombre (Ajustes → Inferencia y contexto) controla cuántas peticiones concurrentes acepta el servidor. En 1 (el valor por defecto), las peticiones se encolan una tras otra en vez de competir por la GPU, y una petición cortada por timeout retoma el procesamiento donde se quedó en el siguiente intento. Con 2 o más, "Contexto separado por petición" da a cada una su parte del contexto: genera más rápido con varias a la vez, pero ninguna conversación pasa de su parte.
 
 #### Conectar clientes externos
 
@@ -368,7 +368,7 @@ The **Chat / Images** toggle at the top of the window switches to the image stud
 
 **MoE experts on CPU** — See the MoE section.
 
-**VRAM reserve** — Memory left free for the system. 1024 MB is safe.
+**VRAM reserve** — Memory left free for the system. Automatic leaves 8% of the card, between 768 and 1536 MB, as the engine does on its own.
 
 **Copy weights to VRAM (--no-mmap)** — Essential on discrete GPUs: without it, weights are read over PCIe on every token and speed drops ~6×.
 
@@ -474,7 +474,7 @@ Useful endpoints:
 
 There's also a minimal web chat at the root (`http://127.0.0.1:8080`) for browser use.
 
-**Concurrent requests:** the setting of the same name (Settings → Inference & context) controls how many concurrent requests the server accepts. At 1 (the default), requests queue instead of competing for the GPU, and a request cut off by a timeout resumes processing where it stopped on the next attempt.
+**Concurrent requests:** the setting of the same name (Settings → Inference & context) controls how many concurrent requests the server accepts. At 1 (the default), requests queue instead of competing for the GPU, and a request cut off by a timeout resumes processing where it stopped on the next attempt. With 2 or more, "Separate context per request" gives each one its share of the context: generation is faster with several at once, but no conversation grows past its share.
 
 #### Connecting external clients
 

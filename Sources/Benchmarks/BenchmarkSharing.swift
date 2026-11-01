@@ -16,7 +16,7 @@ final class BenchmarkSharing: ObservableObject {
 
     static let baseURL = "https://toshllm.com"
     static let consentVersion = "benchmark-share-v1"
-    private static let bundleID = "dev.engel.toshllm"
+    private static let bundleID = AppInfo.identifier
     private static let keyAccount = "benchmark-signing-key.v1"
 
     // Public identity from the server; the private key never leaves the Keychain.

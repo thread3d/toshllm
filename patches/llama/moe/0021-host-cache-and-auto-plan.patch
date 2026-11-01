@@ -1,0 +1,3181 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 3ffcf6f6c..636d7a36e 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2896,16 +2896,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             } else if (is_falsey(value)) {
+                 params.fit_params = false;
+             } else {
+                 throw std::runtime_error(
+                     string_format("error: unknown value for --fit: '%s'\n", value.c_str()));
+             }
+         }
+     ).set_env("LLAMA_ARG_FIT"));
++    add_opt(common_arg(
++        { "--dynamic-moe" }, "[on|off]",
++        string_format("plan MoE memory with Dynamic MoE: the planner picks expert residency in VRAM and RAM, "
++                      "or a safe fallback, and refuses to load when nothing fits ('on' or 'off', default: '%s')",
++                      params.dynamic_moe ? "on" : "off"),
++        [](common_params & params, const std::string & value) {
++            if (is_truthy(value)) {
++                params.dynamic_moe = true;
++            } else if (is_falsey(value)) {
++                params.dynamic_moe = false;
++            } else {
++                throw std::runtime_error(
++                    string_format("error: unknown value for --dynamic-moe: '%s'\n", value.c_str()));
++            }
++        }
++    ).set_env("LLAMA_ARG_DYNAMIC_MOE"));
+     add_opt(common_arg(
+         { "-fitp", "--fit-print" }, "[on|off]",
+         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
+         [](common_params & params, const std::string & value) {
+             if (is_truthy(value)) {
+                 params.fit_params_print = true;
+             } else if (is_falsey(value)) {
+                 params.fit_params_print = false;
+diff --git a/common/common.cpp b/common/common.cpp
+index 0d91ce3d9..104e5e72b 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -3,16 +3,19 @@
+ #include "gguf.h"
+ 
+ #include "build-info.h"
+ #include "common.h"
+ 
+ #include "../src/llama-ext.h"
+ 
+ #include "fit.h"
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++#include "tosh-hostcache.h"
++#endif
+ #include "tosh-plan.h"
+ #include "log.h"
+ #include "llama.h"
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "unicode.h"
+ 
+ #include <algorithm>
+@@ -401,16 +404,17 @@ void common_init() {
+ void common_params_print_info(const common_params & params, bool print_devices) {
+ #ifdef NDEBUG
+     const char * build_type = "";
+ #else
+     const char * build_type = " (debug)";
+ #endif
+     COM_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+ 
++
+     const int verbosity = common_log_get_verbosity_thold();
+     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
+ 
+     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
+     if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
+         COM_TRC("%s", "device_info:\n");
+         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+             auto * dev = ggml_backend_dev_get(i);
+@@ -1225,16 +1229,28 @@ common_decision_type common_get_decision_type(const std::string & fname) {
+     if (gguf_get_kv_type(gguf_ctx.get(), type_id) != GGUF_TYPE_STRING) {
+         return COMMON_DECISION_TYPE_UNKNOWN; // malformed metadata
+     }
+     return common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
+ }
+ 
+ common_init_result::common_init_result(common_params & params, bool model_only) :
+     pimpl(new impl{}) {
++    {
++        tosh_plan plan;
++        if (!tosh_plan_apply(params, &plan) && plan.state == TOSH_PLAN_NOT_PLANNED && !params.dynamic_moe && getenv("TOSH_AUTO") == nullptr) {
++            LOG_INF("Tosh MoE: standard\n");
++        }
++        // no plan fits: loading with the defaults would hand memory to a layout nobody checked
++        if (plan.state == TOSH_PLAN_UNSUPPORTED && getenv("TOSH_AUTO_DRY_RUN") == nullptr) {
++            LOG_ERR("%s: TOSH_AUTO found no configuration that fits (%s), the model is not loaded\n", __func__, plan.primary_reason.c_str());
++            tosh_plan_report_load("PLAN_REFUSED", plan.primary_reason.c_str());
++            return;
++        }
++    }
+ 
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
+     if (params.fit_params) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+ 
+@@ -1265,16 +1281,23 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.fit_params_target.data(),
+             params.fit_params_min_ctx,
+             has_draft || spec_mtp ? &extra : nullptr,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+     }
+ 
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+     if (model == NULL) {
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++        // a host memory lock that failed during the load is an allocation failure, not a bad model
++        const char * err = tosh_hostcache_error();
++        tosh_plan_report_load(err && strstr(err, "NOT_LOCKABLE") ? "ALLOCATION_FAILED" : "MODEL_LOAD_FAILED", err);
++#else
++        tosh_plan_report_load("MODEL_LOAD_FAILED");
++#endif
+         return;
+     }
+ 
+     pimpl->model.reset(model);
+ 
+     if (model_only) {
+         return;
+     }
+@@ -1358,26 +1381,37 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+     if (params.sampling.backend_sampling) {
+         cparams.samplers   = pimpl->samplers_seq_config.data();
+         cparams.n_samplers = pimpl->samplers_seq_config.size();
+     }
+ 
+     llama_context * lctx = llama_init_from_model(model, cparams);
+     if (lctx == NULL) {
+         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++        const char * err = tosh_hostcache_error();
++        tosh_plan_report_load(err && strstr(err, "NOT_LOCKABLE") ? "ALLOCATION_FAILED" : "CONTEXT_FAILED", err);
++#else
++        tosh_plan_report_load("CONTEXT_FAILED");
++#endif
+         return;
+     }
+ 
+     pimpl->context.reset(lctx);
+ 
+     set_process_priority(params.cpuparams.priority);
+ 
+     pimpl->threadpools.init(lctx, params);
+ }
+ 
++void common_init_result::release() {
++    pimpl->context.reset();
++    pimpl->model.reset();
++}
++
+ llama_model * common_init_result::model() {
+     return pimpl->model.get();
+ }
+ 
+ llama_context * common_init_result::context() {
+     return pimpl->context.get();
+ }
+ 
+@@ -1508,16 +1542,26 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
+         }
+         llama_memory_clear(llama_get_memory(lctx), true);
+         llama_synchronize(lctx);
+         llama_perf_context_reset(lctx);
+ 
+         // reset samplers to reset RNG state after warmup to the seeded state
+         res->reset_samplers();
+     }
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++    // an expert cache that could not be locked would page: fail rather than run on it
++    if (!tosh_hostcache_warmup_done()) {
++        COM_ERR("%s: %s\n", __func__, tosh_hostcache_error() ? tosh_hostcache_error() : "the expert cache failed");
++        tosh_plan_report_load("ALLOCATION_FAILED", tosh_hostcache_error());
++        res->release();
++        return res;
++    }
++#endif
++    tosh_plan_report_load("READY");
+ 
+     return res;
+ }
+ 
+ common_init_result::~common_init_result() = default;
+ 
+ std::string common_get_model_endpoint() {
+     std::string endpoint = common_get_env("MODEL_ENDPOINT");
+diff --git a/common/common.h b/common/common.h
+index 2f50d90c6..777075786 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -474,16 +474,17 @@ struct common_params {
+ 
+     // offload params
+     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+ 
+     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
+     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
++    bool    dynamic_moe        = false; // Tosh plans MoE memory: expert residency, host RAM and fallback
+     bool    fit_params_print   = false; // print the estimated required memory to run the model
+     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+ 
+     // margin per device in bytes for fitting parameters to free memory:
+     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+ 
+     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+@@ -977,16 +978,19 @@ struct common_init_result {
+     llama_model * model();
+     llama_context * context();
+ 
+     common_sampler * sampler(llama_seq_id seq_id);
+     void reset_samplers();
+ 
+     std::vector<llama_adapter_lora_ptr> & lora();
+ 
++    // drops the model and context after a failure found once they exist
++    void release();
++
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+ };
+ 
+ using common_init_result_ptr = std::unique_ptr<common_init_result>;
+ 
+ common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+diff --git a/common/tosh-plan.cpp b/common/tosh-plan.cpp
+index e6befba34..7b82d081c 100644
+--- a/common/tosh-plan.cpp
++++ b/common/tosh-plan.cpp
+@@ -7,113 +7,260 @@
+ #include "gguf.h"
+ #include "llama.h"
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
+ #endif
+ 
+ #include <algorithm>
++#include <climits>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <filesystem>
+ #include <list>
+ #include <regex>
+ 
+ #ifdef __APPLE__
++#include <chrono>
++#include <thread>
+ #include <mach/mach.h>
+ #include <sys/sysctl.h>
+ #endif
+ 
+ static constexpr double MiB = 1048576.0;
+ 
+ // safety reserve: a share of the card, bounded on small and large cards
+ static constexpr double RESERVE_FRACTION = 0.08;
+ static constexpr double RESERVE_MIN_MIB  = 768.0;
+ static constexpr double RESERVE_MAX_MIB  = 1536.0;
+ // RAM left to the rest of the system once a plan's host memory is taken
+ static constexpr double HOST_MARGIN_MIB  = 2048.0;
++// experimental bounded host cache: (VRAM arena + RAM cache) / bank below this streams every token
++static constexpr double BOUNDED_MIN_COVERAGE  = 1.0;
++static constexpr double BOUNDED_GOOD_COVERAGE = 1.25;
++// TOSH_AUTO_HOST_BANK=lean: RAM holds the experts the VRAM arena does not, plus this margin
++static constexpr double LEAN_COVERAGE         = 1.08;
++// reclaimable RAM lost between the snapshot and the commit that makes the plan stale
++static constexpr double STALE_DROP_MIB = 1024.0;
+ 
+ namespace {
+ 
+ struct moe_info {
+     bool   moe       = false;
+     int    n_layer   = 0;
+     int    n_moe     = 0;       // layers with an expert bank
+     int    n_expert  = 0;
+     int    n_used    = 0;
+     int    n_ctx_train = 0;
+     double bank_mib  = 0;       // every expert weight
+     double max_tensor_mib = 0;  // one layer's largest expert tensor: a prefill slot
+     double embd_mib  = 0;       // token embeddings, kept in host memory
++    double total_mib = 0;       // every tensor, across all shards
++    // the RAM cache keeps one pool per expert size and each must hold a whole layer
++    double warm_floor_mib = 0;
++    // sliding-window cache of one sequence per cache element size: what a context checkpoint holds
++    double swa_elems = 0;
++    int    n_swa     = 0;
++    int    n_split   = 1;
++    std::string error;          // the model's metadata could not be read completely
+ };
+ 
+ struct host_mem {
+     double ram_mib        = 0;
+     double wired_mib      = 0;
+     double wire_limit_mib = 0;
+     double available_mib  = 0;   // what the system can hand out now without compressing or swapping
++    // runtime policy: free, speculative and purgeable pages plus inactive file cache; inactive
++    // anonymous pages only come back through the compressor or swap, so they do not count
++    double reclaimable_mib = 0;
++    double compressed_mib  = 0;
++    double swap_used_mib   = 0;
++    double self_rss_mib    = 0;
++    int    pressure_level  = 1;  // kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
++    bool   swap_growing    = false;
++    bool   simulated       = false;
+ };
+ 
+ struct probe {
+     bool   ok = false;
+     double model = 0, context = 0, compute = 0;   // GPU, MiB
+     double host_model = 0, host_other = 0;
+ };
+ 
+ double env_mib(const char * k, double d) {
+     const char * v = getenv(k);
+     return v ? atof(v) : d;
+ }
+ 
++// metadata comes from the first shard, tensors from every shard of a split model
+ moe_info read_moe_info(const char * path) {
+     moe_info mi;
+     gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+     gguf_context * g = gguf_init_from_file(path, gp);
+     if (g == nullptr) {
++        mi.error = "cannot read the model file";
+         return mi;
+     }
+     auto get_u32 = [&](const std::string & k) -> int {
+         const int64_t id = gguf_find_key(g, k.c_str());
+         return id < 0 ? 0 : (int) gguf_get_val_u32(g, id);
+     };
+     const int64_t aid = gguf_find_key(g, "general.architecture");
+     const std::string arch = aid < 0 ? "" : gguf_get_val_str(g, aid);
+     mi.n_layer     = get_u32(arch + ".block_count");
+     mi.n_expert    = get_u32(arch + ".expert_count");
+     mi.n_used      = get_u32(arch + ".expert_used_count");
+     mi.n_ctx_train = get_u32(arch + ".context_length");
++    // sliding-window layers: heads x (key + value) per token, over the window
++    auto u32_or = [&](const std::string & k, int d) { const int64_t id = gguf_find_key(g, k.c_str()); return id < 0 ? d : (int) gguf_get_val_u32(g, id); };
++    mi.n_swa = u32_or(arch + ".attention.sliding_window", 0);
++    if (mi.n_swa > 0 && mi.n_layer > 0) {
++        const int64_t hid = gguf_find_key(g, (arch + ".attention.head_count_kv").c_str());
++        const int64_t pid = gguf_find_key(g, (arch + ".attention.sliding_window_pattern").c_str());
++        const int kl = u32_or(arch + ".attention.key_length_swa", u32_or(arch + ".attention.key_length", 128));
++        const int vl = u32_or(arch + ".attention.value_length_swa", u32_or(arch + ".attention.value_length", 128));
++        for (int il = 0; il < mi.n_layer; ++il) {
++            // without a pattern every layer is counted, which only overstates
++            const bool swa = pid < 0 || gguf_get_arr_type(g, pid) != GGUF_TYPE_BOOL || il >= (int) gguf_get_arr_n(g, pid) ||
++                             ((const bool *) gguf_get_arr_data(g, pid))[il];
++            if (!swa) continue;
++            int heads = 0;
++            if (hid >= 0 && gguf_get_kv_type(g, hid) == GGUF_TYPE_ARRAY && il < (int) gguf_get_arr_n(g, hid)) {
++                heads = ((const int32_t *) gguf_get_arr_data(g, hid))[il];
++            } else if (hid >= 0 && gguf_get_kv_type(g, hid) == GGUF_TYPE_UINT32) {
++                heads = (int) gguf_get_val_u32(g, hid);
++            }
++            mi.swa_elems += (double) heads*(kl + vl);
++        }
++    }
++    const int64_t sid = gguf_find_key(g, "split.count");
++    mi.n_split = sid < 0 ? 1 : std::max(1, (int) gguf_get_val_u16(g, sid));
++
++    std::vector<std::string> paths = { path };
++    if (mi.n_split > 1) {
++        char prefix[PATH_MAX] = {}, shard[PATH_MAX] = {};
++        if (llama_split_prefix(prefix, sizeof(prefix), path, 0, mi.n_split) == 0) {
++            mi.error = string_format("SPLIT_GGUF_METADATA_ERROR: %s is not the first of %d shards", path, mi.n_split);
++            gguf_free(g);
++            return mi;
++        }
++        for (int i = 1; i < mi.n_split; ++i) {
++            llama_split_path(shard, sizeof(shard), prefix, i, mi.n_split);
++            paths.push_back(shard);
++        }
++    }
+ 
+     const std::regex bank("^blk\\.([0-9]+)\\.ffn_(up|down|gate|gate_up)_exps\\.weight$");
++    std::vector<double> layer_mib(mi.n_layer + 1, 0.0);
++    for (size_t f = 0; f < paths.size(); ++f) {
++        gguf_context * gs = f == 0 ? g : gguf_init_from_file(paths[f].c_str(), gp);
++        if (gs == nullptr) {
++            mi.error = string_format("SPLIT_GGUF_METADATA_ERROR: cannot read shard %zu of %d: %s", f + 1, mi.n_split, paths[f].c_str());
++            break;
+         }
++        for (int64_t i = 0; i < gguf_get_n_tensors(gs); ++i) {
++            const std::string name = gguf_get_tensor_name(gs, i);
++            const double mib = gguf_get_tensor_size(gs, i)/MiB;
++            mi.total_mib += mib;
++            if (name == "token_embd.weight") {
++                mi.embd_mib = mib;
++            }
++            std::smatch m;
++            if (!std::regex_match(name, m, bank)) {
++                continue;
++            }
++            mi.bank_mib += mib;
++            mi.max_tensor_mib = std::max(mi.max_tensor_mib, mib);
++            const int il = std::stoi(m[1]);
++            if (il >= 0 && il < (int) layer_mib.size()) layer_mib[il] += mib;
+         }
++        if (gs != g) gguf_free(gs);
++    }
+     gguf_free(g);
++    std::vector<double> sizes;
++    for (double l : layer_mib) {
++        if (l <= 0) continue;
++        mi.n_moe++;
++        if (std::none_of(sizes.begin(), sizes.end(), [&](double s) { return std::fabs(s - l) < 1e-6; })) sizes.push_back(l);
++    }
++    for (double s : sizes) mi.warm_floor_mib += s;
++    mi.moe = mi.error.empty() && mi.n_expert > 0 && mi.n_used > 0 && mi.n_moe > 0;
+     return mi;
+ }
+ 
++// the product switch plans host memory from the machine's state unless told otherwise
++static bool g_runtime_default = false;
++
++bool host_policy_runtime() {
++    const char * v = getenv("TOSH_AUTO_HOST_POLICY");
++    return v == nullptr ? g_runtime_default : strcmp(v, "runtime") == 0;
++}
++
++static bool host_bank_lean() {
++    const char * v = getenv("TOSH_AUTO_HOST_BANK");
++    return v != nullptr && strcmp(v, "lean") == 0;
++}
++
+ host_mem read_host_info() {
+     host_mem h;
+ #ifdef __APPLE__
+     uint64_t mem = 0; size_t len = sizeof(mem);
+     if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) h.ram_mib = mem/MiB;
+     uint64_t lim = 0; len = sizeof(lim);
+     if (sysctlbyname("vm.user_wire_limit", &lim, &len, nullptr, 0) == 0) h.wire_limit_mib = lim/MiB;
+     vm_statistics64_data_t vs;
+     mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) == KERN_SUCCESS) {
+         h.wired_mib = (double) vs.wire_count*vm_page_size/MiB;
+         h.available_mib = (double) (vs.free_count + vs.inactive_count + vs.speculative_count + vs.purgeable_count)*vm_page_size/MiB;
+     }
+ #endif
++#ifdef __APPLE__
++    if (host_policy_runtime()) {
++        auto sample = [](vm_statistics64_data_t & v) {
++            mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
++            return host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &v, &n) == KERN_SUCCESS;
++        };
++        vm_statistics64_data_t a, b;
++        if (sample(a)) {
++            const double pg = (double) vm_page_size/MiB;
++            h.reclaimable_mib = (a.free_count + a.speculative_count + a.purgeable_count +
++                                 std::min<uint64_t>(a.inactive_count, a.external_page_count))*pg;
++            h.compressed_mib = a.compressor_page_count*pg;
++            // swap written now, not swap left over from earlier pressure
++            std::this_thread::sleep_for(std::chrono::milliseconds(400));
++            if (sample(b)) h.swap_growing = b.swapouts > a.swapouts;
++        }
++        xsw_usage sw = {}; size_t sl = sizeof(sw);
++        if (sysctlbyname("vm.swapusage", &sw, &sl, nullptr, 0) == 0) h.swap_used_mib = sw.xsu_used/MiB;
++        int lvl = 1; size_t ll = sizeof(lvl);
++        if (sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &ll, nullptr, 0) == 0) h.pressure_level = lvl;
++        mach_task_basic_info_data_t ti; mach_msg_type_number_t tn = MACH_TASK_BASIC_INFO_COUNT;
++        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t) &ti, &tn) == KERN_SUCCESS) h.self_rss_mib = ti.resident_size/MiB;
++    }
++#endif
++    // planner tests: a pressure level or swap activity this machine is not in
++    if (const char * v = getenv("TOSH_AUTO_SIM_PRESSURE_LEVEL")) h.pressure_level = atoi(v);
++    if (getenv("TOSH_AUTO_SIM_SWAP_GROWING")) h.swap_growing = true;
+     const double sim = env_mib("TOSH_AUTO_SIM_RAM_MIB", 0);
+     if (sim > 0) {
++        // the runtime policy scales this machine's wired share instead of keeping its free RAM
++        h.wired_mib = host_policy_runtime() ? h.wired_mib*sim/h.ram_mib : std::max(0.0, h.wired_mib - h.ram_mib + sim);
+         h.wire_limit_mib = h.wire_limit_mib > 0 ? h.wire_limit_mib*sim/h.ram_mib : 0;
+         h.available_mib = std::min(h.available_mib, sim);
+         h.ram_mib = sim;
++        // a simulated machine does not inherit this one's state: idle unless told otherwise
++        h.simulated = true;
++        h.reclaimable_mib = env_mib("TOSH_AUTO_SIM_RECLAIMABLE_MIB", 0.85*sim);
++        h.compressed_mib = 0; h.swap_used_mib = 0; h.self_rss_mib = 0;
++        if (!getenv("TOSH_AUTO_SIM_PRESSURE_LEVEL")) h.pressure_level = 1;
++        if (!getenv("TOSH_AUTO_SIM_SWAP_GROWING")) h.swap_growing = false;
+     }
+     return h;
+ }
+ 
+ // keeps override patterns alive for the lifetime of the params that point at them
+ std::list<std::string> & pattern_store() {
+     static std::list<std::string> s;
+     return s;
+@@ -198,101 +345,249 @@ const char * kv_name(ggml_type t) { return ggml_type_name(t); }
+ const char * tosh_plan_state_name(tosh_plan_state s) {
+     switch (s) {
+         case TOSH_PLAN_NOT_PLANNED:            return "NOT_PLANNED";
+         case TOSH_PLAN_FULL_GPU_OPTIMAL:       return "FULL_GPU_OPTIMAL";
+         case TOSH_PLAN_DMOE_CONTEXT_OPTIMAL:   return "DMOE_CONTEXT_OPTIMAL";
+         case TOSH_PLAN_DMOE_CAPACITY_REQUIRED: return "DMOE_CAPACITY_REQUIRED";
+         case TOSH_PLAN_LEGACY_OFFLOAD_BETTER:  return "LEGACY_OFFLOAD_BETTER";
+         case TOSH_PLAN_UNSUPPORTED:            return "UNSUPPORTED";
++        case TOSH_PLAN_DMOE_BOUNDED_HOST:      return "DMOE_BOUNDED_HOST";
++    }
++    return "?";
++}
++
++const char * tosh_plan_mode_name(tosh_plan_mode m) {
++    switch (m) {
++        case TOSH_PLAN_MODE_NONE:           return "PLAN_NONE";
++        case TOSH_PLAN_MODE_FULL_GPU:       return "PLAN_FULL_GPU";
++        case TOSH_PLAN_MODE_FULL_HOST_DMOE: return "PLAN_FULL_HOST_DMOE";
++        case TOSH_PLAN_MODE_BOUNDED_DMOE:   return "PLAN_BOUNDED_DMOE";
++        case TOSH_PLAN_MODE_CLASSIC_NCMOE:  return "PLAN_CLASSIC_NCMOE";
++        case TOSH_PLAN_MODE_UNSUPPORTED:    return "PLAN_UNSUPPORTED";
+     }
+     return "?";
+ }
+ 
+ static std::string jstr(const std::string & s) {
+     std::string o = "\"";
+     for (char c : s) o += (c == '"' || c == '\\') ? '\'' : c;
+     return o + "\"";
+ }
+ 
++static std::string jarr(const std::vector<std::string> & v) {
++    std::string o = "[";
++    for (size_t i = 0; i < v.size(); ++i) o += (i ? ", " : "") + jstr(v[i]);
++    return o + "]";
++}
++
++static long long bytes(double mib) { return (long long) std::llround(mib*MiB); }
++
++// the stable part for the app: codes and bytes, no sentences
++static std::string plan_product_json(const tosh_plan & p) {
++    std::string label = tosh_plan_mode_name(p.plan_mode);
++    label = "plan.mode." + label.substr(5);
++    for (auto & c : label) c = (char) tolower(c);
++    const bool fallback = p.plan_mode == TOSH_PLAN_MODE_BOUNDED_DMOE || p.plan_mode == TOSH_PLAN_MODE_CLASSIC_NCMOE;
++    std::string o = "{\"mode\": " + jstr(tosh_plan_mode_name(p.plan_mode)) + ", \"mode_label_key\": " + jstr(label);
++    o += ", \"reason\": " + jstr(p.primary_reason) + ", \"warnings\": " + jarr(p.warnings) + ", \"limits\": " + jarr(p.limits);
++    o += ", \"limiting_resource\": " + jstr(p.limiting_resource);
++    o += ", \"fallback\": {\"selected\": " + std::string(fallback ? "true" : "false") + ", \"type\": " +
++         jstr(fallback ? tosh_plan_mode_name(p.plan_mode) : "NONE") + "}";
++    o += ", \"memory\": {\"host_policy\": " + jstr(p.host_policy.empty() ? "static" : p.host_policy) + ", \"pressure\": " + jstr(p.host_pressure);
++    o += string_format(", \"physical_bytes\": %lld, \"reclaimable_bytes\": %lld, \"runtime_headroom_bytes\": %lld, \"static_reserve_bytes\": %lld",
++                       bytes(p.host_ram_mib), bytes(p.reclaimable_mib), bytes(p.headroom_mib), bytes(p.static_reserve_mib));
++    o += string_format(", \"effective_host_budget_bytes\": %lld, \"lockable_remaining_bytes\": %lld, \"swap_used_bytes\": %lld, \"compressed_bytes\": %lld",
++                       bytes(p.effective_mib), bytes(p.lockable_mib), bytes(p.swap_used_mib), bytes(p.compressed_mib));
++    o += string_format(", \"projected_rss_bytes\": %lld, \"projected_vram_bytes\": %lld, \"vram_total_bytes\": %lld, \"vram_free_bytes\": %lld, \"prompt_cache_bytes\": %lld, \"context_checkpoints\": %d, \"checkpoint_bytes\": %lld}",
++                       bytes(p.projected_rss_mib), bytes(p.private_mib), bytes(p.vram_total_mib), bytes(p.vram_free_mib), bytes(p.prompt_cache_mib),
++                       p.n_ctx_checkpoints, bytes(p.checkpoint_mib));
++    o += string_format(", \"dmoe\": {\"expert_bank_bytes\": %lld, \"hot_bytes\": %lld, \"warm_bytes\": %lld, \"warm_floor_bytes\": %lld, \"coverage\": %.3f, \"coverage_state\": %s}",
++                       bytes(p.bank_mib), bytes(p.arena_mib), bytes(p.warm_mib), bytes(p.warm_floor_mib), p.coverage, jstr(p.coverage_state).c_str());
++    o += string_format(", \"runtime\": {\"context\": %d, \"kv_type\": %s, \"kv_bytes\": %lld, \"ubatch\": %d, \"ncmoe_layers\": %d}",
++                       p.n_ctx, jstr(ggml_type_name(p.kv)).c_str(), bytes(p.kv_mib), p.ubatch, p.ncmoe);
++    o += string_format(", \"model\": {\"model_bytes\": %lld, \"split_count\": %d, \"host_weights_bytes\": %lld}",
++                       bytes(p.model_mib), p.n_split, bytes(p.host_weights_mib));
++    if (p.plan_mode == TOSH_PLAN_MODE_UNSUPPORTED) {
++        o += string_format(", \"unsupported\": {\"required_host_bytes\": %lld, \"available_host_bytes\": %lld, \"required_vram_bytes\": %lld, \"available_vram_bytes\": %lld}",
++                           bytes(p.required_host_mib), bytes(p.available_host_mib), bytes(p.required_vram_mib), bytes(p.available_vram_mib));
++    }
++    o += string_format(", \"recheck_ms\": %.0f}", p.recheck_ms);
++    return o;
++}
++
+ std::string tosh_plan_json(const tosh_plan & p) {
+     std::string o = "{";
++    o += string_format("\"plan_schema_version\": %d, \"product\": ", TOSH_PLAN_SCHEMA_VERSION) + plan_product_json(p) + ", ";
+     o += "\"state\": " + jstr(tosh_plan_state_name(p.state));
+     o += ", \"mode\": " + jstr(p.mode);
++    o += ", \"code\": " + jstr(p.code) + ", \"limits\": [";
++    for (size_t i = 0; i < p.limits.size(); ++i) o += (i ? ", " : "") + jstr(p.limits[i]);
++    o += "]";
+     o += ", \"reason\": " + jstr(p.reason);
+     o += ", \"fallback\": " + jstr(p.fallback);
+     o += ", \"kv\": " + jstr(kv_name(p.kv));
+     o += string_format(", \"n_ctx\": %d, \"ubatch\": %d, \"ncmoe\": %d", p.n_ctx, p.ubatch, p.ncmoe);
+     o += string_format(", \"reserve_mib\": %.0f, \"arena_mib\": %.0f, \"min_arena_mib\": %.0f", p.reserve_mib, p.arena_mib, p.min_arena_mib);
+     o += string_format(", \"projected_private_mib\": %.0f, \"projected_free_mib\": %.0f", p.private_mib, p.free_mib);
+     o += string_format(", \"vram_total_mib\": %.0f, \"vram_free_mib\": %.0f", p.vram_total_mib, p.vram_free_mib);
+     o += string_format(", \"host_required_mib\": %.0f, \"host_ram_mib\": %.0f, \"host_available_mib\": %.0f, \"host_reserve_mib\": %.0f, \"bank_mib\": %.0f",
+                        p.host_required_mib, p.host_ram_mib, p.host_available_mib, p.host_reserve_mib, p.bank_mib);
++    o += string_format(", \"model_mib\": %.0f, \"host_weights_mib\": %.0f, \"warm_floor_mib\": %.0f, \"n_split\": %d",
++                       p.model_mib, p.host_weights_mib, p.warm_floor_mib, p.n_split);
+     o += ", \"mlock\": " + jstr(p.mlock) + ", \"dispersion\": " + jstr(p.dispersion);
++    if (p.host_policy == "runtime") {
++        o += ", \"host\": {\"policy\": " + jstr(p.host_policy) + ", \"simulated\": " + (p.host_simulated ? "true" : "false") +
++             ", \"pressure\": " + jstr(p.host_pressure) + ", \"swap_growing\": " + (p.swap_growing ? "true" : "false") +
++             ", \"full_host\": " + jstr(p.full_host_code) + ", \"bounded\": " + jstr(p.bounded_code);
++        o += string_format(", \"reclaimable_mib\": %.0f, \"wired_mib\": %.0f, \"compressed_mib\": %.0f, \"swap_used_mib\": %.0f, \"self_rss_mib\": %.0f",
++                           p.reclaimable_mib, p.wired_mib, p.compressed_mib, p.swap_used_mib, p.self_rss_mib);
++        o += string_format(", \"static_reserve_mib\": %.0f, \"headroom_mib\": %.0f, \"static_cap_mib\": %.0f, \"dynamic_cap_mib\": %.0f, \"lockable_mib\": %.0f, \"effective_mib\": %.0f",
++                           p.static_reserve_mib, p.headroom_mib, p.static_cap_mib, p.dynamic_cap_mib, p.lockable_mib, p.effective_mib);
++        o += string_format(", \"warm_mib\": %.0f, \"coverage\": %.3f, \"projected_rss_mib\": %.0f, \"projected_left_mib\": %.0f}",
++                           p.warm_mib, p.coverage, p.projected_rss_mib, p.projected_left_mib);
++    }
+     o += ", \"candidates\": [";
+     for (size_t i = 0; i < p.candidates.size(); ++i) {
+         const auto & c = p.candidates[i];
+         o += i ? ", {" : "{";
+         o += "\"name\": " + jstr(c.name) + ", \"mode\": " + jstr(c.mode) + ", \"kv\": " + jstr(kv_name(c.kv)) + ", \"valid\": " + (c.valid ? "true" : "false") + ", \"reason\": " + jstr(c.reason);
+         o += string_format(", \"ubatch\": %d, \"ncmoe\": %d, \"private_mib\": %.0f, \"free_mib\": %.0f, \"arena_mib\": %.0f, \"kv_mib\": %.0f, \"compute_mib\": %.0f}",
+                            c.ubatch, c.ncmoe, c.private_mib, c.free_mib, c.arena_mib, c.kv_mib, c.compute_mib);
+     }
+     return o + "]}";
+ }
+ 
+ static void plan_log(const tosh_plan & p) {
++    LOG_DBG("Tosh auto memory plan\n");
++    LOG_DBG("  requested context %d, VRAM %.1f GiB (%.1f free), reserve %.1f GiB\n",
+             p.n_ctx, p.vram_total_mib/1024, p.vram_free_mib/1024, p.reserve_mib/1024);
+     for (const auto & c : p.candidates) {
++        LOG_DBG("  %-22s ub %4d  private %6.0f MiB  free %6.0f MiB  arena %6.0f MiB  %s: %s\n", c.name.c_str(), c.ubatch,
+                 c.private_mib, c.free_mib, c.arena_mib, c.valid ? "valid" : "rejected", c.reason.c_str());
+     }
++    if (p.host_policy == "runtime") {
++        LOG_DBG("  host (%s): RAM %.1f GiB, reclaimable now %.1f, wired %.1f, compressed %.1f, swap %.1f%s, pressure %s\n",
++                p.host_simulated ? "simulated machine" : "this machine now", p.host_ram_mib/1024, p.reclaimable_mib/1024, p.wired_mib/1024,
++                p.compressed_mib/1024, p.swap_used_mib/1024, p.swap_growing ? " and growing" : "", p.host_pressure.c_str());
++        LOG_DBG("  host budget to add: static %.1f GiB (reserve %.1f), current %.1f GiB (headroom %.1f), lockable %.1f GiB -> %.1f GiB\n",
++                p.static_cap_mib/1024, p.static_reserve_mib/1024, p.dynamic_cap_mib/1024, p.headroom_mib/1024, p.lockable_mib/1024, p.effective_mib/1024);
++        LOG_DBG("  full host bank %.1f GiB: %s | RAM cache %.1f GiB, coverage %.2f: %s | projected RSS %.1f GiB, reclaimable left %.1f GiB\n",
++                p.bank_mib/1024, p.full_host_code.c_str(), p.warm_mib/1024, p.coverage, p.bounded_code.c_str(),
++                p.projected_rss_mib/1024, p.projected_left_mib/1024);
++    }
++    std::string limits;
++    for (const auto & l : p.limits) limits += (limits.empty() ? "" : ", ") + l;
++    LOG_DBG("  model %.1f GiB in %d file%s, expert bank %.1f GiB, other weights in host memory %.1f GiB\n",
++            p.model_mib/1024, p.n_split, p.n_split > 1 ? "s" : "", p.bank_mib/1024, p.host_weights_mib/1024);
++    LOG_DBG("  selected %s (%s, %s): %s, KV %s, ubatch %d, arena %.0f MiB, projected free %.0f MiB, host %.1f GiB%s%s%s%s\n",
++            p.mode.c_str(), p.code.c_str(), tosh_plan_state_name(p.state), p.reason.c_str(), kv_name(p.kv), p.ubatch, p.arena_mib,
++            p.free_mib, p.host_required_mib/1024, p.fallback.empty() ? "" : "; ", p.fallback.c_str(),
++            limits.empty() ? "" : "; limits: ", limits.c_str());
++    std::string warn;
++    for (const auto & w : p.warnings) warn += (warn.empty() ? "" : ",") + w;
++    if (p.plan_mode == TOSH_PLAN_MODE_UNSUPPORTED) {
++        LOG_INF("Tosh Dynamic MoE: mode=%s reason=%s limits=%s required_host=%.1fGiB available_host=%.1fGiB required_vram=%.1fGiB available_vram=%.1fGiB\n",
++                p.code.c_str(), p.primary_reason.c_str(), limits.c_str(), p.required_host_mib/1024, p.available_host_mib/1024,
++                p.required_vram_mib/1024, p.available_vram_mib/1024);
++    } else {
++        LOG_INF("Tosh Dynamic MoE: mode=%s reason=%s%s%s rss=%.1fGiB vram=%.1fGiB warm=%.1fGiB hot=%.1fGiB coverage=%.2f %s ctx=%d kv=%s ub=%d%s\n",
++                p.code.c_str(), p.primary_reason.c_str(), warn.empty() ? "" : " warnings=", warn.c_str(), p.projected_rss_mib/1024,
++                p.private_mib/1024, p.warm_mib/1024, p.arena_mib/1024, p.coverage, p.coverage_state.c_str(), p.n_ctx, kv_name(p.kv), p.ubatch,
++                p.ncmoe > 0 ? string_format(" ncmoe=%d", p.ncmoe).c_str() : "");
++    }
+ }
+ 
+ static void add_override(common_params & params, const char * pattern) {
+     auto & ov = params.tensor_buft_overrides;
+     for (auto & o : ov) {
+         if (o.pattern == nullptr) {
+             o = { pattern, ggml_backend_cpu_buffer_type() };
+             break;
+         }
+     }
+     if (ov.empty() || ov.back().pattern != nullptr) {
+         ov.push_back({ nullptr, nullptr });
+     }
+ }
+ 
++// log, plan file and dry run; returns only when the caller should go on
++static tosh_plan g_last_plan;
++static bool      g_planned = false;
++
++static void plan_emit(const tosh_plan & p) {
++    g_last_plan = p;
++    g_planned = true;
++    plan_log(p);
++    if (const char * f = getenv("TOSH_AUTO_PLAN_FILE")) {
++        if (FILE * fp = fopen(f, "w")) {
++            fprintf(fp, "%s\n", tosh_plan_json(p).c_str());
++            fclose(fp);
++        }
++        if (getenv("TOSH_DMOE_STATUS_FILE") == nullptr) {
++            setenv("TOSH_DMOE_STATUS_FILE", (std::string(f) + ".runtime").c_str(), 1);
++        }
++    }
++    const char * dry = getenv("TOSH_AUTO_DRY_RUN");
++    if (dry != nullptr && strcmp(dry, "exit") == 0) {
++        // a caller previews the plan of these exact arguments without loading anything
++        printf("%s\n", tosh_plan_json(p).c_str());
++        fflush(stdout);
++        exit(p.state == TOSH_PLAN_UNSUPPORTED ? 2 : 0);
++    }
++}
++
+ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
++    // precedence: TOSH_DMOE_* set by hand, then TOSH_AUTO, then --dynamic-moe, then the standard path
+     const char * mode_env = getenv("TOSH_AUTO");
++    g_runtime_default = params.dynamic_moe;
++    if (mode_env == nullptr && params.dynamic_moe) mode_env = "1";
+     if (mode_env == nullptr || strcmp(mode_env, "0") == 0 || strcmp(mode_env, "off") == 0) {
+         return false;
+     }
+     if (getenv("TOSH_DMOE_CACHE_MIB") != nullptr || getenv("TOSH_DMOE_RESIDENCY") != nullptr) {
+         LOG_WRN("%s: TOSH_DMOE_* set by hand, the auto plan steps aside\n", __func__);
+         return false;
+     }
+     std::string force = (strcmp(mode_env, "1") == 0 || strcmp(mode_env, "auto") == 0) ? "" : mode_env;
+     // nodmoe: auto without mixed execution, the retry after the expert bank could not be locked
+     const bool no_dmoe = force == "nodmoe";
+     if (no_dmoe) force.clear();
+ 
+     tosh_plan p;
+     const moe_info mi = read_moe_info(params.model.path.c_str());
++    p.n_split = mi.n_split; p.model_mib = mi.total_mib; p.warm_floor_mib = mi.warm_floor_mib;
++    if (!mi.error.empty()) {
++        p.state = TOSH_PLAN_UNSUPPORTED; p.mode = "none";
++        p.plan_mode = TOSH_PLAN_MODE_UNSUPPORTED; p.code = tosh_plan_mode_name(p.plan_mode);
++        p.primary_reason = "SPLIT_GGUF_METADATA_ERROR"; p.limiting_resource = "METADATA";
++        p.limits = { "SPLIT_GGUF_METADATA_ERROR", "NO_SAFE_FALLBACK" };
++        p.reason = mi.error;
++        plan_emit(p);
++        if (out) *out = p;
++        return false;
++    }
+     if (!mi.moe) {
+         if (out) *out = p;
+         return false;
+     }
+ 
+     p.n_ctx = params.n_ctx > 0 ? params.n_ctx : std::min(mi.n_ctx_train, 32768);
+     p.bank_mib = mi.bank_mib;
+     const double per_expert = mi.bank_mib/std::max(1, mi.n_moe*mi.n_expert);
+     // below one token's worth of experts the arena mostly misses and the host does the work
+     p.min_arena_mib = std::max(256.0, env_mib("TOSH_AUTO_MIN_ARENA_MIB", mi.n_moe*mi.n_used*per_expert));
+     // each chunk touches most experts when every token picks a large share of them
+     const bool high = mi.n_expert > 0 && (double) mi.n_used/mi.n_expert > 1.0/16;
+     p.dispersion = high ? "high" : "normal";
+ 
++    const host_mem hi0 = read_host_info();
++    const auto t_snapshot = std::chrono::steady_clock::now();
++    p.host_ram_mib     = hi0.ram_mib;
++    p.host_reserve_mib = env_mib("TOSH_AUTO_HOST_RESERVE_MIB", std::max(6144.0, 0.25*hi0.ram_mib));
+ 
+     // cache types to consider
+     std::vector<ggml_type> kvs;
+     const std::string kv_env = getenv("TOSH_AUTO_KV") ? getenv("TOSH_AUTO_KV") : "auto";
+     if (kv_env == "auto") {
+         kvs = { GGML_TYPE_F16, GGML_TYPE_Q8_0 };
+     } else {
+         const ggml_type t = kv_env == "f16" ? GGML_TYPE_F16 : kv_env == "q8_0" ? GGML_TYPE_Q8_0 :
+@@ -325,58 +620,145 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         f.model += mi.bank_mib;
+         f.host_model = std::max(0.0, f.host_model - mi.bank_mib);
+         full.push_back({ kvs[k], f });
+     }
+     if (!read_vram(p.vram_free_mib, p.vram_total_mib)) {
+         LOG_WRN("%s: no GPU memory reading, planning off\n", __func__);
+         return false;
+     }
++    // every weight the probe left in host memory besides the bank: embeddings, per-layer inputs
++    p.host_weights_mib = dm[0][0].ok ? std::max(mi.embd_mib, dm[0][0].host_model - mi.bank_mib) : mi.embd_mib;
++    const bool runtime = host_policy_runtime() && dmoe_built;
++    const tosh_plan base = p;
++
++    // the decision from one host memory snapshot; run again when memory changed before committing
++    auto decide = [&](const host_mem & hi) -> const tosh_plan_candidate * {
++    p = base;
++    p.host_available_mib = hi.available_mib;
++    const double host_engine = p.host_weights_mib + dm[0][0].host_other + 1024.0;
+     const double host_dmoe   = mi.bank_mib + host_engine;
+     std::string dmoe_block;
+     if (!dmoe_built) {
+         dmoe_block = "engine built without Dynamic MoE";
+     } else if (hi.ram_mib > 0 && host_dmoe + p.host_reserve_mib > hi.ram_mib) {
+         dmoe_block = string_format("host RAM: %.1f GiB needed + %.1f GiB reserve > %.1f GiB",
+                                    host_dmoe/1024, p.host_reserve_mib/1024, hi.ram_mib/1024);
+     } else if (hi.available_mib > 0 && host_dmoe + HOST_MARGIN_MIB > hi.available_mib) {
+         dmoe_block = string_format("host RAM: %.1f GiB needed, %.1f GiB available now", host_dmoe/1024, hi.available_mib/1024);
++    } else if (hi.wire_limit_mib > 0 && mi.bank_mib + p.host_weights_mib > hi.wire_limit_mib - hi.wired_mib) {
++        dmoe_block = string_format("DMOE_HOST_BANK_NOT_LOCKABLE: %.1f GiB bank and host weights > %.1f GiB lockable",
++                                   (mi.bank_mib + p.host_weights_mib)/1024, (hi.wire_limit_mib - hi.wired_mib)/1024);
+     }
+     p.mlock = dmoe_block.rfind("DMOE_HOST_BANK_NOT_LOCKABLE", 0) == 0 ? "not_lockable" : "required";
+ 
++    // runtime host policy: every cap is memory this load may still add; the whole bank only when
++    // it fits all three with the machine calm, else the largest RAM cache that does
++    const double staging_mib = 128.0;
++    double bounded_warm = 0;
++    bool full_host_ok = true;
++    const bool lean = runtime && host_bank_lean();
++    if (runtime) {
++        p.host_policy = "runtime";
++        p.host_simulated = hi.simulated; p.swap_growing = hi.swap_growing;
++        p.reclaimable_mib = hi.reclaimable_mib; p.wired_mib = hi.wired_mib; p.compressed_mib = hi.compressed_mib;
++        p.swap_used_mib = hi.swap_used_mib; p.self_rss_mib = hi.self_rss_mib;
++        p.host_pressure = hi.pressure_level >= 4 ? "CRITICAL" : hi.pressure_level >= 2 || hi.swap_growing ? "ELEVATED" : "NORMAL";
++        p.static_reserve_mib = env_mib("TOSH_AUTO_HOST_RESERVE_MIB", std::max(6144.0, 0.20*hi.ram_mib));
++        p.headroom_mib   = env_mib("TOSH_AUTO_HOST_HEADROOM_MIB", std::clamp(0.15*hi.ram_mib, 4096.0, 12288.0));
++        p.static_cap_mib = std::max(0.0, hi.ram_mib - p.static_reserve_mib - hi.self_rss_mib);
++        p.dynamic_cap_mib = std::max(0.0, hi.reclaimable_mib - p.headroom_mib);
++        p.lockable_mib   = std::max(0.0, hi.wire_limit_mib - hi.wired_mib - 1024.0);
++        p.effective_mib  = std::min(p.static_cap_mib, p.dynamic_cap_mib);
++        p.full_host_code = p.host_pressure != "NORMAL"           ? "HOST_MEMORY_PRESSURE_HIGH" :
++                           host_dmoe > p.static_cap_mib           ? "FULL_HOST_STATIC_LIMIT" :
++                           host_dmoe > p.dynamic_cap_mib          ? "FULL_HOST_CURRENT_RAM_LIMIT" :
++                           mi.bank_mib + p.host_weights_mib > p.lockable_mib ? "FULL_HOST_WIRE_LIMIT" : "FULL_HOST_SAFE";
++        if (lean && p.full_host_code == "FULL_HOST_SAFE") p.full_host_code = "FULL_HOST_NOT_WANTED";
++        full_host_ok = p.full_host_code == "FULL_HOST_SAFE";
++        dmoe_block = full_host_ok ? "" : string_format("%s: %.1f GiB to add, %.1f GiB allowed now", p.full_host_code.c_str(),
++                                                        host_dmoe/1024, std::min(p.effective_mib, p.lockable_mib + host_engine)/1024);
++        if (full_host_ok) {
++            p.bounded_code = "NOT_NEEDED";
++        } else if (p.host_pressure == "CRITICAL") {
++            p.bounded_code = "HOST_MEMORY_PRESSURE_HIGH";
++        } else {
++            // under elevated pressure the cache takes half of what is left
++            const double budget = p.effective_mib*(p.host_pressure == "ELEVATED" ? 0.5 : 1.0) - host_engine - staging_mib;
+             // the weights kept in RAM and the staging are locked too
+             bounded_warm = std::min({ mi.bank_mib, budget, p.lockable_mib - host_engine - staging_mib });
++            p.bounded_code = bounded_warm >= mi.warm_floor_mib ? "BOUNDED_HOST_SELECTED" :
++                             p.lockable_mib < mi.warm_floor_mib ? "HOST_MEMORY_LOCK_LIMIT" :
++                             bounded_warm > 0 ? "STRUCTURAL_WARM_TOO_SMALL" : "BOUNDED_HOST_CURRENT_RAM_TOO_LOW";
++            // the cache refuses to start below one layer's experts per size, a prefill chunk can pin them all
++            if (bounded_warm < mi.warm_floor_mib) {
++                if (p.bounded_code == "STRUCTURAL_WARM_TOO_SMALL") {
++                    dmoe_block += string_format("; STRUCTURAL_WARM_TOO_SMALL: %.0f MiB RAM cache < %.0f MiB, one layer per expert size",
++                                                bounded_warm, mi.warm_floor_mib);
++                }
++                bounded_warm = 0;
++            }
++        }
++        p.mlock = "required";
++    }
++
+     const double slots    = 3.0*mi.max_tensor_mib;   // prefill uploads
+     const double overhead = env_mib("TOSH_DMOE_OVERHEAD_MIB", 64);
+     const double weights_full = full[0].second.ok ? full[0].second.model : mi.bank_mib;
+     const bool weights_fit = weights_full + 512.0 <= p.vram_free_mib;
+ 
++    // the code of what rules a host mode out, from the checks above
++    auto host_limit = [&](const std::string & why) -> const char * {
++        return why.find("STATIC_LIMIT") != std::string::npos || why.find("reserve >") != std::string::npos ? "STATIC_RAM_LIMIT" :
++               why.find("WIRE_LIMIT") != std::string::npos || why.find("NOT_LOCKABLE") != std::string::npos ||
++               why.find("LOCK_LIMIT") != std::string::npos ? "WIRE_LIMIT" :
++               why.find("STRUCTURAL_WARM") != std::string::npos ? "STRUCTURAL_WARM_TOO_SMALL" :
++               why.find("COVERAGE") != std::string::npos ? "COVERAGE_TOO_LOW" :
++               why.find("PRESSURE") != std::string::npos ? "HOST_MEMORY_PRESSURE_HIGH" : "CURRENT_RAM_LIMIT";
++    };
+     auto evaluate = [&](double R) {
+         p.candidates.clear();
+         p.reserve_mib = R;
+         for (auto & [kv, pr] : full) {
+             tosh_plan_candidate c;
+             c.name = std::string("full_gpu+") + kv_name(kv); c.mode = "full_gpu"; c.kv = kv; c.ubatch = ub_full;
+             c.private_mib = pr.model + pr.context + pr.compute;
+             c.free_mib    = p.vram_free_mib - c.private_mib;
+             c.kv_mib = pr.context; c.compute_mib = pr.compute;
+             c.valid  = pr.ok && c.free_mib >= R;
++            c.need_vram_mib = c.private_mib + R; c.need_host_mib = host_engine;
+             c.reason = !pr.ok ? "probe failed" : c.valid ? "fits with the reserve" :
++                       c.free_mib >= 0 ? "VRAM_LIMIT: loads, but leaves less than the reserve for the requested context" : "VRAM_LIMIT: does not fit";
+             p.candidates.push_back(c);
+         }
+         for (size_t k = 0; k < kvs.size() && dmoe_built; ++k) {
+             for (int u = 0; u < 3; ++u) {
+                 const probe & pr = dm[k][u];
+                 tosh_plan_candidate c;
+                 c.name = std::string("dmoe+") + kv_name(kvs[k]); c.mode = "dmoe"; c.kv = kvs[k]; c.ubatch = ubs[u];
+                 const double base = pr.model + pr.context + pr.compute;
+                 c.arena_mib   = std::max(0.0, p.vram_free_mib - base - slots - overhead - R);
+                 c.private_mib = base + slots + overhead + c.arena_mib;
+                 c.free_mib    = p.vram_free_mib - c.private_mib;
+                 c.kv_mib = pr.context; c.compute_mib = pr.compute;
++                c.need_vram_mib = base + slots + overhead + p.min_arena_mib + R;
++                c.need_host_mib = !runtime || full_host_ok ? host_dmoe :
++                                  host_engine + staging_mib + std::max(mi.warm_floor_mib, mi.bank_mib*BOUNDED_MIN_COVERAGE - c.arena_mib);
++                // a bounded cache must still cover the bank together with the arena
++                std::string host_reason = dmoe_block;
++                if (!host_reason.empty() && bounded_warm > 0) {
++                    const double cov = (c.arena_mib + bounded_warm)/mi.bank_mib;
++                    host_reason = cov >= BOUNDED_MIN_COVERAGE ? "" :
++                                  string_format("BOUNDED_HOST_COVERAGE_REJECTED: %.1f GiB RAM cache, coverage %.2f", bounded_warm/1024, cov);
++                }
++                c.valid  = pr.ok && host_reason.empty() && c.arena_mib >= p.min_arena_mib;
++                c.reason = !pr.ok ? "probe failed" : !host_reason.empty() ? host_reason :
++                           c.valid ? (dmoe_block.empty() ? "context and reserve kept" :
++                                      string_format("context and reserve kept, %.1f GiB of the bank in RAM", bounded_warm/1024)) :
++                           string_format("VRAM_LIMIT: arena %.0f MiB under the useful minimum %.0f", c.arena_mib, p.min_arena_mib);
+                 p.candidates.push_back(c);
+             }
+         }
+         // legacy: the fewest layers of experts on the host that leave the reserve
+         for (auto & [kv, pr] : full) {
+             tosh_plan_candidate c;
+             c.name = std::string("legacy+") + kv_name(kv); c.mode = "legacy_offload"; c.kv = kv; c.ubatch = ub_full;
+             const double per_layer = mi.bank_mib/std::max(1, mi.n_moe);
+@@ -384,16 +766,26 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+             for (int n = 1; n <= mi.n_layer && pr.ok; ++n) {
+                 const double priv = full_priv - n*per_layer + slots;
+                 if (p.vram_free_mib - priv >= R) {
+                     c.ncmoe = n; c.private_mib = priv; c.free_mib = p.vram_free_mib - priv; c.valid = true;
+                     break;
+                 }
+             }
+             c.kv_mib = pr.context; c.compute_mib = pr.compute;
++            const double host_legacy = mi.bank_mib*c.ncmoe/std::max(1, mi.n_moe) + p.host_weights_mib + 1024.0;
++            c.need_vram_mib = (c.valid ? c.private_mib : full_priv - mi.bank_mib + slots) + R;
++            c.need_host_mib = c.valid ? host_legacy : mi.bank_mib + p.host_weights_mib + 1024.0;
++            const bool host_ok = runtime ? p.host_pressure != "CRITICAL" && host_legacy <= p.effective_mib :
++                                 hi.available_mib <= 0 || host_legacy + HOST_MARGIN_MIB <= hi.available_mib;
++            const double host_allowed = runtime ? p.effective_mib : hi.available_mib - HOST_MARGIN_MIB;
++            c.reason = !c.valid ? "VRAM_LIMIT: does not fit" : !host_ok ?
++                string_format("%s: %d layers of experts on the host need %.1f GiB, %.1f GiB allowed now",
++                              runtime && p.effective_mib == p.static_cap_mib ? "STATIC_RAM_LIMIT" : "CURRENT_RAM_LIMIT",
++                              c.ncmoe, host_legacy/1024, host_allowed/1024) :
+                 string_format("%d layers of experts on the host", c.ncmoe);
+             c.valid = c.valid && host_ok;
+             p.candidates.push_back(c);
+         }
+     };
+ 
+     auto find = [&](const std::string & mode, ggml_type kv, int ub) -> tosh_plan_candidate * {
+         for (auto & c : p.candidates) if (c.mode == mode && c.kv == kv && (ub == 0 || c.ubatch == ub)) return &c;
+@@ -416,16 +808,39 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+ 
+     const tosh_plan_candidate * sel = nullptr;
+     // VRAM kept free after every known allocation, for the desktop and other apps; the plan
+     // already counts weights, KV, compute, prefill slots and the driver margin
+     // an MTP head adds its own context and buffers after the plan; past the reserve the driver pages
+     // GPU memory into wired RAM, which slows every token and can use up the host
+     const auto & spec_types = params.speculative.types;
+     const bool mtp = std::find(spec_types.begin(), spec_types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != spec_types.end();
++    // a head that comes as its own file loads its weights after the plan as well
++    double mtp_mib = 0;
++    bool head_file = false;
++    if (mtp) {
++        std::error_code ec;
++        const std::string & head = params.speculative.draft.mparams.path;
++        const auto head_bytes = head.empty() ? 0 : std::filesystem::file_size(head, ec);
++        head_file = !head.empty() && !ec;
++        mtp_mib = env_mib("TOSH_AUTO_MTP_RESERVE_MIB", 768.0 + (head_file ? head_bytes/MiB : 0.0));
++    }
++    // the app's VRAM reserve setting replaces the default share of the card; the head adds to either
++    const double reserve_base = env_mib("GGML_METAL_VRAM_RESERVE_MB", std::clamp(RESERVE_FRACTION*p.vram_total_mib, RESERVE_MIN_MIB, RESERVE_MAX_MIB));
++    const double reserve_pref = env_mib("TOSH_AUTO_RESERVE_MIB", reserve_base + mtp_mib);
++    std::vector<double> reserves = { reserve_pref, env_mib("TOSH_AUTO_MIN_RESERVE_MIB", std::max(512.0, reserve_pref - 256.0)) };
++    // the head is optional: where it leaves no room, the plan is made again without it
++    const size_t n_with_head = reserves.size();
++    if (mtp_mib > 0) {
++        reserves.push_back(reserve_pref - mtp_mib);
++        reserves.push_back(std::max(512.0, reserve_pref - mtp_mib - 256.0));
++    }
++    p.mtp_head_dropped = false;
++    for (size_t ri = 0; ri < reserves.size(); ++ri) {
++        const double R = reserves[ri];
+         evaluate(R);
+         const tosh_plan_candidate * f16 = find("full_gpu", kvs[0], 0);
+         const tosh_plan_candidate * q8  = kvs.size() > 1 ? find("full_gpu", kvs[1], 0) : nullptr;
+         if (force.empty() || force == "full") {
+             if (f16 && f16->valid) { sel = f16; p.reason = "the model and the requested context fit with the reserve"; }
+             else if (q8 && q8->valid) { sel = q8; p.reason = "q8_0 cache makes the full model fit with the reserve"; }
+         }
+         if (sel == nullptr && !no_dmoe && (force.empty() || force == "dmoe")) {
+@@ -442,59 +857,196 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+         }
+         if (sel == nullptr && (force.empty() || force == "legacy")) {
+             const tosh_plan_candidate * l16 = find("legacy_offload", kvs[0], 0);
+             const tosh_plan_candidate * l8  = kvs.size() > 1 ? find("legacy_offload", kvs[1], 0) : nullptr;
+             if (l16 && l16->valid) sel = l16; else if (l8 && l8->valid) sel = l8;
+             if (sel) p.reason = "mixed execution is not available here; expert layers go to the host";
+         }
+         if (sel) {
++            p.mtp_head_dropped = ri >= n_with_head;
++            if (R < reserves[p.mtp_head_dropped ? n_with_head : 0]) p.fallback = string_format("reserve lowered to %.1f GiB", R/1024);
+             break;
+         }
+     }
+ 
+     if (sel == nullptr) {
+         p.state  = TOSH_PLAN_UNSUPPORTED;
+         p.mode   = "none";
++        p.code   = "PLAN_UNSUPPORTED";
+         p.reason = "no configuration fits the requested context with the minimum reserve";
+     } else {
+         p.mode = sel->mode; p.kv = sel->kv; p.ubatch = sel->ubatch; p.ncmoe = sel->ncmoe;
+         p.arena_mib = sel->arena_mib; p.private_mib = sel->private_mib; p.free_mib = sel->free_mib;
++        p.code = sel->mode == "full_gpu" ? "PLAN_FULL_GPU" : sel->mode == "legacy_offload" ? "PLAN_CLASSIC_NCMOE" :
++                 runtime && !full_host_ok ? "PLAN_BOUNDED_DMOE" : "PLAN_FULL_HOST_DMOE";
+         if (sel->mode == "full_gpu") {
+             p.state = TOSH_PLAN_FULL_GPU_OPTIMAL;
+             p.host_required_mib = host_engine;
+             p.mlock = "not_required";
++        } else if (sel->mode == "dmoe" && runtime && !full_host_ok) {
++            p.state = TOSH_PLAN_DMOE_BOUNDED_HOST;
++            p.mode  = "dmoe_bounded";
++            p.warm_mib = !lean ? bounded_warm :
++                         std::min(bounded_warm, std::max(mi.warm_floor_mib, mi.bank_mib*LEAN_COVERAGE - sel->arena_mib));
++            p.coverage = (sel->arena_mib + p.warm_mib)/mi.bank_mib;
++            p.bounded_code = p.coverage >= BOUNDED_GOOD_COVERAGE ? "BOUNDED_HOST_COVERAGE_GOOD" : "BOUNDED_HOST_COVERAGE_CONSTRAINED";
++            p.host_required_mib = host_engine + p.warm_mib + staging_mib;
++            p.fallback = dmoe_block;
+         } else if (sel->mode == "dmoe") {
+             p.state = weights_fit ? TOSH_PLAN_DMOE_CONTEXT_OPTIMAL : TOSH_PLAN_DMOE_CAPACITY_REQUIRED;
+             p.host_required_mib = host_dmoe;
++            if (runtime) p.coverage = (sel->arena_mib + mi.bank_mib)/mi.bank_mib;
+         } else {
+             p.state = TOSH_PLAN_LEGACY_OFFLOAD_BETTER;
+             p.host_required_mib = mi.bank_mib*sel->ncmoe/std::max(1, mi.n_moe) + host_engine;
+             p.mlock = "not_required";
+             if (!dmoe_block.empty()) p.fallback = dmoe_block;
+         }
+     }
++    if (runtime) {
++        if (sel == nullptr || sel->mode != "dmoe" || full_host_ok) {
++            if (p.bounded_code == "BOUNDED_HOST_SELECTED") p.bounded_code = "BOUNDED_HOST_COVERAGE_REJECTED";
++        }
++        p.projected_rss_mib  = hi.self_rss_mib + p.host_required_mib;
++        p.projected_left_mib = hi.reclaimable_mib - p.host_required_mib;
++    }
++    // what ruled out each mode preferred over the selected one
++    const auto tier = [](const std::string & m) { return m == "full_gpu" ? 0 : m == "dmoe" ? 1 : 2; };
++    const int sel_tier = sel ? tier(sel->mode) : 3;
++    for (const auto & c : p.candidates) {
++        if (c.valid || tier(c.mode) >= sel_tier || c.reason == "probe failed") continue;
++        const char * code = c.reason.rfind("VRAM_LIMIT", 0) == 0 ? "VRAM_LIMIT" : host_limit(c.reason);
++        if (std::find(p.limits.begin(), p.limits.end(), code) == p.limits.end()) p.limits.push_back(code);
++    }
++    if (sel == nullptr) p.limits.push_back("NO_SAFE_FALLBACK");
++
++    // product view: the mode, why it and not the preferred one, and what to watch
++    auto has_limit = [&](const char * l) { return std::find(p.limits.begin(), p.limits.end(), l) != p.limits.end(); };
++    if (sel == nullptr) {
++        p.plan_mode = TOSH_PLAN_MODE_UNSUPPORTED;
++        p.primary_reason = "NO_SAFE_FALLBACK";
++        bool vram_ok = false;
++        p.required_vram_mib = p.required_host_mib = 0;
++        for (const auto & c : p.candidates) {
++            if (c.need_vram_mib > 0 && (p.required_vram_mib == 0 || c.need_vram_mib < p.required_vram_mib)) p.required_vram_mib = c.need_vram_mib;
++            if (c.need_vram_mib > 0 && c.need_vram_mib <= p.vram_free_mib) {
++                vram_ok = true;
++                if (p.required_host_mib == 0 || c.need_host_mib < p.required_host_mib) p.required_host_mib = c.need_host_mib;
++            }
++        }
++        p.available_vram_mib = p.vram_free_mib;
++        p.available_host_mib = runtime ? std::min(p.effective_mib, p.lockable_mib + host_engine) : std::max(0.0, hi.available_mib - HOST_MARGIN_MIB);
++        p.limiting_resource  = !vram_ok ? "VRAM" : has_limit("WIRE_LIMIT") && !has_limit("CURRENT_RAM_LIMIT") ? "WIRE" : "HOST_RAM";
++    } else if (sel->mode == "full_gpu") {
++        p.plan_mode = TOSH_PLAN_MODE_FULL_GPU;
++        p.primary_reason = "FULL_GPU_FITS";
++        p.limiting_resource = "NONE";
++    } else if (sel->mode == "legacy_offload") {
++        p.plan_mode = TOSH_PLAN_MODE_CLASSIC_NCMOE;
++        p.primary_reason = "CLASSIC_NCMOE_FALLBACK";
++        p.limiting_resource = has_limit("WIRE_LIMIT") && !has_limit("CURRENT_RAM_LIMIT") ? "WIRE" : dmoe_built ? "HOST_RAM" : "VRAM";
++    } else if (runtime && !full_host_ok) {
++        p.plan_mode = TOSH_PLAN_MODE_BOUNDED_DMOE;
++        p.primary_reason = p.full_host_code == "FULL_HOST_NOT_WANTED"   ? "HOST_RAM_SAVING" :
++                           p.full_host_code == "FULL_HOST_STATIC_LIMIT" ? "STATIC_RAM_LIMIT" :
++                           p.full_host_code == "FULL_HOST_WIRE_LIMIT"   ? "WIRE_LIMIT" :
++                           p.full_host_code == "HOST_MEMORY_PRESSURE_HIGH" ? "HOST_MEMORY_PRESSURE_HIGH" : "CURRENT_RAM_LIMIT";
++        p.limiting_resource = p.primary_reason == "WIRE_LIMIT" ? "WIRE" : "HOST_RAM";
++    } else {
++        p.plan_mode = TOSH_PLAN_MODE_FULL_HOST_DMOE;
++        p.primary_reason = "FULL_HOST_SAFE";
++        p.limiting_resource = "VRAM";
++        p.coverage = (sel->arena_mib + mi.bank_mib)/mi.bank_mib;
+     }
++    p.code = tosh_plan_mode_name(p.plan_mode);
++    if (sel) p.kv_mib = sel->kv_mib;
++    if (p.plan_mode == TOSH_PLAN_MODE_FULL_HOST_DMOE || p.plan_mode == TOSH_PLAN_MODE_BOUNDED_DMOE) {
++        p.coverage_state = p.coverage >= BOUNDED_GOOD_COVERAGE ? "GOOD" : p.coverage >= BOUNDED_MIN_COVERAGE ? "CONSTRAINED" : "REJECT";
++        if (p.coverage_state == "CONSTRAINED") p.warnings.push_back("COVERAGE_CONSTRAINED");
++    }
++    if (sel && sel->mode != "full_gpu" && p.projected_rss_mib == 0) p.projected_rss_mib = hi.self_rss_mib + p.host_required_mib;
++    // the server keeps context checkpoints and a prompt cache in RAM; they take what the plan leaves,
++    // checkpoints first since they spare re-reading a conversation, and the model before both
++    double left = runtime ? p.effective_mib - p.host_required_mib : hi.available_mib - HOST_MARGIN_MIB - p.host_required_mib;
++        p.n_ctx_checkpoints = std::min(params.n_ctx_checkpoints, (int) std::max(0.0, std::floor(left/p.checkpoint_mib)));
++        if (p.n_ctx_checkpoints < params.n_ctx_checkpoints) p.warnings.push_back("CONTEXT_CHECKPOINTS_REDUCED");
++        left -= p.n_ctx_checkpoints*p.checkpoint_mib;
++        p.projected_rss_mib += p.n_ctx_checkpoints*p.checkpoint_mib;
++    } else {
++        p.n_ctx_checkpoints = params.n_ctx_checkpoints;
++    }
++    if (sel && params.cache_ram_mib != 0) {
++        const double want = params.cache_ram_mib > 0 ? params.cache_ram_mib : std::max(0.0, left);
++        p.prompt_cache_mib = std::clamp(std::floor(left), 0.0, want);
++        if (p.prompt_cache_mib < want) p.warnings.push_back("PROMPT_CACHE_REDUCED");
++        p.projected_rss_mib += p.prompt_cache_mib;
++    }
++    if (p.fallback.rfind("reserve lowered", 0) == 0) p.warnings.push_back("RESERVE_LOWERED");
++    if (runtime && p.host_pressure == "ELEVATED") p.warnings.push_back("HOST_MEMORY_PRESSURE_ELEVATED");
++    if (runtime && hi.swap_growing) p.warnings.push_back("SWAP_GROWING");
++    if (hi.simulated) p.warnings.push_back("SIMULATED_HOST");
++    return sel;
++    };
++
++    const tosh_plan_candidate * sel = decide(hi0);
++    // the probes take seconds: if memory went elsewhere meanwhile, the plan is made again, once
++    if (runtime && sel != nullptr && sel->mode != "full_gpu" && !hi0.simulated) {
++        const host_mem hi1 = read_host_info();
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_snapshot).count();
++        const bool changed = hi0.reclaimable_mib - hi1.reclaimable_mib > STALE_DROP_MIB ||
++                             hi1.pressure_level > hi0.pressure_level || (hi1.swap_growing && !hi0.swap_growing);
++        if (changed) {
++            LOG_WRN("%s: memory changed while planning (reclaimable %.1f -> %.1f GiB), planning again\n",
++                    __func__, hi0.reclaimable_mib/1024, hi1.reclaimable_mib/1024);
++            sel = decide(hi1);
++            p.warnings.push_back("REPLANNED_AFTER_MEMORY_CHANGE");
++        }
++        p.recheck_ms = ms;
++    }
++    if (p.mtp_head_dropped) p.warnings.push_back("MTP_HEAD_DROPPED");
++    plan_emit(p);
+     if (out) *out = p;
++    if (getenv("TOSH_AUTO_DRY_RUN") != nullptr || sel == nullptr) {
+         return false;
+     }
+ 
+     // apply: the plan owns memory from here
++    if (p.mtp_head_dropped) {
++        LOG_WRN("%s: the MTP head does not fit beside the model, starting without it\n", __func__);
++        auto & types = params.speculative.types;
++        types.erase(std::remove(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP), types.end());
++        if (types.empty()) types = { COMMON_SPECULATIVE_TYPE_NONE };
++        params.speculative.draft.mparams = common_params_model();
++    }
+     params.fit_params = false;
+     params.n_gpu_layers = 999;
+     params.cache_type_k = p.kv;
+     params.cache_type_v = p.kv;
+     params.n_ctx = p.n_ctx;
+     params.n_ubatch = p.ubatch;
+     params.n_batch  = std::max(params.n_batch, p.ubatch);
++    if (params.cache_ram_mib != 0) params.cache_ram_mib = (int32_t) p.prompt_cache_mib;
++    params.n_ctx_checkpoints = p.n_ctx_checkpoints;
+     if (p.mode != "full_gpu") {
+         params.no_extra_bufts = true;
+     }
++    if (p.mode == "dmoe" || p.mode == "dmoe_bounded") {
+         add_override(params, experts_pattern());
+         params.load_mode = LLAMA_LOAD_MODE_MLOCK;
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++        if (p.mode == "dmoe_bounded") {
++            // the bank stays in the file; the locked RAM cache is the host cache's own allocation
++            params.load_mode = LLAMA_LOAD_MODE_NONE;
++            setenv("TOSH_DMOE_HOST_CACHE_MIB", string_format("%.0f", p.warm_mib).c_str(), 1);
++            setenv("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(TOSH_DMOE_MAX_TOKENS + 1).c_str(), 1);
++            // fill the cache from the file while it is locked, until the server is ready
++            setenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB", "max", 0);
++        }
++#endif
+         setenv("TOSH_DMOE_CACHE_MIB", "auto", 1);
+         setenv("TOSH_DMOE_RESERVE_MIB", string_format("%.0f", p.reserve_mib).c_str(), 1);
+         setenv("TOSH_DMOE_MIN_ARENA_MIB", string_format("%.0f", p.min_arena_mib).c_str(), 1);
+         setenv("TOSH_DMOE_RARE_ROWS", "auto", 0);
+         setenv("TOSH_DMOE_RARE_TAIL", "0", 0);
+         setenv("GGML_SCHED_PREFETCH_EXPERTS", "1", 0);
+         setenv("GGML_CPU_NO_REPACK", "1", 0);
+         // the host executor computes the missed experts on every core; the backend's own threads find little
+@@ -506,17 +1058,60 @@ bool tosh_plan_apply(common_params & params, tosh_plan * out) {
+                     cp->n_threads = cpu_threads;
+                 }
+             }
+         }
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+         tosh_dmoe_enable();
+ #endif
+     } else if (p.mode == "legacy_offload") {
++        // the host share is sized as anonymous memory, as with the expert bank
++        if (params.load_mode == LLAMA_LOAD_MODE_AUTO) params.load_mode = LLAMA_LOAD_MODE_NONE;
+         for (int i = 0; i < p.ncmoe; ++i) {
+             pattern_store().push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
+             add_override(params, pattern_store().back().c_str());
+         }
+         setenv("GGML_SCHED_PREFETCH_EXPERTS", "1", 0);
+         setenv("GGML_CPU_NO_REPACK", "1", 0);
+     }
+     return true;
+ }
++
++void tosh_plan_report_load(const char * result, const char * detail) {
++    const char * f = getenv("TOSH_AUTO_PLAN_FILE");
++    if (!g_planned || f == nullptr) return;
++    const tosh_plan & p = g_last_plan;
++    double rss_mib = 0, footprint_mib = 0, vram_free = 0, vram_total = 0;
++    GGML_UNUSED(vram_total);
++#ifdef __APPLE__
++    mach_task_basic_info_data_t ti; mach_msg_type_number_t tn = MACH_TASK_BASIC_INFO_COUNT;
++    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t) &ti, &tn) == KERN_SUCCESS) rss_mib = ti.resident_size/MiB;
++    // resident also counts clean file pages the system can drop; the footprint is what the plan commits
++    task_vm_info_data_t vi; mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
++    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &vi, &vn) == KERN_SUCCESS) footprint_mib = vi.phys_footprint/MiB;
++#endif
++    // this process's private Metal memory; else the card's live free memory against the plan's reading
++    double vram_mib = -1;
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++    if (const size_t b = tosh_dmoe_private_bytes()) vram_mib = b/MiB;
++    size_t vf = 0, vt = 0;
++    if (vram_mib < 0 && tosh_vram_read(&vf, &vt)) { vram_free = vf/MiB; vram_total = vt/MiB; vram_mib = std::max(0.0, p.vram_free_mib - vram_free); }
++#endif
++    // what mixed execution ended up doing, e.g. DMOE_HOST_BANK_NOT_LOCKABLE when it had to stay off
++    std::string runtime_code;
++    if (const char * sf = getenv("TOSH_DMOE_STATUS_FILE")) {
++        if (FILE * rf = fopen(sf, "r")) {
++            char buf[1024] = {};
++            const size_t n = fread(buf, 1, sizeof(buf) - 1, rf);
++            fclose(rf);
++            const std::string st(buf, n);
++            const size_t k = st.find("\"code\": \"");
++            if (k != std::string::npos) runtime_code = st.substr(k + 9, st.find('"', k + 9) - (k + 9));
++        }
++    }
++    if (FILE * fp = fopen((std::string(f) + ".actual").c_str(), "w")) {
++        fprintf(fp, "{\"plan_schema_version\": %d, \"load_result\": %s, \"detail\": %s, \"runtime_code\": %s, \"mode\": %s, "
++                    "\"projected_rss_bytes\": %lld, \"actual_rss_bytes\": %lld, \"actual_footprint_bytes\": %lld, \"projected_vram_bytes\": %lld, \"actual_vram_bytes\": %lld}\n",
++                TOSH_PLAN_SCHEMA_VERSION, jstr(result).c_str(), jstr(detail ? detail : "").c_str(), jstr(runtime_code).c_str(), jstr(p.code).c_str(),
++                bytes(p.projected_rss_mib), bytes(rss_mib), bytes(footprint_mib), bytes(p.private_mib), vram_mib >= 0 ? bytes(vram_mib) : -1LL);
++        fclose(fp);
++    }
++}
+diff --git a/common/tosh-plan.h b/common/tosh-plan.h
+index 5b7c55fe7..430f53fa4 100644
+--- a/common/tosh-plan.h
++++ b/common/tosh-plan.h
+@@ -13,36 +13,67 @@ struct common_params;
+ 
+ enum tosh_plan_state {
+     TOSH_PLAN_NOT_PLANNED,          // dense model, or planning off
+     TOSH_PLAN_FULL_GPU_OPTIMAL,     // weights and the requested workload fit with the reserve
+     TOSH_PLAN_DMOE_CONTEXT_OPTIMAL, // the weights fit, the requested context does not
+     TOSH_PLAN_DMOE_CAPACITY_REQUIRED,
+     TOSH_PLAN_LEGACY_OFFLOAD_BETTER,
+     TOSH_PLAN_UNSUPPORTED,
++    TOSH_PLAN_DMOE_BOUNDED_HOST,    // experimental: part of the expert bank in RAM, the rest read from the file
+ };
+ 
++// execution mode of a plan, for callers; tosh_plan_mode_name gives its stable code
++enum tosh_plan_mode {
++    TOSH_PLAN_MODE_NONE,            // not planned
++    TOSH_PLAN_MODE_FULL_GPU,
++    TOSH_PLAN_MODE_FULL_HOST_DMOE,
++    TOSH_PLAN_MODE_BOUNDED_DMOE,
++    TOSH_PLAN_MODE_CLASSIC_NCMOE,
++    TOSH_PLAN_MODE_UNSUPPORTED,
++};
++
++// version of the "product" object in the plan JSON
++#define TOSH_PLAN_SCHEMA_VERSION 1
++
+ struct tosh_plan_candidate {
+     std::string name;
+     std::string mode;               // full_gpu, dmoe, legacy_offload
+     ggml_type   kv      = GGML_TYPE_F16;
+     int         ubatch  = 512;
+     int         ncmoe   = 0;
+     bool        valid   = false;
+     std::string reason;
+     double      private_mib = 0;    // projected VRAM this process holds
+     double      free_mib    = 0;    // projected VRAM left on the card
+     double      arena_mib   = 0;
+     double      kv_mib      = 0;
+     double      compute_mib = 0;
++    double      need_vram_mib = 0;  // VRAM with the reserve at the mode's smallest useful size
++    double      need_host_mib = 0;
+ };
+ 
+ struct tosh_plan {
+     tosh_plan_state state = TOSH_PLAN_NOT_PLANNED;
++    tosh_plan_mode  plan_mode = TOSH_PLAN_MODE_NONE;
++    std::string primary_reason;     // why this mode and not the preferred one, e.g. CURRENT_RAM_LIMIT
++    std::vector<std::string> warnings;  // e.g. COVERAGE_CONSTRAINED, RESERVE_LOWERED, REPLANNED
++    std::string limiting_resource;  // VRAM, HOST_RAM, WIRE, METADATA or NONE
++    std::string coverage_state;     // GOOD, CONSTRAINED or REJECT for DMoE plans
++    double      kv_mib = 0;
++    // what the smallest mode would need against what is there, set when nothing fits
++    double      required_host_mib = 0, available_host_mib = 0, required_vram_mib = 0, available_vram_mib = 0;
++    double      recheck_ms = 0;     // from the memory snapshot to the check before committing
++    double      prompt_cache_mib = 0;  // the server's RAM prompt cache the plan leaves room for
++    int         n_ctx_checkpoints = 0; // context checkpoints per sequence the plan leaves room for
++    double      checkpoint_mib = 0;    // one checkpoint: the sliding-window cache of a sequence
+     std::string mode;               // selected execution mode
++    // PLAN_FULL_GPU, PLAN_FULL_HOST_DMOE, PLAN_BOUNDED_DMOE, PLAN_CLASSIC_NCMOE or PLAN_UNSUPPORTED
++    std::string code;
++    std::vector<std::string> limits;  // what ruled out the preferred modes, e.g. VRAM_LIMIT, COVERAGE_TOO_LOW
+     std::string reason;
+     std::string fallback;           // why a preferred mode was not used
+     ggml_type   kv     = GGML_TYPE_F16;
+     int         ubatch = 512;
+     int         n_ctx  = 0;
+     int         ncmoe  = 0;
+     double      reserve_mib        = 0;
+     double      arena_mib          = 0;
+@@ -51,17 +82,52 @@ struct tosh_plan {
+     double      free_mib           = 0;
+     double      vram_total_mib     = 0;
+     double      vram_free_mib      = 0;
+     double      host_required_mib  = 0;
+     double      host_ram_mib       = 0;
+     double      host_available_mib = 0;
+     double      host_reserve_mib   = 0;
+     double      bank_mib           = 0;
++    double      model_mib          = 0;  // every tensor, across all shards
++    double      host_weights_mib   = 0;  // weights the backends keep in host memory besides the bank
++    double      warm_floor_mib     = 0;  // smallest RAM cache that holds one layer per expert size
++    int         n_split            = 1;
+     std::string mlock;              // required, not_required, not_lockable
+     std::string dispersion;         // normal, high
++    // TOSH_AUTO_HOST_POLICY=runtime (experimental): host memory budget from the machine's state now
++    std::string host_policy;        // static, runtime
++    std::string host_pressure;      // NORMAL, ELEVATED, CRITICAL
++    std::string full_host_code;     // FULL_HOST_SAFE or why the whole bank is not taken
++    std::string bounded_code;       // BOUNDED_HOST_SELECTED or why not
++    bool        host_simulated    = false;
++    bool        mtp_head_dropped  = false;   // the MTP head left no room and the plan goes on without it
++    bool        swap_growing      = false;
++    double      reclaimable_mib   = 0;
++    double      wired_mib         = 0;
++    double      compressed_mib    = 0;
++    double      swap_used_mib     = 0;
++    double      self_rss_mib      = 0;
++    double      static_reserve_mib = 0;
++    double      headroom_mib      = 0;
++    double      static_cap_mib    = 0;  // every budget below is bytes this load may still add
++    double      dynamic_cap_mib   = 0;
++    double      lockable_mib      = 0;
++    double      effective_mib     = 0;
++    double      warm_mib          = 0;
++    double      coverage          = 0;
++    double      projected_rss_mib = 0;
++    double      projected_left_mib = 0; // reclaimable memory left to the system after the load
+     std::vector<tosh_plan_candidate> candidates;
+ };
+ 
+ const char * tosh_plan_state_name(tosh_plan_state s);
++const char * tosh_plan_mode_name(tosh_plan_mode m);
+ std::string  tosh_plan_json(const tosh_plan & plan);
+ 
++// Plans and applies the result to params. Returns false when planning is off or not needed, and
++// when no plan exists: then out->state is TOSH_PLAN_UNSUPPORTED and the model must not be loaded.
+ bool tosh_plan_apply(common_params & params, tosh_plan * out = nullptr);
++
++// Outcome of the load that followed the last plan: READY, PLAN_REFUSED, MODEL_LOAD_FAILED,
++// ALLOCATION_FAILED or CONTEXT_FAILED, with the measured RSS and VRAM next to the projection.
++// Written to <TOSH_AUTO_PLAN_FILE>.actual; no-op when nothing was planned.
++void tosh_plan_report_load(const char * result, const char * detail = nullptr);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 3ef9afa8c..db8f7b43b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -9,23 +9,30 @@
+ #endif
+ 
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
++#include "tosh-hostcache.h"
+ #else
+ static inline bool   tosh_dmoe_compact(void) { return false; }
+ static inline float  tosh_dmoe_token_decay(void) { return 0.0f; }
+ static inline void   tosh_dmoe_set_chunk_rows(const int32_t *, const float *, int) {}
+ static inline void   tosh_dmoe_note_time(int, int64_t) {}
+ static inline void   tosh_dmoe_timeline(int, int, double, double) {}
+ static inline double tosh_dmoe_host_seconds(void) { return 0.0; }
++static inline bool   tosh_hostcache_on(void) { return false; }
++static inline bool   tosh_hostcache_lookup(const void *, int *, int *) { return false; }
++static inline bool   tosh_hostcache_acquire(int, const int32_t *, int, int) { return false; }
++static inline const char * tosh_hostcache_part(int, int, int) { return nullptr; }
++static inline void   tosh_hostcache_release(int, const int32_t *, int) {}
++#define TOSH_HC_PREFILL 3
+ #endif
+ 
+ #include <assert.h>
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -2137,16 +2144,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                                 GGML_ASSERT(id >= 0 && id < n_expert);
+                                 ggml_bitset_set(used_ids.data(), id);
+                             }
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    // bounded host cache: the bank has no bytes; each used expert comes from the cache,
++                    // pinned until the copies are done
++                    int hc_il = -1, hc_part = -1;
++                    if (tosh_hostcache_on() && tosh_hostcache_lookup(input->data, &hc_il, &hc_part)) {
++                        std::vector<int32_t> pin;
++                        for (int32_t e = 0; e < n_expert; ++e) if (ggml_bitset_get(used_ids.data(), e)) pin.push_back(e);
++                        if (pin.empty()) continue;
++                        GGML_ASSERT(tosh_hostcache_acquire(hc_il, pin.data(), (int) pin.size(), TOSH_HC_PREFILL) && "bounded host cache read failed");
++                        for (int32_t e : pin) {
++                            ggml_backend_tensor_set_async(split_backend, input_cpy, tosh_hostcache_part(hc_il, e, hc_part), (size_t) e*expert_size, expert_size);
++                        }
++                        ggml_backend_synchronize(split_backend);
++                        tosh_hostcache_release(hc_il, pin.data(), (int) pin.size());
++                        continue;
++                    }
++
+                     // group consecutive experts and copy them together
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
+                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+ 
+                         ggml_backend_tensor_set_async(split_backend,
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 3eb9feaba..fb36bcfbf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -6,16 +6,18 @@
+ 
+ #import "ggml-metal-impl.h"
+ #import "ggml-metal-common.h"
+ #import "ggml-metal-ops.h"
+ #import "ggml-metal-fusion.h"
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
++#include "tosh-hostcache.h"
++#endif
+ 
+ #import <Foundation/Foundation.h>
+ 
+ #import <Metal/Metal.h>
+ 
+ #undef MIN
+ #undef MAX
+ #define MIN(a, b) ((a) < (b) ? (a) : (b))
+@@ -1334,16 +1336,17 @@ static void ggml_metal_dmoe_pf_report(void) {
+                     atomic_load(&g_dmoe_pf_rare_bytes[0])/G, atomic_load(&g_dmoe_pf_rare_bytes[1])/G, atomic_load(&g_dmoe_pf_rare_bytes[2])/G);
+         }
+     }
+ }
+ 
+ #define DMOE_RING_CHUNKS 8
+ #define DMOE_RING_CHUNK  ((size_t) 16 << 20)
+ 
++struct dmoe_piece { size_t src, dst, len; const char * host; };   // host: a cached expert, else data + src
+ 
+ static void ggml_metal_dmoe_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, int il) {
+     [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+         tosh_dmoe_note_time(2, (int64_t) ((cb.GPUEndTime - cb.GPUStartTime)*1e6));
+         tosh_dmoe_timeline(2, il, cb.GPUStartTime, cb.GPUEndTime);
+     }];
+     [cmd_buf commit];
+     [ctx->cmd_bufs_ext addObject:cmd_buf];
+@@ -1354,36 +1357,41 @@ static void ggml_metal_dmoe_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_bu
+ // Copies the pieces into their ring chunk on several threads and blits them to the slot.
+ static void ggml_metal_dmoe_ring_flush(ggml_metal_t ctx, const void * data, id<MTLBuffer> dst, size_t dst_offs,
+         const struct dmoe_piece * p, int n, bool * first, int il) {
+     if (n == 0) {
+         return;
+     }
+     const int c = ctx->dmoe_ring_cur;
+     ctx->dmoe_ring_cur = (c + 1) % DMOE_RING_CHUNKS;
++    const double tl_w = tosh_dmoe_host_seconds();
+     if (ctx->dmoe_ring_cmds[c]) {
+         [ctx->dmoe_ring_cmds[c] waitUntilCompleted];
+         [ctx->dmoe_ring_cmds[c] release];
+         ctx->dmoe_ring_cmds[c] = nil;
+     }
++    const double tl_c = tosh_dmoe_host_seconds();
++    tosh_dmoe_timeline(7, il, tl_w, tl_c);
+     char * ring = (char *) ctx->dmoe_ring.contents + (size_t) c*DMOE_RING_CHUNK;
+     const size_t sub = (size_t) 1 << 20;
+     size_t n_sub = 0;
+     for (int i = 0; i < n; ++i) n_sub += (p[i].len + sub - 1)/sub;
+     dispatch_apply(n_sub, DISPATCH_APPLY_AUTO, ^(size_t k) {
+         size_t kk = k;
+         for (int i = 0; i < n; ++i) {
+             const size_t m = (p[i].len + sub - 1)/sub;
+             if (kk < m) {
+                 const size_t o = kk*sub, l = MIN(sub, p[i].len - o);
++                memcpy(ring + p[i].dst + o, (p[i].host ? p[i].host : (const char *) data + p[i].src) + o, l);
+                 return;
+             }
+             kk -= m;
+         }
+     });
++    tosh_dmoe_timeline(5, il, tl_c, tosh_dmoe_host_seconds());
+     id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+     if (*first) {
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+         *first = false;
+     }
+     id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+     for (int i = 0; i < n; ++i) {
+         [encoder copyFromBuffer:ctx->dmoe_ring sourceOffset:(size_t) c*DMOE_RING_CHUNK + p[i].dst
+@@ -1435,37 +1443,68 @@ static bool ggml_metal_dmoe_compact_upload(ggml_metal_t ctx, const struct tosh_d
+         }
+         [encoder endEncoding];
+         ggml_metal_dmoe_submit(ctx, cmd_buf, plan->il);
+     }
+ 
+     struct dmoe_piece p[64];
+     int n = 0;
+     size_t fill = 0;
++    if (tosh_hostcache_on()) {
++        // experimental bounded host cache: pin the chunk's missing experts (their reads overlap),
++        // copy each from its cached part, then let them go
++        int32_t need[512];
++        int n_need = 0;
++        for (int e = 0; e < plan->n_expert && n_need < 512; ++e) {
++            if (rows[e] > 0 && plan->slot_of[e] < 0) need[n_need++] = e;
++        }
++        if (!tosh_hostcache_acquire(plan->il, need, n_need, TOSH_HC_PREFILL)) {
++            tosh_dmoe_fail(tosh_hostcache_error());
++            return false;
++        }
++        for (int i = 0; i < n_need; ++i) {
++            if (fill + eb > DMOE_RING_CHUNK || n == 64) {
++                ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
++                n = 0;
++                fill = 0;
++            }
++            p[n++] = (struct dmoe_piece) { (size_t) need[i]*eb, fill, eb, tosh_hostcache_part(plan->il, need[i], plan->which) };
++            fill += eb;
++            host_bytes += eb;
++        }
++        ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
++        tosh_hostcache_release(plan->il, need, n_need);
++        n = 0;
++    }
++    for (int e = 0; e < plan->n_expert && !tosh_hostcache_on();) {
+         if (rows[e] == 0 || plan->slot_of[e] >= 0) {
+             ++e;
+             continue;
+         }
+         int e1 = e + 1;
+         while (e1 < plan->n_expert && rows[e1] > 0 && plan->slot_of[e1] < 0) ++e1;
+         size_t off = (size_t) e*eb, len = (size_t) (e1 - e)*eb;
+         host_bytes += len;
+         while (len > 0) {
+             if (fill == DMOE_RING_CHUNK || n == 64) {
+                 ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
+                 n = 0;
+                 fill = 0;
+             }
+             const size_t take = MIN(len, DMOE_RING_CHUNK - fill);
++            p[n++] = (struct dmoe_piece) { off, fill, take, NULL };
+             fill += take;
+             off  += take;
+             len  -= take;
+         }
+         e = e1;
+     }
++    if (!tosh_hostcache_on()) {
++        ggml_metal_dmoe_ring_flush(ctx, data, bid_dst.metal, bid_dst.offs, p, n, &first, plan->il);
++    }
+ 
+     if (plan->n_promo > 0) {
+         id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+         for (int i = 0; i < plan->n_promo; ++i) {
+             const int e = plan->promo_expert[i], sl = plan->promo_slot[i];
+             if (e < 0 || e >= plan->n_expert || sl < 0 || rows[e] == 0) continue;
+             [encoder copyFromBuffer:bid_dst.metal sourceOffset:bid_dst.offs + (size_t) e*eb
+@@ -1524,16 +1563,31 @@ static bool ggml_metal_dmoe_bank_upload(ggml_metal_t ctx, struct ggml_tensor * t
+     static bool registered = false;
+     if (!registered) {
+         registered = true;
+         atexit(ggml_metal_dmoe_pf_report);
+     }
+     if (plan.rows != NULL && ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
+         return true;
+     }
++    if (tosh_hostcache_on()) {
++        // the bank holds no bytes: without the chunk's routing every expert is taken from the cache
++        static int32_t all_rows[1024];
++        static uint64_t n_all = 0;
++        if (plan.n_expert > 1024) {
++            GGML_ABORT("bounded host cache: a bank upload without routing and more than 1024 experts");
++        }
++        for (int e = 0; e < plan.n_expert; ++e) all_rows[e] = 1;
++        plan.rows = all_rows;
++        if (n_all++ == 0) GGML_LOG_WARN("%s: bounded host cache: a bank upload without routing takes every expert\n", __func__);
++        if (ggml_metal_dmoe_compact_upload(ctx, &plan, bid_dst, bid_arena, data)) {
++            return true;
++        }
++        GGML_ABORT("bounded host cache: a bank upload found no cached path: %s", tosh_hostcache_error() ? tosh_hostcache_error() : "?");
++    }
+ 
+     int stage = -1;
+     size_t offs_src = 0;
+     id<MTLBuffer> buf_src = ggml_metal_device_wrap_host(ctx->dev, data, size, &offs_src);
+     if (buf_src == nil) {
+         stage = ctx->prefetch_stage_cur;
+         ctx->prefetch_stage_cur = (ctx->prefetch_stage_cur + 1) % ctx->prefetch_stage_count;
+         if (ctx->prefetch_stage_cmds[stage]) {
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 497a337a5..f93624097 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -2,16 +2,19 @@
+ 
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
+ #include "ggml-metal-device.h"
+ #include "ggml-metal-fusion.h"
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
++#include "tosh-hostcache.h"
++#include "tosh-dmoe.h"
++#endif
+ #include "ggml-metal-context.h"
+ #include "ggml-metal-ops.h"
+ #include "ggml-metal-tuning.h"
+ 
+ #include <mutex>
+ #include <string>
+ #ifdef __APPLE__
+ #include <dispatch/dispatch.h>
+@@ -842,23 +845,26 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
+         default:
+             return ggml_nrows(op);
+     }
+ }
+ 
+ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+ 
++    int min_batch = ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
+     // mixed execution takes every batch above its host path: the CPU backend would compute the
+     // resident experts too, and a bounded host cache leaves it no bytes. The device read the
+     // threshold before a plan could lower it
+     if (tosh_dmoe_enabled() || tosh_hostcache_on()) min_batch = std::min(min_batch, TOSH_DMOE_MAX_TOKENS + 1);
++#endif
+     return (op->op == GGML_OP_MUL_MAT ||
+             op->op == GGML_OP_MUL_MAT_ID) &&
+-            get_op_batch_size(op) >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
++            get_op_batch_size(op) >= min_batch;
+ }
+ 
+ static ggml_backend_event_t ggml_backend_metal_device_event_new(ggml_backend_dev_t dev) {
+     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+ 
+     ggml_metal_event_t event = ggml_metal_device_event_init(ctx_dev);
+     GGML_ASSERT(event);
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 28fbb871f..c5280d77d 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,10 +1,15 @@
+ #include "llama-model-loader.h"
+ 
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++#include "tosh-hostcache.h"
++#endif
++
++
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+ #include "gguf.h"
+ #include "llama-hparams.h"
+ #include "llama.h"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -1380,16 +1385,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         t_meta.nb[2] = t_meta.nb[1]*t_meta.ne[1];
+         t_meta.nb[3] = t_meta.nb[2]*t_meta.ne[2];
+         ggml_set_name(&t_meta, fused_name.c_str());
+ 
+         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+         if (buft == nullptr) {
+             return NULL;
+         }
++        // the fused tensor has no place in the file: a mapped CPU buffer cannot hold it and a
++        // repacking one only takes whole tensors, so those keep the file's two tensors
++        ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);   // null for the plain CPU type
++        const bool on_cpu = buft_dev == nullptr || ggml_backend_dev_type(buft_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
++        if (on_cpu && (use_mmap || buft != ggml_backend_cpu_buffer_type())) {
++            return NULL;
++        }
+ 
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * fused = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(fused, fused_name.c_str());
+ 
+         fused_map.emplace(fused_name, llama_tensor_fused {
+                 wa->idx, wa->offs, wb->offs, ggml_nbytes(ta)/(size_t) n_exp_a, n_exp_a });
+ 
+@@ -1666,16 +1678,41 @@ bool llama_model_loader::load_all_data(
+             ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
+             ggml_backend_name(upload_backend));
+     }
+ 
+     std::vector<ggml_tensor *> tensors;
+     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+         tensors.push_back(cur);
+     }
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++    // bounded host cache: start it before the other weights are read, so filling it overlaps the load
++    if (tosh_hostcache_on()) {
++        int n_layer = 0, n_expert = 0;
++        for (ggml_tensor * cur : tensors) {
++            const char * name = ggml_get_name(cur);
++            int il = -1;
++            if (cur->buffer == nullptr || !ggml_backend_buffer_is_host(cur->buffer) || !tosh_hostcache_is_bank_name(name) ||
++                sscanf(name, "blk.%d.", &il) != 1) continue;
++            const auto it_fused = fused_map.find(name);
++            if (it_fused != fused_map.end()) {
++                const auto & fu = it_fused->second;
++                tosh_hostcache_note_fused_tensor(cur->data, ggml_nbytes(cur), files.at(fu.idx)->file_id(), fu.offs_a, fu.offs_b);
++            } else {
++                const auto & w = require_weight(name);
++                tosh_hostcache_note_file_tensor(cur->data, ggml_nbytes(cur), files.at(w.idx)->file_id(), w.offs);
++            }
++            const int part = strstr(name, ".ffn_up_exps.") ? 1 : strstr(name, ".ffn_down_exps.") ? 2 : 0;
++            tosh_hostcache_bind(il, part, cur->data, cur->nb[2], (int) cur->ne[2]);
++            n_layer = std::max(n_layer, il + 1);
++            n_expert = (int) cur->ne[2];
++        }
++        if (n_layer > 0) tosh_hostcache_start(n_layer, n_expert);
++    }
++#endif
+ 
+     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
+     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
+     if (!use_mmap) {
+         std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
+             const bool staged_a = a->buffer && !ggml_backend_buffer_is_host(a->buffer);
+             const bool staged_b = b->buffer && !ggml_backend_buffer_is_host(b->buffer);
+             if (staged_a != staged_b) {
+@@ -1688,16 +1725,26 @@ bool llama_model_loader::load_all_data(
+     for (struct ggml_tensor * cur : tensors) {
+         const auto * weight = get_weight(ggml_get_name(cur));
+         if (weight == nullptr) {
+             const auto it_fused = fused_map.find(ggml_get_name(cur));
+             if (it_fused != fused_map.end()) {
+                 const auto & fu = it_fused->second;
+                 const size_t dst_stride = ggml_nbytes(cur)/(size_t) fu.n_expert;
+                 GGML_ASSERT(dst_stride == 2*fu.stride);
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++                if ((tosh_hostcache_on() || getenv("TOSH_DMOE_HOST_BYTECHECK")) && ggml_backend_buffer_is_host(cur->buffer) &&
++                    tosh_hostcache_is_bank_name(ggml_get_name(cur))) {
++                    tosh_hostcache_note_fused_tensor(cur->data, ggml_nbytes(cur), files.at(fu.idx)->file_id(), fu.offs_a, fu.offs_b);
++                    if (tosh_hostcache_on()) {
++                        size_done += ggml_nbytes(cur);
++                        continue;
++                    }
++                }
++#endif
+ 
+                 std::vector<uint8_t> buf(dst_stride);
+                 const auto & file = files.at(fu.idx);
+                 const uint8_t * map_addr = mappings.empty() ? nullptr : (const uint8_t *) mappings.at(fu.idx)->addr();
+ 
+                 for (int64_t e = 0; e < fu.n_expert; ++e) {
+                     if (map_addr) {
+                         memcpy(buf.data(),             map_addr + fu.offs_a + e*fu.stride, fu.stride);
+@@ -1756,16 +1803,27 @@ bool llama_model_loader::load_all_data(
+                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+             } else {
+                 ggml_backend_tensor_set(cur, data, 0, n_size);
+             }
+         } else {
+             const auto & file = files.at(weight->idx);
+ 
++#ifdef TOSH_ENABLE_DYNAMIC_MOE
++            // experimental bounded host cache: the expert bank stays in the file, read on demand
++            if ((tosh_hostcache_on() || getenv("TOSH_DMOE_HOST_BYTECHECK")) && ggml_backend_buffer_is_host(cur->buffer) &&
++                tosh_hostcache_is_bank_name(ggml_get_name(cur))) {
++                tosh_hostcache_note_file_tensor(cur->data, n_size, file->file_id(), weight->offs);
++                if (tosh_hostcache_on()) {
++                    size_done += n_size;
++                    continue;
++                }
++            }
++#endif
+             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                 file->seek(weight->offs, SEEK_SET);
+                 file->read_raw(cur->data, n_size);
+                 if (check_tensors) {
+                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                     }));
+                 }
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index dea450cac..0680c8a0e 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -4,16 +4,17 @@
+ #include "llama-model.h"
+ #include "llama-hparams.h"
+ 
+ #include "ggml-backend.h"
+ #include "ggml-cpu.h"
+ 
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
++#include "tosh-hostcache.h"
+ #endif
+ 
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -93,16 +94,18 @@ static ggml_tensor * dmoe_gate(const llama_layer & L) { return L.ffn_gate_exps ?
+ static bool dmoe_has_bank(const llama_layer & L) {
+     return dmoe_gate(L) && L.ffn_down_exps && (L.ffn_gate_exps ? L.ffn_up_exps != nullptr : L.ffn_up_exps == nullptr);
+ }
+ 
+ struct miss {
+     int t;      // token
+     int j;      // router position
+     int e;      // expert id
++    // bounded host cache: the expert's cached gate, up and down, pinned for this job
++    const char * g = nullptr, * u = nullptr, * d = nullptr;
+ };
+ 
+ struct executor {
+     int n_threads = 1;
+     int n_embd    = 0;
+     int n_ff      = 0;
+ 
+     std::vector<host_bank> banks;   // by layer
+@@ -210,16 +213,18 @@ struct executor {
+         // unpacked once for up to four of them where the type has a multi-row dot
+         const auto mg = ggml_cpu_get_vec_dot_multi(bank->gate->type);
+         const auto mu = ggml_cpu_get_vec_dot_multi(up_t->type);
+         const auto md = ggml_cpu_get_vec_dot_multi(bank->down->type);
+         for (int c; (c = next1.fetch_add(1, std::memory_order_relaxed)) < n_grp*c1; ) {
+             const int i0 = grp[c/c1], i1 = grp[c/c1 + 1];
+             const miss & m = misses[i0];
+             const int r0 = (c % c1)*rows1;
++            const char * g = m.g ? m.g : (const char *) bank->gate->data + (size_t) m.e*bank->gate->nb[2];
++            const char * u = m.u ? m.u : (const char *) up_t->data + (size_t) m.e*up_t->nb[2] + up_off;
+             const float * gb = bank->gate_b.empty() ? nullptr : bank->gate_b.data() + (size_t) m.e*n_ff;
+             const float * ub = bank->up_b.empty()   ? nullptr : bank->up_b.data()   + (size_t) m.e*n_ff;
+             const int act = bank->act.load(std::memory_order_relaxed);
+             auto finish = [&](int i, int r, float sg, float su) {
+                 float * hr = h.data() + (size_t) i*n_ff;
+                 if (gb) sg += gb[r];
+                 if (ub) su += ub[r];
+                 if (act == 1) {
+@@ -328,16 +333,46 @@ struct executor {
+             if (g == seen) {
+                 continue;
+             }
+             seen = g;
+             run(tid);
+         }
+     }
+ 
++    std::vector<int32_t> pinned;
++    int pinned_il = -1;
++
++    bool pin_misses(int il, int kind) {
++        if (!tosh_hostcache_on() || misses.empty()) {
++            return true;
++        }
++        pinned.clear();
++        for (const miss & m : misses) pinned.push_back(m.e);
++        pinned_il = il;
++        if (!tosh_hostcache_acquire(il, pinned.data(), (int) pinned.size(), kind)) {
++            tosh_dmoe_fail(tosh_hostcache_error());
++            return false;
++        }
++        const size_t up_off = bank->fused ? (size_t) n_ff*bank->gate->nb[1] : 0;
++        for (miss & m : misses) {
++            m.g = tosh_hostcache_part(il, m.e, 0);
++            m.u = bank->fused ? m.g + up_off : tosh_hostcache_part(il, m.e, 1);
++            m.d = tosh_hostcache_part(il, m.e, 2);
++        }
++        return true;
++    }
++
++    void unpin_misses() {
++        if (!pinned.empty()) {
++            tosh_hostcache_release(pinned_il, pinned.data(), (int) pinned.size());
++            pinned.clear();
++        }
++    }
++
+     // a wide batch: the positions the GPU skipped, grouped by expert so its weights stay in cache
+     bool job_wide(int il, const tosh_dmoe_job & jb) {
+         const double t0 = tosh_dmoe_host_seconds();
+         if (il <= wide_first_il) {
+             wide_first_il = il;
+             tosh_dmoe_rare_chunk(t0, jb.n_tokens);
+         }
+         size_t bytes = 0;
+@@ -383,22 +418,26 @@ struct executor {
+             const auto from_float = ggml_get_type_traits_cpu(ggml_get_type_traits_cpu(bank->gate->type)->vec_dot_type)->from_float;
+             wide_seen.assign(T, 0);
+             for (const miss & m : misses) {
+                 if (!wide_seen[m.t]) {
+                     from_float(act + (size_t) m.t*n_embd, act_q.data() + (size_t) m.t*act_q_row, n_embd);
+                     wide_seen[m.t] = 1;
+                 }
+             }
++            if (!pin_misses(il, TOSH_HC_WIDE)) {
++                return false;
++            }
+             wide = true;
+             next1.store(0, std::memory_order_relaxed);
+             next2.store(0, std::memory_order_relaxed);
+             kick();
+             run(0);
+             wide = false;
++            unpin_misses();
+         }
+         n_wide++;
+         n_wide_miss    += misses.size();
+         n_wide_experts += n_exp;
+         const double t1 = tosh_dmoe_host_seconds();
+         us_wide += (uint64_t) ((t1 - t0)*1e6);
+         tosh_dmoe_timeline(1, il, t0, t1);
+         tosh_dmoe_rare_host_done(il, t0, t1, tosh_dmoe_reach_get() >= jb.value);
+@@ -478,20 +517,24 @@ struct executor {
+             const auto from_float = ggml_get_type_traits_cpu(ggml_get_type_traits_cpu(bank->gate->type)->vec_dot_type)->from_float;
+             for (int t = 0; t < jb.n_tokens; ++t) {
+                 if (tok_used[t]) {
+                     from_float(act + (size_t) t*n_embd, act_q.data() + (size_t) t*act_q_row, n_embd);
+                 }
+             }
+             us_quant += (uint64_t) us_since(tq);
+ 
++            if (!pin_misses(il, TOSH_HC_DECODE)) {
++                return false;
++            }
+             next1.store(0, std::memory_order_relaxed);
+             next2.store(0, std::memory_order_relaxed);
+             kick();
+             run(0);
++            unpin_misses();
+         }
+ 
+         n_jobs++;
+         us_job += (uint64_t) us_since(t0);
+         return true;
+     }
+ 
+     void leader_main() {
+@@ -778,23 +821,30 @@ struct policy {
+         return std::max(1.0, t_up/(t_cpu_expert_us - 7.0));
+     }
+ 
+     struct exchange { int il, s, e; };
+     std::vector<exchange> exchanges;      // evicted this cycle: their bytes are still in the slot
+     uint64_t exchanged = 0;
+     double   us_exchange = 0;
+ 
++    // bounded host cache: an expert leaving VRAM goes back to RAM, which holds what VRAM does not
++    void demote(int il, int s) {
++        const int e = slots[(size_t) il*Q + s].e;
+         if (!tosh_hostcache_on() || e < 0) {
+             return;
+         }
+         static const bool copy_back = getenv("TOSH_DMOE_HOST_EXCHANGE") == nullptr || atoi(getenv("TOSH_DMOE_HOST_EXCHANGE")) != 0;
+         if (copy_back && up->download != nullptr) {
+             if (tosh_hostcache_store(il, e)) exchanges.push_back({ il, s, e });
+         } else {
++            tosh_hostcache_prefetch(il, e);
++        }
++    }
++
+     // the slots are not reused before a later cycle, so one copy per cycle takes them all
+     void flush_exchanges() {
+         if (exchanges.empty()) {
+             return;
+         }
+         const clk::time_point t0 = clk::now();
+         std::vector<tosh_dmoe_copy> copies;
+         for (const exchange & x : exchanges) {
+@@ -814,21 +864,31 @@ struct policy {
+         exchanges.clear();
+     }
+ 
+     bool verify_slot(int il, int s) {
+         const llama_tosh_dmoe_layer * dl = layers[il];
+         const host_bank & b = (*banks)[il];
+         const int e = slots[(size_t) il*Q + s].e;
+         bool ok = true;
++        const int32_t eid = e;
++        const bool hc = tosh_hostcache_on();
++        if (hc && !tosh_hostcache_acquire(il, &eid, 1, TOSH_HC_VERIFY)) {
++            return false;
++        }
++        int part = -1;
+         for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
++            part++;
+             if (bank == nullptr) continue;
+             std::vector<uint8_t> got(arena->nb[2]);
+             ggml_backend_tensor_get(arena, got.data(), (size_t) s*arena->nb[2], got.size());
++            const char * src = hc ? tosh_hostcache_part(il, e, part) : (const char *) bank->data + (size_t) e*bank->nb[2];
++            ok = ok && memcmp(got.data(), src, got.size()) == 0;
+         }
++        if (hc) tosh_hostcache_release(il, &eid, 1);
+         return ok;
+     }
+ 
+     void cycle() {
+         const clk::time_point t0 = clk::now();
+         const uint64_t sync = tosh_dmoe_completed_value();
+         const uint32_t now  = (uint32_t) tosh_dmoe_tick();
+         n_cycles++;
+@@ -927,16 +987,17 @@ struct policy {
+             const int st = up->status(up->ctx, sl.ticket);
+             if (st == 0) { ++i; continue; }
+             const int il = gs / Q, s = gs % Q;
+             const size_t key = (size_t) il*n_expert + sl.e;
+             pending[key] = 0;
+             if (st == 1) {
+                 sl.state = RESIDENT; sl.since = now; sl.uses = 0;
+                 resident_slot[key] = s;
++                if (tosh_hostcache_on()) tosh_hostcache_drop(il, sl.e);
+                 upload_done++;
+                 us_upload_wall += std::chrono::duration<double, std::micro>(clk::now() - sl.issued).count();
+                 us_upload_gpu  += up->gpu_us(up->ctx, sl.ticket);
+                 if (verify_every > 0 && upload_done % verify_every == 0) {
+                     verified++;
+                     if (!verify_slot(il, s)) verify_bad++;
+                 }
+                 dirty = true;
+@@ -983,16 +1044,17 @@ struct policy {
+                     sl.state = FREE; sl.e = -1; sl.parts = 0; sl.drop = false; sl.claimed = false;
+                     free_list[il].push_back(s);
+                 } else if (sl.drop) {
+                     ++i;
+                     continue;
+                 } else if (sl.parts == full[il] && sync > sl.encoded_sync) {
+                     sl.state = RESIDENT; sl.since = now; sl.uses = 0; sl.claimed = false;
+                     resident_slot[key] = s;
++                    if (tosh_hostcache_on()) tosh_hostcache_drop(il, sl.e);
+                     pending[key] = 0;
+                     dirty = true;
+                     if (verify_every > 0 && vpromotions % verify_every == 0) {
+                         verified++;
+                         if (!verify_slot(il, s)) verify_bad++;
+                     }
+                 } else if (sl.parts != full[il] && sync > sl.reserved_sync + 16 && vmask[il] == 0) {
+                     // never fully carried: drop it, its layer's plan with it
+@@ -1055,16 +1117,17 @@ struct policy {
+                     int victim = -1; float vs = 0;
+                     for (int s = 0; s < Q; ++s) {
+                         const slot & sl = slots[(size_t) il*Q + s];
+                         if (sl.state != RESIDENT) continue;
+                         const float v = decayed((size_t) il*n_expert + sl.e, now);
+                         if (victim < 0 || v < vs) { victim = s; vs = v; }
+                     }
+                     if (victim < 0 || vs + margin >= sc) continue;
++                    demote(il, victim);
+                     slot & sl = slots[(size_t) il*Q + victim];
+                     const size_t vkey = (size_t) il*n_expert + sl.e;
+                     resident_slot[vkey] = -1;
+                     evicted_tick[vkey] = now;
+                     lifetime_sum += now - sl.since; lifetime_n++; uses_sum += sl.uses;
+                     if (lifetimes.size() < (1 << 20)) lifetimes.push_back(now - sl.since);
+                     sl.state = RETIRING; sl.retire_sync = UINT64_MAX;
+                     retiring_slots.push_back(il*Q + victim);
+@@ -1093,22 +1156,32 @@ struct policy {
+                     s = free_list[il].back();
+                     free_list[il].pop_back();
+                 }
+                 slot & sl = slots[(size_t) il*Q + s];
+                 const llama_tosh_dmoe_layer * dl = layers[il];
+                 const host_bank & b = (*banks)[il];
+                 tosh_dmoe_copy copies[3];
+                 int n_copies = 0;
++                const int32_t eid = e;
++                const bool hc = tosh_hostcache_on();
++                if (hc && !tosh_hostcache_acquire(il, &eid, 1, TOSH_HC_PROMOTE)) {
++                    tosh_dmoe_fail(tosh_hostcache_error());
++                }
++                int part = -1;
+                 for (auto [bank, arena] : { std::pair{ b.gate, dl->arena_gate }, { b.up, dl->arena_up }, { b.down, dl->arena_down } }) {
++                    part++;
+                     if (bank == nullptr) continue;
++                    const char * src = hc ? tosh_hostcache_part(il, e, part) : (const char *) bank->data + (size_t) e*bank->nb[2];
++                    copies[n_copies++] = { arena, (size_t) s*arena->nb[2], src, arena->nb[2] };
+                 }
+                 sl.e = e; sl.gen++; sl.issued = clk::now();
+                 const clk::time_point tu = clk::now();
+                 sl.ticket = up->upload(up->ctx, copies, n_copies);
++                if (hc) tosh_hostcache_release(il, &eid, 1);
+                 us_upload_call += std::chrono::duration<double, std::micro>(clk::now() - tu).count();
+                 if (sl.ticket == 0) {
+                     failed++;
+                     sl.state = FREE; sl.e = -1;
+                     std::lock_guard<std::mutex> lock(vp_mutex);
+                     free_list[il].push_back(s);
+                     continue;
+                 }
+@@ -1138,16 +1211,17 @@ struct policy {
+                     for (int s = 0; s < Q; ++s) {
+                         const slot & sl = slots[(size_t) il*Q + s];
+                         if (sl.state != RESIDENT) continue;
+                         const size_t k = (size_t) il*n_expert + sl.e;
+                         const float v = (chunk_freq.empty() ? 0.0f : chunk_freq[k]) + 1e-3f*decayed(k, now);
+                         if (victim < 0 || v < vs) { victim = s; vs = v; }
+                     }
+                     if (victim < 0) break;
++                    demote(il, victim);
+                     slot & sl = slots[(size_t) il*Q + victim];
+                     const size_t vkey = (size_t) il*n_expert + sl.e;
+                     resident_slot[vkey] = -1;
+                     evicted_tick[vkey] = now;
+                     lifetime_sum += now - sl.since; lifetime_n++; uses_sum += sl.uses;
+                     sl.state = RETIRING; sl.retire_sync = UINT64_MAX;
+                     retiring_slots.push_back(il*Q + victim);
+                     evictions++; reserve_evictions++;
+@@ -1498,25 +1572,90 @@ static void dmoe_lock_bank(const std::vector<llama_layer> & layers) {
+             }
+             bytes += b - a;
+         }
+     }
+     locked = true;
+     LLAMA_LOG_INFO("%s: expert bank locked in host memory, %.0f MiB\n", __func__, bytes/1048576.0);
+ }
+ 
++// EXPERIMENTAL: the bank tensors were left unread; the cache reads experts from the file. The
++// untouched bank pages are made inaccessible so a reader that bypasses the cache fails loudly.
++static void dmoe_start_hostcache(const std::vector<llama_layer> & layers, const llama_hparams & hparams) {
++    static bool started = false;
++    if (started) {
++        return;
++    }
++    const char * ob = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
++    if (ob == nullptr || atoi(ob) > TOSH_DMOE_MAX_TOKENS + 1) {
++        throw std::runtime_error(format("the bounded host cache needs GGML_OP_OFFLOAD_MIN_BATCH=%d: smaller batches would compute experts from the bank on the CPU backend", TOSH_DMOE_MAX_TOKENS + 1));
++    }
++    int n_moe = 0;
++    for (int il = 0; il < (int) layers.size(); ++il) {
++        const llama_layer & L = layers[il];
++        if (!dmoe_gate(L)) continue;
++        // parts keep fixed places: 0 gate (or fused gate/up), 1 up, 2 down; biases and scales stay loaded
++        int part = 0;
++        for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
++            if (t != nullptr && !tosh_hostcache_bind(il, part, t->data, t->nb[2], (int) hparams.n_expert)) {
++                throw std::runtime_error(tosh_hostcache_error());
++            }
++            part++;
++        }
++        n_moe++;
++    }
++    if (n_moe == 0 || !tosh_hostcache_start((int) layers.size(), (int) hparams.n_expert)) {
++        throw std::runtime_error(tosh_hostcache_error() ? tosh_hostcache_error() : "no expert bank");
++    }
++    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    for (const llama_layer & L : layers) {
++        for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
++            if (t == nullptr) continue;
++            const uintptr_t a = ((uintptr_t) t->data + page - 1) & ~(uintptr_t) (page - 1);
++            const uintptr_t b = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(uintptr_t) (page - 1);
++            if (b > a) mprotect((void *) a, b - a, PROT_NONE);
++        }
++    }
++    atexit(tosh_hostcache_report);
++    started = true;
++}
++
+ static void dmoe_init_or_off(std::vector<llama_layer> & layers, const llama_hparams & hparams, const char * path, double cache_mib) {
+     if (path != nullptr) {
+         dmoe_init(layers, hparams, path, cache_mib);
+         return;
+     }
+     try {
++        if (tosh_hostcache_on()) {
++            dmoe_start_hostcache(layers, hparams);
++        } else {
++            dmoe_lock_bank(layers);
++            if (getenv("TOSH_DMOE_HOST_BYTECHECK")) {
++                // the cache reads the loader's own offsets: check them against the bank it loaded
++                int n = 0, bad = 0;
++                for (const llama_layer & L : layers) {
++                    for (const ggml_tensor * t : { (const ggml_tensor *) dmoe_gate(L), (const ggml_tensor *) L.ffn_up_exps, (const ggml_tensor *) L.ffn_down_exps }) {
++                        if (t == nullptr) continue;
++                        for (int e : { 0, 1, 37, 128, 200, (int) t->ne[2] - 1 }) {
++                            if (e >= t->ne[2]) continue;
++                            n++;
++                            bad += !tosh_hostcache_bytecheck(t->data, t->nb[2], e);
++                        }
++                    }
++                }
++                LLAMA_LOG_INFO("%s: expert bytes read from the file against the loaded bank: %d checked in %d file(s), %d differ\n",
++                               __func__, n, tosh_hostcache_n_files(), bad);
++            }
++        }
+         dmoe_init(layers, hparams, path, cache_mib);
+         dmoe_status(true, "DMOE_ON", "", g_arena_buf ? ggml_backend_buffer_get_size(g_arena_buf)/1048576.0 : 0.0);
+     } catch (const std::exception & err) {
++        if (tosh_hostcache_on()) {
++            throw;   // the bank holds no data: there is no path without the cache
++        }
+         LLAMA_LOG_WARN("%s: mixed expert execution stays off: %s\n", __func__, err.what());
+         llama_tosh_dmoe_shutdown();
+         delete g_policy;
+         g_policy = nullptr;
+         const std::string what = err.what();
+         const bool lock = what.rfind("DMOE_HOST_BANK_NOT_LOCKABLE", 0) == 0;
+         dmoe_status(false, lock ? "DMOE_HOST_BANK_NOT_LOCKABLE" : "DMOE_UNSUPPORTED_MODEL", what, 0.0);
+     }
+@@ -1524,16 +1663,19 @@ static void dmoe_init_or_off(std::vector<llama_layer> & layers, const llama_hpar
+ 
+ // TOSH_DMOE_CACHE_MIB=auto: the arena waits for the context, so it is what the card has left
+ static std::vector<llama_layer> * g_defer_layers = nullptr;
+ static const llama_hparams *      g_defer_hparams = nullptr;
+ 
+ void llama_tosh_dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & hparams) {
+     const char * path      = getenv("TOSH_DMOE_RESIDENCY");
+     const char * cache_mib = getenv("TOSH_DMOE_CACHE_MIB");
++    if (tosh_hostcache_on() && (cache_mib == nullptr || path != nullptr)) {
++        throw std::runtime_error("the bounded host cache needs TOSH_DMOE_CACHE_MIB (a VRAM arena) and no residency file");
++    }
+     if ((path == nullptr && cache_mib == nullptr) || g_exec != nullptr) {
+         return;
+     }
+     if (path == nullptr && strcmp(cache_mib, "auto") == 0) {
+         g_defer_layers  = &layers;
+         g_defer_hparams = &hparams;
+         return;
+     }
+@@ -1616,16 +1758,19 @@ void llama_tosh_dmoe_budget(size_t gpu_bytes) {
+             dmoe_init_or_off(layers, hparams, nullptr, arena/M);
+         }
+         LLAMA_LOG_INFO("%s: expert arena rebuilt for this context, %.0f -> %.0f MiB in %.1f ms\n", __func__,
+                        arena_now/M, std::max(0.0, arena)/M, std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+         return;
+     }
+     // a planner passes the smallest arena it judged useful for this model
+     const double min_arena = std::max(256.0*M, envmib("TOSH_DMOE_MIN_ARENA_MIB", 0));
++    if (arena < min_arena && tosh_hostcache_on()) {
++        throw std::runtime_error("the bounded host cache needs mixed expert execution, and the VRAM arena is under its minimum");
++    }
+     if (arena < min_arena) {
+         LLAMA_LOG_WARN("%s: under %.0f MiB left for experts, mixed execution stays off\n", __func__, min_arena/M);
+         dmoe_status(false, "DMOE_ARENA_BELOW_MINIMUM", format("%.0f MiB left, %.0f needed", std::max(0.0, arena)/M, min_arena/M), 0.0);
+         return;
+     }
+     dmoe_init_or_off(layers, hparams, nullptr, arena/M);
+ }
+ 
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index 94abfe510..e1957bc13 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -1,12 +1,160 @@
++#include "tosh-hostcache.h"
++#include "tosh-dmoe.h"
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <fcntl.h>
++#include <pthread.h>
++#include <sys/mman.h>
++#include <sys/uio.h>
++#include <sys/param.h>
+ #ifdef __APPLE__
+ #include <sys/sysctl.h>
+ #endif
++#include <unistd.h>
++
++namespace {
++
++enum slot_state : uint8_t { EMPTY, LOADING, RESIDENT };
++
++struct file_tensor {
++    size_t   nbytes;
++    uint64_t file_off;
++    int      file;
++    uint64_t file_off_up = UINT64_MAX;   // up half of a gate/up pair the loader fused
++};
++
++struct part_ref {
++    uint64_t file_off  = 0;     // of expert 0
++    int      file      = 0;     // shard of a split model
++    size_t   bytes     = 0;     // per expert
++    size_t   slot_off  = 0;     // inside a cache slot
++};
++
++struct cache {
++    std::mutex              m;
++    std::condition_variable loaded;
++    std::condition_variable work;
++    std::deque<int>         queue;      // demand reads in front, read-backs of evicted experts behind
++    bool                    stop = false;
++
++    std::unordered_map<const void *, file_tensor> noted;
++    std::unordered_map<const void *, std::pair<int, int>> bank_of;   // tensor data -> (il, part)
++    std::vector<std::string> paths;     // model files; a split model has one per shard
++    std::vector<int> fds;
++
++    int n_layer = 0, n_expert = 0;
++    std::vector<part_ref> parts;        // [il*3 + part]
++    // one pool per expert size (mixed quantizations), each with its share of the capacity
++    struct pool { size_t slot_bytes = 0; int first = 0, n = 0; char * base = nullptr; size_t bytes = 0;
++                  std::vector<int> free_slots; int lru_head = -1, lru_tail = -1; };
++    std::vector<pool> pools;
++    std::vector<int> pool_of_layer, pool_of_slot;
++    char * base = nullptr;              // first pool, non-null once started
++    size_t cap_bytes = 0, locked_bytes = 0, resident_bytes = 0, peak_bytes = 0;
++    int n_slots = 0;
++
++    std::vector<int32_t>    slot_of;    // key -> slot
++    std::vector<uint8_t>    ever;       // key was read before
++    std::vector<double>     enq_t;      // when a slot's read was queued
++    std::vector<uint8_t>    bg;         // queued by a read-back, not by a demand
++    std::vector<uint8_t>    bg_unused;  // read back and not used since
++    std::vector<uint8_t>    origin;     // 0 read after the server was ready, 1 during warm-up, 2 warm-up fill
++    std::vector<uint8_t>    reused;     // a warm-up or fill entry hit after ready
++    std::atomic<bool>       ready{false};
++    std::thread             locker;
++    double   t_start = 0, t_ready = 0, fill_stop_t = 0;
++    uint64_t fill_n = 0, fill_bytes = 0, fill_dup = 0, fill_skipped = 0;
++    uint64_t reuse_n[3] = {}, reuse_bytes[3] = {}, loaded_n[3] = {}, loaded_bytes[3] = {};
++    std::vector<int32_t>    key_of, ref, prev, next;
++    std::vector<uint8_t>    state;
++
++    std::string error;
++
++    // stats
++    uint64_t req[TOSH_HC_KINDS] = {}, hit[TOSH_HC_KINDS] = {}, cold[TOSH_HC_KINDS] = {}, coalesced = 0;
+     uint64_t evictions = 0, reloads = 0, reads = 0, read_bytes = 0, prefetches = 0, stored = 0;
++    double wait_us[TOSH_HC_KINDS] = {};
++    // queue and read time per class (0 demand, 1 read-back), where acquire waits, read-back reuse
++    std::vector<float> qwait_us[2], rd_us[2];
++    uint64_t rd_n[2] = {}, rd_bytes[2] = {};
++    double wait_own_us[TOSH_HC_KINDS] = {}, wait_co_dem_us[TOSH_HC_KINDS] = {}, wait_co_bg_us[TOSH_HC_KINDS] = {};
++    uint64_t bg_used = 0, bg_used_loading = 0, bg_wasted = 0, bg_dropped_unused = 0;
++    size_t prewarm_bytes = 0; double prewarm_us = 0;
++    uint64_t boosted = 0, kept_on_promotion = 0, refreshed = 0;
++
++    // a free slot of layer il's pool, evicting the least recent unpinned one; -1 if all are pinned
++    int take_slot(int il) {
++        pool & pl = pools[pool_of_layer[il]];
++        int s;
++        if (!pl.free_slots.empty()) {
++            s = pl.free_slots.back();
++            pl.free_slots.pop_back();
++        } else {
++            s = pl.lru_tail;
++            if (s < 0) return -1;
++            lru_unlink(s);
++            slot_of[key_of[s]] = -1;
++            evictions++;
++            if (bg_unused[s]) { bg_wasted++; bg_unused[s] = 0; }
++            resident_bytes -= pl.slot_bytes;
++        }
++        resident_bytes += pl.slot_bytes;
++        peak_bytes = std::max(peak_bytes, resident_bytes);
++        return s;
++    }
++    std::vector<float> read_us;
++    std::atomic<uint64_t> cold_total{0};
++
++    char * slot_ptr(int s) { pool & p = pools[pool_of_slot[s]]; return p.base + (size_t) (s - p.first)*p.slot_bytes; }
++    void lru_unlink(int s) {
++        pool & p = pools[pool_of_slot[s]];
++        if (prev[s] >= 0) next[prev[s]] = next[s]; else if (p.lru_head == s) p.lru_head = next[s];
++        if (next[s] >= 0) prev[next[s]] = prev[s]; else if (p.lru_tail == s) p.lru_tail = prev[s];
++        prev[s] = next[s] = -1;
++    }
++    void lru_push_tail(int s) {
++        pool & p = pools[pool_of_slot[s]];
++        next[s] = -1;
++        prev[s] = p.lru_tail;
++        if (p.lru_tail >= 0) next[p.lru_tail] = s;
++        p.lru_tail = s;
++        if (p.lru_head < 0) p.lru_head = s;
++    }
++    void lru_push(int s) {
++        pool & p = pools[pool_of_slot[s]];
++        prev[s] = -1;
++        next[s] = p.lru_head;
++        if (p.lru_head >= 0) prev[p.lru_head] = s;
++        p.lru_head = s;
++        if (p.lru_tail < 0) p.lru_tail = s;
++    }
++    bool in_lru(int s) const { return prev[s] >= 0 || next[s] >= 0 || pools[pool_of_slot[s]].lru_head == s; }
++};
++
++cache g;
++
++double now_us() {
++    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+ // Wired pages cannot be compressed or paged out: locking faster than the system frees memory
+ // evicts the code pages of every other process, and a desktop stalls until the watchdog reboots it.
+ bool mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
+     static const size_t step    = (size_t) 256 << 20;
+     static const double wait_us = 30e6;
+     char * base = (char *) addr;
+     for (size_t o = 0; o < bytes; o += step) {
+ #ifdef __APPLE__
+@@ -31,28 +179,542 @@ bool mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
+                      o/1048576.0, bytes/1048576.0, strerror(e));
+             munlock(base, o);
+             return false;
+         }
+     }
+     return true;
+ }
+ 
++void reader_main() {
++#ifdef __APPLE__
++    // the executor's threads run at this class and would otherwise starve the reads they wait on
++    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++#endif
++    for (;;) {
++        int s;
++        {
++            std::unique_lock<std::mutex> lock(g.m);
++            g.work.wait(lock, [] { return g.stop || !g.queue.empty(); });
++            if (g.stop) return;
++            s = g.queue.front();
++            g.queue.pop_front();
++        }
++        const int key = g.key_of[s];
++        const int il = key / g.n_expert, e = key % g.n_expert;
++        char * dst = g.slot_ptr(s);
++        const double t0 = now_us();
++        const int cls = g.bg[s];
++        const double tq = g.enq_t[s];
++        std::string err;
++        size_t total = 0;
++        for (int p = 0; p < 3 && err.empty(); ++p) {
++            const part_ref & pr = g.parts[il*3 + p];
++            size_t done = 0;
++            while (done < pr.bytes) {
++                const ssize_t r = pread(g.fds[pr.file], dst + pr.slot_off + done, pr.bytes - done, (off_t) (pr.file_off + (uint64_t) e*pr.bytes + done));
++                if (r <= 0) {
++                    err = r == 0 ? "short read of an expert from the model file" : std::string("pread: ") + strerror(errno);
++                    break;
++                }
++                done += (size_t) r;
++            }
++            total += done;
++        }
++        static const long fail_at = getenv("TOSH_DMOE_TEST_READ_FAIL") ? atol(getenv("TOSH_DMOE_TEST_READ_FAIL")) : -1;
++        if (fail_at >= 0 && (long) g.reads + 1 == fail_at && err.empty()) err = "injected read failure";
++        const double us = now_us() - t0;
++        {
++            std::lock_guard<std::mutex> lock(g.m);
++            if (!err.empty() && g.error.empty()) g.error = err;
++            if (g.qwait_us[cls].size() < (1u << 22)) { g.qwait_us[cls].push_back((float) (t0 - tq)); g.rd_us[cls].push_back((float) us); }
++            g.rd_n[cls]++; g.rd_bytes[cls] += total;
++            tosh_dmoe_timeline(8 + 2*cls, il, tq*1e-6, t0*1e-6);
++            tosh_dmoe_timeline(9 + 2*cls, il, t0*1e-6, (t0 + us)*1e-6);
++            g.state[s] = RESIDENT;
++            if (g.ref[s] == 0 && !g.in_lru(s)) g.lru_push(s);
++            g.reads++;
++            g.read_bytes += total;
++            if (g.read_us.size() < (1u << 22)) g.read_us.push_back((float) us);
++        }
++        g.loaded.notify_all();
++    }
++}
++
++}  // namespace
++
++extern "C" {
++
++bool tosh_hostcache_on(void) {
++    // only a yes is kept: the Auto plan sets the variable after its probes have asked
++    static std::atomic<bool> on{false};
++    if (on.load(std::memory_order_relaxed)) return true;
++    if (getenv("TOSH_DMOE_HOST_CACHE_MIB") == nullptr) return false;
++    on.store(true);
++    return true;
++}
++
++bool tosh_hostcache_is_bank_name(const char * name) {
++    const char * p = strstr(name, ".ffn_");
++    if (p == nullptr) return false;
++    return strcmp(p, ".ffn_gate_exps.weight") == 0 || strcmp(p, ".ffn_up_exps.weight") == 0 || strcmp(p, ".ffn_down_exps.weight") == 0 ||
++           strcmp(p, ".ffn_gate_up_exps.weight") == 0;
++}
++
++static int file_index(int fd) {
++    char buf[MAXPATHLEN];
++    if (fcntl(fd, F_GETPATH, buf) != 0) return -1;
++    int file = 0;
++    while (file < (int) g.paths.size() && g.paths[file] != buf) file++;
++    if (file == (int) g.paths.size()) g.paths.push_back(buf);
++    return file;
++}
++
++void tosh_hostcache_note_file_tensor(const void * data, size_t nbytes, int fd, uint64_t file_off) {
++    std::lock_guard<std::mutex> lock(g.m);
++    const int file = file_index(fd);
++    if (file >= 0) g.noted[data] = { nbytes, file_off, file };
++}
++
++void tosh_hostcache_note_fused_tensor(const void * data, size_t nbytes, int fd, uint64_t off_gate, uint64_t off_up) {
++    std::lock_guard<std::mutex> lock(g.m);
++    const int file = file_index(fd);
++    if (file >= 0) g.noted[data] = { nbytes, off_gate, file, off_up };
++}
++
++bool tosh_hostcache_bind(int il, int part, const void * data, size_t part_bytes, int n_expert) {
++    std::lock_guard<std::mutex> lock(g.m);
++    if (g.base != nullptr) return true;   // bound and started by the loader
++    auto it = g.noted.find(data);
++    if (it == g.noted.end() || it->second.nbytes != part_bytes*(size_t) n_expert || part < 0 || part > 2) {
++        g.error = "an expert bank was loaded, or has an unexpected size";
++        return false;
++    }
++    if ((int) g.parts.size() < (il + 1)*3) g.parts.resize((il + 1)*3);
++    const file_tensor & ft = it->second;
++    if (ft.file_off_up != UINT64_MAX) {
++        // fused gate/up: its gate and up halves are the slot's parts 0 and 1, adjacent in the slot
++        if (part != 0 || part_bytes % 2 != 0) { g.error = "a fused gate/up bank in an unexpected place"; return false; }
++        g.parts[il*3 + 0] = { ft.file_off,    ft.file, part_bytes/2, 0 };
++        g.parts[il*3 + 1] = { ft.file_off_up, ft.file, part_bytes/2, 0 };
++    } else {
++        g.parts[il*3 + part].file_off = ft.file_off;
++        g.parts[il*3 + part].file     = ft.file;
++        g.parts[il*3 + part].bytes    = part_bytes;
++    }
++    g.bank_of[data] = { il, part };
++    return true;
++}
++
++static void prewarm(int n_io);
++static void start_warmup_fill();
++
++bool tosh_hostcache_start(int n_layer, int n_expert) {
++    std::unique_lock<std::mutex> lock(g.m);
++    if (!g.error.empty()) return false;
++    if (g.base != nullptr) return true;   // started early by the loader
++    g.n_layer = n_layer;
++    g.n_expert = n_expert;
++    g.parts.resize(n_layer*3);
++    // a slot holds gate, up and down of one expert; layers with another expert size get their own pool
++    std::vector<size_t> layer_bytes(n_layer, 0);
++    for (int il = 0; il < n_layer; ++il) {
++        size_t off = 0;
++        for (int p = 0; p < 3; ++p) {
++            g.parts[il*3 + p].slot_off = off;
++            off += g.parts[il*3 + p].bytes;
++        }
++        layer_bytes[il] = off;
++    }
++    if (g.paths.empty()) { g.error = "no expert bank to cache"; return false; }
++    for (const auto & path : g.paths) {
++        const int fd = open(path.c_str(), O_RDONLY);
++        if (fd < 0) { g.error = "cannot open the model file for expert reads: " + path; return false; }
++        if (getenv("TOSH_DMOE_HOST_NOCACHE") != nullptr) fcntl(fd, F_NOCACHE, 1);
++        g.fds.push_back(fd);
++    }
++
++    g.cap_bytes = (size_t) (atof(getenv("TOSH_DMOE_HOST_CACHE_MIB"))*1048576.0);
++    size_t bank_bytes = 0;
++    g.pool_of_layer.assign(n_layer, -1);
++    for (int il = 0; il < n_layer; ++il) {
++        if (layer_bytes[il] == 0) continue;
++        bank_bytes += layer_bytes[il]*(size_t) n_expert;
++        int pi = -1;
++        for (int k = 0; k < (int) g.pools.size(); ++k) if (g.pools[k].slot_bytes == layer_bytes[il]) pi = k;
++        if (pi < 0) { pi = (int) g.pools.size(); g.pools.emplace_back(); g.pools.back().slot_bytes = layer_bytes[il]; }
++        g.pool_of_layer[il] = pi;
++    }
++    if (g.pools.empty()) { g.error = "no expert bank to cache"; return false; }
++    // every pool holds at least one layer's full expert set, since a prefill chunk can pin them all;
++    // the rest of the budget is shared in proportion to each size class
++    size_t floor_bytes = 0;
++    for (auto & pl : g.pools) floor_bytes += pl.slot_bytes*(size_t) n_expert;
++    if (floor_bytes > g.cap_bytes) { g.error = "the expert cache is smaller than one layer's experts per size class"; return false; }
++    for (auto & pl : g.pools) {
++        size_t class_bytes = 0;
++        for (int il = 0; il < n_layer; ++il) if (g.pool_of_layer[il] >= 0 && g.pools[g.pool_of_layer[il]].slot_bytes == pl.slot_bytes) class_bytes += pl.slot_bytes*(size_t) n_expert;
++        const size_t share = (size_t) ((double) (g.cap_bytes - floor_bytes)*class_bytes/bank_bytes) + pl.slot_bytes*(size_t) n_expert;
++        pl.n = (int) std::min(share/pl.slot_bytes, class_bytes/pl.slot_bytes);
++        pl.first = g.n_slots;
++        g.n_slots += pl.n;
++        pl.bytes = (size_t) pl.n*pl.slot_bytes;
++        void * p = mmap(nullptr, std::max<size_t>(pl.bytes, 1), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
++        if (p == MAP_FAILED) { g.error = "cannot allocate the expert cache"; return false; }
++        pl.base = (char *) p;
++        g.locked_bytes += pl.bytes;
++    }
++    g.base = g.pools[0].base;
++    const int n_keys = n_layer*n_expert;
++    g.slot_of.assign(n_keys, -1);
++    g.ever.assign(n_keys, 0);
++    g.key_of.assign(g.n_slots, -1);
++    g.ref.assign(g.n_slots, 0);
++    g.prev.assign(g.n_slots, -1);
++    g.next.assign(g.n_slots, -1);
++    g.state.assign(g.n_slots, EMPTY);
++    g.enq_t.assign(g.n_slots, 0.0);
++    g.bg.assign(g.n_slots, 0);
++    g.bg_unused.assign(g.n_slots, 0);
++    g.origin.assign(g.n_slots, 0);
++    g.reused.assign(g.n_slots, 0);
++    g.pool_of_slot.assign(g.n_slots, 0);
++    for (int k = 0; k < (int) g.pools.size(); ++k) {
++        auto & pl = g.pools[k];
++        for (int s = pl.first + pl.n - 1; s >= pl.first; --s) { pl.free_slots.push_back(s); g.pool_of_slot[s] = k; }
++    }
++
++    const int n_io = std::max(1, getenv("TOSH_DMOE_HOST_IO") ? atoi(getenv("TOSH_DMOE_HOST_IO")) : 4);
++    for (int i = 0; i < n_io; ++i) std::thread(reader_main).detach();
++    for (auto & pl : g.pools) {
++        fprintf(stderr, "tosh_hostcache: pool of %d slots of %.3f MiB (%.0f MiB)\n", pl.n, pl.slot_bytes/1048576.0, pl.bytes/1048576.0);
++    }
++    fprintf(stderr, "tosh_hostcache: %.0f MiB locked for experts, %d readers, %zu file%s from %s\n", g.locked_bytes/1048576.0, n_io,
++            g.paths.size(), g.paths.size() > 1 ? "s" : "", g.paths[0].c_str());
++    g.t_start = now_us();
++    // locking zero-fills every page; with the warm-up fill on, the pages are filled with experts from
++    // the file while the lock proceeds, and the server waits for the lock before it is ready
++    const bool overlap = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB") != nullptr;
++    auto lock_pools = [] {
++        for (auto & pl : g.pools) {
+             char err[256];
+             if (!mlock_paced(pl.base, pl.bytes, err, sizeof(err))) {
+                 std::lock_guard<std::mutex> lk(g.m);
+                 if (g.error.empty()) g.error = err;
+                 return;
++            }
++        }
++    };
++    lock.unlock();
++    if (overlap) {
++        g.locker = std::thread(lock_pools);
++        // a load that fails before ready exits with the lock thread still attached
++        static const bool joined_at_exit = atexit([] { if (g.locker.joinable()) g.locker.join(); }) == 0;
++        (void) joined_at_exit;
++        start_warmup_fill();
++    } else {
++        lock_pools();
++    }
++    prewarm(n_io);
++    return g.error.empty();
++}
++
++// EXPERIMENT: TOSH_DMOE_HOST_WARMUP_FILL_MIB (a number, or max) reads experts in file order into free
+ // slots from the moment the model finishes loading, past ready, until the budget or the slots run
+ // out. Demand never waits on it: an entry is published only once read, and last in line for eviction.
++static void start_warmup_fill() {
++    const char * v = getenv("TOSH_DMOE_HOST_WARMUP_FILL_MIB");
++    if (v == nullptr) return;
++    const size_t budget = strcmp(v, "max") == 0 ? g.locked_bytes : (size_t) (atof(v)*1048576.0);
++    if (budget == 0) return;
++    const int n_th = std::max(1, getenv("TOSH_DMOE_HOST_FILL_IO") ? atoi(getenv("TOSH_DMOE_HOST_FILL_IO")) : 16);
++    auto next = std::make_shared<std::atomic<int>>(0);
++    auto left = std::make_shared<std::atomic<int>>(n_th);
++    for (int t = 0; t < n_th; ++t) {
++        std::thread([budget, next, left] {
++            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
++            const int n_keys = g.n_layer*g.n_expert;
+             for (int key; (key = (*next)++) < n_keys;) {
++                const int il = key / g.n_expert, e = key % g.n_expert;
++                int s;
++                {
++                    std::lock_guard<std::mutex> lock(g.m);
++                    if (g.pool_of_layer[il] < 0 || g.slot_of[key] >= 0) continue;
++                    if (g.fill_bytes >= budget) break;
++                    auto & pl = g.pools[g.pool_of_layer[il]];
++                    if (pl.free_slots.empty()) { g.fill_skipped++; continue; }   // never evicts
++                    s = pl.free_slots.back();
++                    pl.free_slots.pop_back();
++                    g.resident_bytes += pl.slot_bytes;
++                    g.peak_bytes = std::max(g.peak_bytes, g.resident_bytes);
++                    g.key_of[s] = -1; g.state[s] = LOADING; g.ref[s] = 1;
++                    g.fill_bytes += pl.slot_bytes;
++                }
++                bool ok = true;
++                for (int p = 0; p < 3 && ok; ++p) {
++                    const part_ref & pr = g.parts[il*3 + p];
++                    size_t done = 0;
++                    while (ok && done < pr.bytes) {
++                        const ssize_t r = pread(g.fds[pr.file], g.slot_ptr(s) + pr.slot_off + done, pr.bytes - done,
++                                                (off_t) (pr.file_off + (uint64_t) e*pr.bytes + done));
++                        if (r <= 0) ok = false; else done += (size_t) r;
++                    }
++                }
++                std::lock_guard<std::mutex> lock(g.m);
++                auto & pl = g.pools[g.pool_of_slot[s]];
++                g.ref[s] = 0;
++                if (!ok || g.slot_of[key] >= 0) {
++                    // a demand read it meanwhile, or the read failed: the slot goes back
++                    g.state[s] = EMPTY;
++                    pl.free_slots.push_back(s);
++                    g.resident_bytes -= pl.slot_bytes;
++                    g.fill_bytes -= pl.slot_bytes;
++                    g.fill_dup++;
++                    continue;
++                }
++                g.key_of[s] = key; g.slot_of[key] = s; g.state[s] = RESIDENT;
++                g.ever[key] = 1; g.origin[s] = 2; g.reused[s] = 0;
++                g.lru_push_tail(s);
++                g.fill_n++;
++                g.loaded_n[2]++; g.loaded_bytes[2] += pl.slot_bytes;
++            }
++            if (--*left == 0) {
++                std::lock_guard<std::mutex> lock(g.m);
++                g.fill_stop_t = now_us();
++            }
++        }).detach();
++    }
++}
++
++// EXPERIMENT: fill part of the cache before the first request. TOSH_DMOE_HOST_PREWARM_MIB bytes, taken
++// in layer order (TOSH_DMOE_HOST_PREWARM=seq) or from a list of "layer expert" lines; read one
++// expert at a time in list order, or (TOSH_DMOE_HOST_PREWARM_ORDER=offset) in file order with
++// adjacent experts of a tensor merged into one read
++static void prewarm(int n_io) {
++    const char * mib = getenv("TOSH_DMOE_HOST_PREWARM_MIB");
++    if (mib == nullptr || atof(mib) <= 0) return;
++    const size_t budget = (size_t) (atof(mib)*1048576.0);
++    const char * src = getenv("TOSH_DMOE_HOST_PREWARM") ? getenv("TOSH_DMOE_HOST_PREWARM") : "seq";
++    const bool by_offset = getenv("TOSH_DMOE_HOST_PREWARM_ORDER") && strcmp(getenv("TOSH_DMOE_HOST_PREWARM_ORDER"), "offset") == 0;
++    const double t0 = now_us();
++    std::vector<int> keys;
++    if (strcmp(src, "seq") == 0) {
++        for (int il = 0; il < g.n_layer; ++il) {
++            if (g.pool_of_layer[il] < 0) continue;
++            for (int e = 0; e < g.n_expert; ++e) keys.push_back(il*g.n_expert + e);
++        }
++    } else if (FILE * f = fopen(src, "r")) {
++        int il, e;
++        while (fscanf(f, "%d %d", &il, &e) == 2) {
++            if (il >= 0 && il < g.n_layer && e >= 0 && e < g.n_expert && g.pool_of_layer[il] >= 0) keys.push_back(il*g.n_expert + e);
++        }
++        fclose(f);
++    }
++    std::vector<int> slots;
++    size_t bytes = 0;
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        for (int key : keys) {
++            const int il = key / g.n_expert;
++            auto & pl = g.pools[g.pool_of_layer[il]];
++            if (bytes + pl.slot_bytes > budget) break;
++            if (g.slot_of[key] >= 0 || pl.free_slots.empty()) continue;
++            const int s = g.take_slot(il);
++            g.key_of[s] = key; g.slot_of[key] = s; g.state[s] = LOADING; g.ref[s] = 0; g.ever[key] = 1;
++            slots.push_back(s);
++            bytes += pl.slot_bytes;
++        }
++    }
++    // one read job: a range of one part tensor landing in the parts of one or more slots
++    struct job { int il, part, e0; std::vector<int> s; };
++    std::vector<job> jobs;
++    if (by_offset) {
++        std::vector<int> order = slots;
++        std::sort(order.begin(), order.end(), [](int a, int b) { return g.key_of[a] < g.key_of[b]; });
++        for (int part = 0; part < 3; ++part) {
++            for (size_t i = 0; i < order.size();) {
++                const int k0 = g.key_of[order[i]];
++                if (g.parts[k0 / g.n_expert*3 + part].bytes == 0) { i++; continue; }   // no such part (fused gate/up)
++                job j{ k0 / g.n_expert, part, k0 % g.n_expert, { order[i] } };
++                size_t k = i + 1;
++                // a run stays inside one layer's tensor
++                while (k < order.size() && g.key_of[order[k]] == k0 + (int) (k - i) && g.key_of[order[k]] / g.n_expert == j.il &&
++                       j.s.size() < 64) j.s.push_back(order[k++]);
++                jobs.push_back(std::move(j));
++                i = k;
++            }
++        }
++        std::sort(jobs.begin(), jobs.end(), [](const job & a, const job & b) {
++            const uint64_t oa = g.parts[a.il*3 + a.part].file_off + (uint64_t) a.e0*g.parts[a.il*3 + a.part].bytes;
++            const uint64_t ob = g.parts[b.il*3 + b.part].file_off + (uint64_t) b.e0*g.parts[b.il*3 + b.part].bytes;
++            return oa < ob;
++        });
++    } else {
++        for (int s : slots) {
++            const int k = g.key_of[s];
++            for (int part = 0; part < 3; ++part) {
++                if (g.parts[k / g.n_expert*3 + part].bytes > 0) jobs.push_back({ k / g.n_expert, part, k % g.n_expert, { s } });
++            }
++        }
++    }
++    std::atomic<size_t> next{0};
++    std::atomic<uint64_t> n_reads{0};
++    std::vector<std::thread> th;
++    for (int t = 0; t < n_io; ++t) {
++        th.emplace_back([&] {
++            for (size_t i; (i = next++) < jobs.size();) {
++                const job & j = jobs[i];
++                const part_ref & pr = g.parts[j.il*3 + j.part];
++                std::vector<iovec> iov(j.s.size());
++                for (size_t k = 0; k < j.s.size(); ++k) iov[k] = { g.slot_ptr(j.s[k]) + pr.slot_off, pr.bytes };
++                const size_t want = pr.bytes*j.s.size();
++                size_t got = 0;
++                const off_t off = (off_t) (pr.file_off + (uint64_t) j.e0*pr.bytes);
++                while (got < want) {
++                    // resume a short read inside the vector
++                    size_t skip = got, k = 0;
++                    while (skip >= iov[k].iov_len) { skip -= iov[k].iov_len; k++; }
++                    iovec first = { (char *) iov[k].iov_base + skip, iov[k].iov_len - skip };
++                    std::vector<iovec> rest(iov.begin() + k, iov.end());
++                    rest[0] = first;
++                    const ssize_t r = preadv(g.fds[pr.file], rest.data(), (int) rest.size(), off + (off_t) got);
++                    if (r <= 0) { std::lock_guard<std::mutex> lock(g.m); if (g.error.empty()) g.error = "prewarm read failed"; return; }
++                    got += (size_t) r;
++                }
++                n_reads++;
++            }
++        });
++    }
++    for (auto & t : th) t.join();
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        for (int s : slots) { g.state[s] = RESIDENT; g.lru_push(s); }
++        g.prewarm_bytes = bytes;
++        g.prewarm_us = now_us() - t0;
++    }
++    fprintf(stderr, "tosh_hostcache: prewarm %zu experts, %.0f MiB from %s in %s order, %llu reads, %.0f ms (%.2f GB/s)\n",
++            slots.size(), bytes/1048576.0, strcmp(src, "seq") == 0 ? "layer order" : "a list", by_offset ? "file" : "list",
++            (unsigned long long) n_reads.load(), g.prewarm_us/1000, bytes/(g.prewarm_us*1e3));
++}
++
+ bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
+     return mlock_paced(addr, bytes, err, err_len);
+ }
+ 
++bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
++    const double t0 = now_us();
++    std::unique_lock<std::mutex> lock(g.m);
++    std::vector<int> wait;
++    std::vector<uint8_t> wait_cls;     // 0 own read, 1 another demand, 2 a read-back
++    bool queued = false;
++    for (int i = 0; i < n; ++i) {
++        const int e = ids[i];
++        if (e < 0 || e >= g.n_expert) continue;
++        const int key = il*g.n_expert + e;
++        g.req[kind]++;
++        int s = g.slot_of[key];
++        if (s >= 0) {
++            if (g.ref[s]++ == 0 && g.in_lru(s)) g.lru_unlink(s);
++            if (g.bg_unused[s]) {
++                g.bg_unused[s] = 0;
++                g.bg_used++;
++                if (g.state[s] != RESIDENT) g.bg_used_loading++;
++            }
++            if (g.ready && g.origin[s] != 0 && !g.reused[s]) {
++                g.reused[s] = 1;
++                g.reuse_n[g.origin[s]]++;
++                g.reuse_bytes[g.origin[s]] += g.pools[g.pool_of_slot[s]].slot_bytes;
++            }
++            if (g.state[s] == RESIDENT) {
++                g.hit[kind]++;
++            } else {
++                g.coalesced++;
++                wait.push_back(s);
++                wait_cls.push_back(g.bg[s] ? 2 : 1);
++                if (g.bg[s]) {
++                    // a demand waits on a queued read-back: it goes ahead of the backlog
++                    auto it = std::find(g.queue.begin(), g.queue.end(), s);
++                    if (it != g.queue.end()) {
++                        g.queue.erase(it);
++                        g.queue.push_front(s);
++                        g.boosted++;
++                        queued = true;
++                    }
++                }
++            }
++            continue;
++        }
++        s = g.take_slot(il);
++        if (s < 0) {
++            if (g.error.empty()) g.error = "the expert cache is smaller than the experts pinned at once";
++            return false;
++        }
++        g.key_of[s] = key;
++        g.slot_of[key] = s;
++        g.state[s] = LOADING;
++        g.ref[s] = 1;
++        g.cold[kind]++;
++        g.cold_total++;
++        g.reloads += g.ever[key];
++        g.ever[key] = 1;
++        g.enq_t[s] = now_us();
++        g.bg[s] = 0;
++        g.bg_unused[s] = 0;
++        g.origin[s] = g.ready ? 0 : 1;
++        g.reused[s] = 0;
++        g.loaded_n[g.origin[s]]++;
++        g.loaded_bytes[g.origin[s]] += g.pools[g.pool_of_slot[s]].slot_bytes;
++        g.queue.push_front(s);    // ahead of the read-backs of evicted experts
++        queued = true;
++        wait.push_back(s);
++        wait_cls.push_back(0);
++    }
++    if (queued) g.work.notify_all();
++    for (size_t i = 0; i < wait.size(); ++i) {
++        const int s = wait[i];
++        const double tw = now_us();
++        g.loaded.wait(lock, [s] { return g.state[s] == RESIDENT; });
++        const double dt = now_us() - tw;
++        if (wait_cls[i] == 0) g.wait_own_us[kind] += dt; else if (wait_cls[i] == 1) g.wait_co_dem_us[kind] += dt; else g.wait_co_bg_us[kind] += dt;
++    }
++    const double t1 = now_us();
++    g.wait_us[kind] += t1 - t0;
++    if (!wait.empty()) tosh_dmoe_timeline(30 + kind, il, t0*1e-6, t1*1e-6);
++    return g.error.empty();
++}
++
++const char * tosh_hostcache_part(int il, int e, int part) {
++    const int s = g.slot_of[il*g.n_expert + e];
++    return s < 0 ? nullptr : g.slot_ptr(s) + g.parts[il*3 + part].slot_off;
++}
++
++void tosh_hostcache_release(int il, const int32_t * ids, int n) {
++    std::lock_guard<std::mutex> lock(g.m);
++    for (int i = 0; i < n; ++i) {
++        const int e = ids[i];
++        if (e < 0 || e >= g.n_expert) continue;
++        const int s = g.slot_of[il*g.n_expert + e];
++        if (s >= 0 && --g.ref[s] == 0) g.lru_push(s);
++    }
++}
++
++void tosh_hostcache_drop(int il, int e) {
++    std::lock_guard<std::mutex> lock(g.m);
++    if (g.base == nullptr) return;
++    const int key = il*g.n_expert + e;
++    const int s = g.slot_of[key];
++    if (s < 0 || g.ref[s] != 0 || g.state[s] != RESIDENT) return;
++    if (g.bg_unused[s]) { g.bg_unused[s] = 0; g.bg_dropped_unused++; }
++    // the copy stays, first in line for eviction: if the expert leaves VRAM before it is evicted
++    // here, nothing has to be read back
++    g.lru_unlink(s);
++    g.lru_push_tail(s);
++    g.kept_on_promotion++;
++}
++
+ // a slot for an expert coming back from VRAM, or -1 when RAM still holds it or has no room; g.m held
+ static int readback_slot(int il, int e) {
+     const int key = il*g.n_expert + e;
+     if (g.base == nullptr) return -1;
+     if (g.slot_of[key] >= 0) {
+         // a copy kept on promotion: it is needed again
+         const int s = g.slot_of[key];
+         if (g.ref[s] == 0 && g.state[s] == RESIDENT && g.in_lru(s)) { g.lru_unlink(s); g.lru_push(s); g.refreshed++; }
+@@ -68,17 +730,27 @@ static int readback_slot(int il, int e) {
+     g.enq_t[s] = now_us();
+     g.bg[s] = 1;
+     g.bg_unused[s] = 1;
+     g.origin[s] = g.ready ? 0 : 1;
+     g.reused[s] = 0;
+     return s;
+ }
+ 
++void tosh_hostcache_prefetch(int il, int e) {
++    {
++        std::lock_guard<std::mutex> lock(g.m);
+         const int s = readback_slot(il, e);
++        if (s < 0) return;
++        g.prefetches++;
++        g.queue.push_back(s);
++    }
++    g.work.notify_one();
++}
++
+ bool tosh_hostcache_store(int il, int e) {
+     std::lock_guard<std::mutex> lock(g.m);
+     return readback_slot(il, e) >= 0;
+ }
+ 
+ void tosh_hostcache_store_done(int il, int e, bool ok) {
+     {
+         std::lock_guard<std::mutex> lock(g.m);
+@@ -91,12 +763,116 @@ void tosh_hostcache_store_done(int il, int e, bool ok) {
+         } else {
+             g.prefetches++;
+             g.queue.push_back(s);
+         }
+     }
+     if (ok) g.loaded.notify_all(); else g.work.notify_one();
+ }
+ 
++bool tosh_hostcache_lookup(const void * data, int * il, int * part) {
++    std::lock_guard<std::mutex> lock(g.m);
++    auto it = g.bank_of.find(data);
++    if (it == g.bank_of.end()) return false;
++    *il = it->second.first;
++    *part = it->second.second;
++    return true;
++}
++
++bool tosh_hostcache_bytecheck(const void * data, size_t part_bytes, int e) {
++    file_tensor ft;
++    std::string path;
++    {
++        std::lock_guard<std::mutex> lock(g.m);
++        auto it = g.noted.find(data);
++        if (it == g.noted.end()) return false;
++        ft = it->second;
++        path = g.paths[ft.file];
++    }
++    const int fd = open(path.c_str(), O_RDONLY);
++    if (fd < 0) return false;
++    fcntl(fd, F_NOCACHE, 1);
++    const bool fused = ft.file_off_up != UINT64_MAX;
++    const size_t n = fused ? part_bytes/2 : part_bytes;
++    std::vector<char> buf(part_bytes);
++    bool ok = pread(fd, buf.data(), n, (off_t) (ft.file_off + (uint64_t) e*n)) == (ssize_t) n;
++    if (ok && fused) ok = pread(fd, buf.data() + n, n, (off_t) (ft.file_off_up + (uint64_t) e*n)) == (ssize_t) n;
++    ok = ok && memcmp(buf.data(), (const char *) data + (size_t) e*part_bytes, part_bytes) == 0;
++    close(fd);
++    return ok;
++}
++
++int tosh_hostcache_n_files(void) {
++    std::lock_guard<std::mutex> lock(g.m);
++    return (int) g.paths.size();
++}
++
++const char * tosh_hostcache_error(void) {
++    return g.error.empty() ? nullptr : g.error.c_str();
++}
++
++uint64_t tosh_hostcache_cold_reads(void) {
++    return g.cold_total.load();
++}
++
++bool tosh_hostcache_warmup_done(void) {
++    if (g.base == nullptr || g.ready) return g.error.empty();
++    // never ready with an unlocked cache
++    if (g.locker.joinable()) g.locker.join();
++    std::lock_guard<std::mutex> lock(g.m);
++    g.ready = true;
++    g.t_ready = now_us();
+     uint64_t hits = 0;
+     for (int k = 0; k < TOSH_HC_KINDS; ++k) hits += g.hit[k];
++    if (!g.error.empty()) fprintf(stderr, "tosh_hostcache: %s\n", g.error.c_str());
++    fprintf(stderr, "tosh_hostcache: ready %.0f ms after the cache started | resident %.0f MiB (%.1f%% of %.0f locked) | warm-up read %llu experts (%.0f MiB), hits %llu | fill %llu experts (%.0f MiB) so far\n",
++            (g.t_ready - g.t_start)/1000, g.resident_bytes/1048576.0, 100.0*g.resident_bytes/std::max<size_t>(1, g.locked_bytes), g.locked_bytes/1048576.0,
++            (unsigned long long) g.loaded_n[1], g.loaded_bytes[1]/1048576.0, (unsigned long long) hits,
++            (unsigned long long) g.fill_n, g.fill_bytes/1048576.0);
++    return g.error.empty();
++}
++
++void tosh_hostcache_report(void) {
++    std::lock_guard<std::mutex> lock(g.m);
++    if (g.base == nullptr) return;
++    static const char * names[TOSH_HC_KINDS] = { "decode", "wide", "promote", "prefill", "verify" };
++    for (int k = 0; k < TOSH_HC_KINDS; ++k) {
++        if (g.req[k] == 0) continue;
++        fprintf(stderr, "tosh_hostcache: %-7s requests %llu, warm hits %llu (%.2f%%), cold %llu, waited %.1f ms\n", names[k],
++                (unsigned long long) g.req[k], (unsigned long long) g.hit[k], 100.0*g.hit[k]/g.req[k], (unsigned long long) g.cold[k], g.wait_us[k]/1000);
++    }
++    auto pq = [](std::vector<float> v, double f) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return (double) v[std::min(v.size() - 1, (size_t) (f*v.size()))]; };
++    for (int c = 0; c < 2; ++c) {
++        fprintf(stderr, "tosh_hostcache: %s reads %llu (%.1f MiB) | queue wait p50 %.0f p95 %.0f p99 %.0f us | read p50 %.0f p95 %.0f p99 %.0f us\n",
++                c ? "read-back" : "demand   ", (unsigned long long) g.rd_n[c], g.rd_bytes[c]/1048576.0,
++                pq(g.qwait_us[c], 0.5), pq(g.qwait_us[c], 0.95), pq(g.qwait_us[c], 0.99), pq(g.rd_us[c], 0.5), pq(g.rd_us[c], 0.95), pq(g.rd_us[c], 0.99));
++    }
++    for (int k = 0; k < TOSH_HC_KINDS; ++k) {
++        if (g.req[k] == 0) continue;
++        fprintf(stderr, "tosh_hostcache: %-7s waits: own reads %.1f ms, another demand %.1f ms, a read-back %.1f ms\n", names[k],
++                g.wait_own_us[k]/1000, g.wait_co_dem_us[k]/1000, g.wait_co_bg_us[k]/1000);
++    }
++    const uint64_t bg_left = [] { uint64_t n = 0; for (auto u : g.bg_unused) n += u; return n; }();
++    fprintf(stderr, "tosh_hostcache: read-backs used %llu (%llu while loading), evicted unused %llu, dropped unused %llu, still unused %llu\n",
++            (unsigned long long) g.bg_used, (unsigned long long) g.bg_used_loading, (unsigned long long) g.bg_wasted,
++            (unsigned long long) g.bg_dropped_unused, (unsigned long long) bg_left);
++    fprintf(stderr, "tosh_hostcache: file reads: first touch %llu, capacity miss %llu, read-back %llu\n",
++            (unsigned long long) (g.rd_n[0] > g.reloads ? g.rd_n[0] - g.reloads : 0), (unsigned long long) g.reloads, (unsigned long long) g.rd_n[1]);
++    fprintf(stderr, "tosh_hostcache: read-backs moved ahead for a waiting demand %llu | promoted copies kept %llu, refreshed on eviction %llu\n",
++            (unsigned long long) g.boosted, (unsigned long long) g.kept_on_promotion, (unsigned long long) g.refreshed);
++    std::vector<float> v = g.read_us;
++    std::sort(v.begin(), v.end());
++    auto q = [&](double f) { return v.empty() ? 0.0 : (double) v[std::min(v.size() - 1, (size_t) (f*v.size()))]; };
+     fprintf(stderr, "tosh_hostcache: read back on eviction %llu, copied back from VRAM %llu\n",
+             (unsigned long long) g.prefetches, (unsigned long long) g.stored);
++    if (g.t_ready > 0) {
++        fprintf(stderr, "tosh_hostcache: loaded before ready: warm-up %llu (%.0f MiB), fill %llu (%.0f MiB, %llu superseded, stopped %.0f ms after ready) | used after ready: warm-up %llu (%.0f MiB), fill %llu (%.0f MiB)\n",
++                (unsigned long long) g.loaded_n[1], g.loaded_bytes[1]/1048576.0, (unsigned long long) g.loaded_n[2], g.loaded_bytes[2]/1048576.0,
++                (unsigned long long) g.fill_dup, g.fill_stop_t > 0 ? (g.fill_stop_t - g.t_ready)/1000 : -1.0,
++                (unsigned long long) g.reuse_n[1], g.reuse_bytes[1]/1048576.0, (unsigned long long) g.reuse_n[2], g.reuse_bytes[2]/1048576.0);
++    }
++    fprintf(stderr, "tosh_hostcache: reads %llu (%.1f MiB), coalesced %llu, evictions %llu, reloads %llu | expert read p50 %.0f p95 %.0f p99 %.0f us | resident %.0f MiB, peak %.0f MiB of %.0f locked\n",
++            (unsigned long long) g.reads, g.read_bytes/1048576.0, (unsigned long long) g.coalesced, (unsigned long long) g.evictions,
++            (unsigned long long) g.reloads, q(0.5), q(0.95), q(0.99), g.resident_bytes/1048576.0,
++            g.peak_bytes/1048576.0, g.locked_bytes/1048576.0);
++}
++
++}  // extern "C"
+diff --git a/tosh-moe/tosh-hostcache.h b/tosh-moe/tosh-hostcache.h
+index 103e5b32f..597bd9b29 100644
+--- a/tosh-moe/tosh-hostcache.h
++++ b/tosh-moe/tosh-hostcache.h
+@@ -1,8 +1,70 @@
++// EXPERIMENTAL bounded host expert cache (TOSH_DMOE_HOST_CACHE_MIB). The expert bank tensors hold
++// no data: whole experts are read from the model file with pread into a locked RAM cache on
++// demand, and every host reader of the bank goes through this cache.
++
++#pragma once
++
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum tosh_hostcache_kind {
++    TOSH_HC_DECODE = 0,     // decode rows the host computes
++    TOSH_HC_WIDE,           // rare prefill rows the host computes
++    TOSH_HC_PROMOTE,        // uploads into the VRAM arena
++    TOSH_HC_PREFILL,        // prefill bank uploads
++    TOSH_HC_VERIFY,
++    TOSH_HC_KINDS,
++};
++
++bool tosh_hostcache_on(void);
++bool tosh_hostcache_is_bank_name(const char * name);
++
++// loader: a bank tensor left unread, with where its bytes are in the file
++void tosh_hostcache_note_file_tensor(const void * data, size_t nbytes, int fd, uint64_t file_off);
++// a gate/up pair the loader fuses: expert e is gate row block e then up row block e of the file
++void tosh_hostcache_note_fused_tensor(const void * data, size_t nbytes, int fd, uint64_t off_gate, uint64_t off_up);
++
++// Dynamic MoE init: layer il's part (0 gate, 1 up, 2 down) is the noted tensor at data
++bool tosh_hostcache_bind(int il, int part, const void * data, size_t part_bytes, int n_expert);
++// allocates and locks the cache and starts the readers; false with tosh_hostcache_error() set
++bool tosh_hostcache_start(int n_layer, int n_expert);
++
+ // locks [addr, addr+bytes) a step at a time, waiting while the system reports memory pressure;
+ // false with a message in err (at least 256 bytes) when the lock fails or the pressure stays up
+ bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len);
+ 
++// pins experts ids[0..n) of layer il, reading the missing ones; false after a read failure
++bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind);
++const char * tosh_hostcache_part(int il, int e, int part);
++void tosh_hostcache_release(int il, const int32_t * ids, int n);
++
++// an expert promoted to VRAM keeps its RAM copy first in line for eviction (drop); one leaving
++// VRAM without a copy is read back in the background, behind demand reads (prefetch)
++void tosh_hostcache_drop(int il, int e);
++void tosh_hostcache_prefetch(int il, int e);
+ // the same expert, when the caller copies its bytes out of VRAM instead: true when a slot waits
+ // for them at tosh_hostcache_part(); done publishes it, or falls back to the file read
+ bool tosh_hostcache_store(int il, int e);
+ void tosh_hostcache_store_done(int il, int e, bool ok);
++
++// bank tensor data pointer -> layer and part, for uploads that only know the source pointer
++bool tosh_hostcache_lookup(const void * data, int * il, int * part);
++
++// full bank loaded: expert e of a noted tensor read with pread equals the loaded bytes
++bool tosh_hostcache_bytecheck(const void * data, size_t part_bytes, int e);
++int  tosh_hostcache_n_files(void);
++
++const char * tosh_hostcache_error(void);
++uint64_t     tosh_hostcache_cold_reads(void);
++void         tosh_hostcache_report(void);
++// the server finished its warm-up and is about to be ready: warm-up fill stops, reuse is counted
++bool         tosh_hostcache_warmup_done(void);   // false: the cache could not be locked, nothing may run
++
++#ifdef __cplusplus
++}
++#endif

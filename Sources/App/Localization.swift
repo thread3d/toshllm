@@ -53,11 +53,11 @@ final class Localizer: ObservableObject {
     /// Returns the string for the active language.
     func t(_ es: String, _ en: String) -> String {
         switch language {
-        case "es": return es
-        case "en": return en
+        case "es": return AppInfo.branded(es)
+        case "en": return AppInfo.branded(en)
         default:
-            if let v = overlay[en], !v.isEmpty { return v }
-            return en
+            if let v = overlay[en], !v.isEmpty { return AppInfo.branded(v) }
+            return AppInfo.branded(en)
         }
     }
 

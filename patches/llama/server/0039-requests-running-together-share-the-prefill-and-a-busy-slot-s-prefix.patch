@@ -1,0 +1,174 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 49363af64..81e85834c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -7,10 +7,28 @@
+ #include "server-queue.h"
+ #include "server-schema.h"
+ #include "server-stream.h"
+ 
+ #include "build-info.h"
++
++// TOSH_PREFILL_SHARE: prompt tokens per step while two or more requests are in flight (default n_ubatch, 0 = off)
++static int32_t prefill_share(int32_t n_ubatch) {
++    static const int32_t v = [] {
++        const char * e = getenv("TOSH_PREFILL_SHARE");
++        return e ? atoi(e) : -1;
++    }();
++    return v < 0 ? n_ubatch : v;
++}
++
++// TOSH_PREFIX_COPY=0: a new request never takes a shared prefix from a busy slot
++static bool prefix_copy() {
++    static const bool v = [] {
++        const char * e = getenv("TOSH_PREFIX_COPY");
++        return !e || strcmp(e, "0") != 0;
++    }();
++    return v;
++}
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
+ #include "log.h"
+ #include "sampling.h"
+@@ -1777,10 +1795,12 @@ private:
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
+                 ret->prompt_save(*prompt_cache);
+ 
++                save_busy_prefix(*ret, task);
++
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+                 }
+ 
+                 prompt_cache->update();
+@@ -1790,10 +1810,62 @@ private:
+         }
+ 
+         return ret;
+     }
+ 
++    // a busy slot may hold a much longer prefix of this prompt, such as the instructions every agent pass starts with:
++    // copy it to the cache for the load that follows, which keeps only the common prefix
++    void save_busy_prefix(const server_slot & dst, const server_task & task) {
++        if (task.tokens.has_mtmd || !prefix_copy()) {
++            return;
++        }
++
++        const bool needs_ckpt =
++            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0;
++
++        size_t best = dst.prompt.tokens.get_common_prefix(task.tokens);
++        for (const auto & st : prompt_cache->states) {
++            const size_t lcp = st.prompt.tokens.get_common_prefix(task.tokens);
++            if (4*lcp >= st.prompt.tokens.size()) {
++                best = std::max(best, lcp);
++            }
++        }
++
++        const size_t n_min = llama_n_ubatch(ctx_tgt);
++
++        const server_slot * src = nullptr;
++        for (const auto & slot : slots) {
++            if (&slot == &dst || !slot.is_processing() || slot.prompt.tokens.empty() || slot.prompt.tokens.has_mtmd) {
++                continue;
++            }
++            const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
++            // the load below refuses an entry that would keep less than a quarter of itself
++            if (4*lcp < slot.prompt.tokens.size()) {
++                continue;
++            }
++            size_t usable = lcp;
++            if (needs_ckpt) {
++                usable = 0;
++                for (const auto & ckpt : slot.prompt.checkpoints) {
++                    if ((size_t) ckpt.n_tokens <= lcp) {
++                        usable = std::max(usable, (size_t) ckpt.n_tokens);
++                    }
++                }
++            }
++            if (usable >= best + n_min) {
++                best = usable;
++                src  = &slot;
++            }
++        }
++
++        if (src) {
++            SLT_INF(*src, "copying a shared prefix of %zu tokens to the prompt cache for slot %d\n", best, dst.id);
++            src->prompt_save(*prompt_cache);
++        }
++    }
++
+     // return true if at least one slot has been cleared
+     // TODO: improve logic
+     //       - smarter decision which slot to clear (LRU or longest prompt?)
+     //       - move slot to level 2 cache instead of removing?
+     //       - instead of purging, try to store and resume later?
+@@ -3330,23 +3402,50 @@ private:
+         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+ 
+         auto & alora_scale       = batch.alora_scale;
+         auto & alora_disabled_id = batch.alora_disabled_id;
+ 
++        // with two or more requests in flight, prompts advance a share per step, so the slots that generate are not
++        // held for a whole n_batch
++        int n_active = 0;
++        for (const auto & slot : slots) {
++            n_active += slot.is_processing();
++        }
++        const int32_t n_share  = prefill_share(n_ubatch);
++        const bool    sharing  = n_share > 0 && n_active >= 2;
++        const int32_t n_shared = std::min<int32_t>(n_batch, batch.size() + n_share);
++
++        // while sharing, prompts take their turn in the order their requests came in
++        std::vector<server_slot *> fill_order;
++        for (auto & slot : slots) {
++            fill_order.push_back(&slot);
++        }
++        if (sharing) {
++            std::stable_sort(fill_order.begin(), fill_order.end(), [](const server_slot * a, const server_slot * b) {
++                return (a->task ? a->task->id : INT_MAX) < (b->task ? b->task->id : INT_MAX);
++            });
++        }
++
+         // next, batch any pending prompts without exceeding n_batch
+         if (params_base.cont_batching || batch.size() == 0) {
+             bool add_ok = true; // false means the batch is full, skip remaining slots
+ 
+-            iterate(slots, [&](server_slot & slot) {
++            iterate(fill_order, [&](server_slot & slot) {
+                 if (!add_ok || batch.size() >= n_batch) {
+                     return; // batch is full, skip remaining slots
+                 }
+ 
+                 if (!slot.is_processing()) {
+                     return;
+                 }
+ 
++                // a decision or an unsplittable prompt needs its tokens in one batch
++                const int32_t n_fill = sharing && slot.can_split() && slot.task->type != SERVER_TASK_TYPE_DECISION ? n_shared : n_batch;
++                if (batch.size() >= n_fill) {
++                    return;
++                }
++
+                 // check if we can batch this slot with the previous one
+                 if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                     return;
+                 }
+ 
+@@ -3790,11 +3889,11 @@ private:
+                     const auto last_user_pos = spans.last_user_message_pos();
+ 
+                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
+ 
+                     // add prompt tokens for processing in the current batch
+-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
++                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_fill) {
+                         // get next token to process
+                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
+                         if (cur_tok == LLAMA_TOKEN_NULL) {
+                             break; // end of text chunk
+                         }

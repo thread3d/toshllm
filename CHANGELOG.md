@@ -3,7 +3,280 @@
 All notable changes to ToshLLM are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.87.31] - 2026-10-29
+
+### Improved
+
+- **LLMs: Q5_1, Q5_0, Q8_0, Q4_1, Q2_K and Q4_0 models read prompts up to 15% faster on Radeon RX 6000 cards, with identical output.** On an RX 6700 XT Qwen3-4B Q5_1 goes from 1426 to 1645 tokens a second, Q5_0 from 1452 to 1601, Q4_1 from 1640 to 1694 and Q8_0 from 1642 to 1663, Llama 2 7B Q8_0 from 945 to 990, and gemma-4-26B-A4B, whose experts are partly Q5_1, from 569 to 582; generation is unchanged.
+- **LLMs: MXFP4 models read prompts up to 15% faster on Radeon RX 6000 cards, with identical output.** On an RX 6700 XT Ornith 1.5 9B goes from 782 to 864 tokens a second, Mellum2 12B from 2073 to 2185 and gpt-oss 20b, fully on the GPU, from 1313 to 1514; generation is unchanged.
+- **LLMs: MXFP4 mixture-of-experts models read short prompts up to three times faster on Radeon RX 6000 cards.** On an RX 6700 XT gpt-oss 20b, fully on the GPU, reads a 128-token prompt at 964 tokens a second instead of 304, and gemma-4-26B-A4B MXFP4 at 177 instead of 148.
+- **LLMs: BF16 models read prompts up to 34% faster on Radeon RX 6000 cards.** On an RX 6700 XT Qwen3 0.6B BF16 goes from 6910 to 9263 tokens a second, within 3% of the same model in F16; generation is unchanged.
+- **LLMs: gpt-oss generates 3% faster, and dense MXFP4 models 1% faster, on Radeon RX 6000 cards.** On an RX 6700 XT gpt-oss 20b, fully on the GPU, goes from 106.4 to 109.6 tokens a second and Ornith 1.5 9B from 65.0 to 65.7.
+- **LLMs: Qwen3.6-35B-A3B generates 3% faster with Dynamic MoE on Radeon RX 6000 cards, with identical output.** On an RX 6700 XT it goes from 55.5 to 57.2 tokens a second.
+- **LLMs: mixture-of-experts models with small Q4_K experts, such as Qwen3.6-35B-A3B, generate 1% faster and read short prompts 6% faster on Radeon RX 6000 cards, with identical output.** On an RX 6700 XT Qwen3.6-35B-A3B with Dynamic MoE goes from 59.6 to 60.4 tokens a second, and from 150 to 159 on a short prompt.
+- **LLMs: Q8_0 mixture-of-experts models with small experts generate 4% faster on Radeon RX 6000 cards, with identical output.** On an RX 6700 XT Granite 3.1 3B-A800M Q8_0 goes from 175.1 to 182.6 tokens a second.
+- **LLMs: with Dynamic MoE on Radeon RX 6000 cards, a model whose MTP head would take too much of the VRAM left for experts starts without it, and generates faster.** On an RX 6700 XT Qwen3.6-35B-A3B goes from 58.2 to 60.9 tokens a second once its experts are cached.
+
+### Fixed
+
+- **LLMs: Qwen3.8-Flash-Next and other models with a gated shared expert load again with TensorMesh,** where 0.87.30 stopped the engine as soon as it generated its first token.
+- **LLMs: a model with an MTP head starts without it when there is no room for the head, instead of the engine stopping with "failed to create MTP context".**
+
+## [0.87.30] - 2026-10-28
+
+### Added
+
+- **The web chat has four more colour themes, Sepia, Ocean, Forest and Lavender,** next to System, Light and Dark; a theme shows as soon as it is picked and stays with Save settings. Contributed by [Basten7](https://github.com/Basten7) in [#142](https://github.com/engeldlgado/toshllm/issues/142).
+
+### Improved
+
+- **LLMs: Q4_0, Q4_K_M, Q5_K_M and Q8_0 models generate up to 4% more tokens per second on Radeon RX 6000 cards.** The gate and up projections and their activation run as one step while generating, with identical output. On an RX 6700 XT: Qwen3-4B Q5_K_M 87.6 to 91.1 t/s, Qwen3-4B Q8_0 69.5 to 71.3, Qwen3-8B Q4_K_M 63.7 to 65.0 and Llama 2 7B Q4_0 77.9 to 79.2.
+- **LLMs: small models generate up to 12% more tokens per second on Radeon RX 6000 cards.** The GPU no longer waits for the engine to finish preparing each step: Qwen3-0.6B goes from 321.7 to 359.0 t/s and Qwen3-4B from 112.0 to 114.1 on an RX 6700 XT, while 7B and larger models are unchanged.
+- **LLMs: Q5_1 models generate 10% more tokens per second on Radeon RX 6000 cards.** Qwen3-4B Q5_1 goes from 79.6 to 87.6 t/s on an RX 6700 XT.
+- **LLMs: IQ1, IQ2, IQ3, Q2_K and Q3_K models generate up to 36% more tokens per second on Radeon RX 6000 cards, and Q5_K models up to 2%.** Their weights are unpacked with fewer operations while generating, with identical output: on an RX 6700 XT Qwen3.5-9B IQ1_M goes from 45.3 to 61.5 t/s and IQ2_XXS from 60.8 to 69.3, and Qwen3-4B IQ3_M from 82.7 to 99.1, IQ2_XS from 91.5 to 108.5, Q2_K from 111.0 to 121.8 and Q5_K_M from 88.9 to 90.4.
+- **LLMs: MoE models whose experts are Q5_K, Q3_K, Q2_K or IQ generate up to 4% more tokens per second on Radeon RX 6000 cards when the experts run on the GPU.** The expert layers take the same lighter unpacking as the dense ones: on an RX 6700 XT OLMoE 1B-7B Q5_K_M goes from 243 to 253 t/s, with the same text.
+- **LLMs: MoE models that normalise their router, such as Qwen3, Qwen3.5 and Qwen3.6, take fewer GPU steps per token on Radeon RX 6000 cards, with identical output.** The router's weight normalisation and the shared expert's gate now run inside the steps around them: on an RX 6700 XT Qwen3.6-35B-A3B spends 1.6% less GPU time per token.
+- **Images: a model sized for more VRAM than the card has can be installed and run.** The tab says how much VRAM the model was sized for and lets it run when the chosen size fits the card; it used to refuse the model outright. Reported by [Mic238](https://github.com/Mic238) in [#138](https://github.com/engeldlgado/toshllm/issues/138).
+- **Settings: every row has its icon and keeps its label in line with its control,** and Speech & Audio uses the same rows as the other tabs; in Audio each choice has its label above it, as in Images and Video.
+- **No text in the app is smaller than 10 points.** Badges, table headers, file names and progress labels were 9, under the size macOS treats as its minimum; the chat text still grows with ⌘+. Reported by [TomDev234](https://github.com/TomDev234) in [#141](https://github.com/engeldlgado/toshllm/issues/141).
+- **Screens keep their layout in a narrow window.** Benchmarks, Logs and About set their cards two by two instead of cutting titles or splitting a word, the benchmark results stack each run's details under its model instead of hiding the speeds past the edge, the benchmark buttons that do not fit show only their icon, and the system card puts its figures on two rows with the processor's short name. The recommended model's figures sit in one row and a library's Use button keeps one column.
+
+### Fixed
+
+- **LLMs: the server no longer crashes on a deeply nested grammar sent through the API;** the request is refused with an error instead. Taken from upstream.
+- **LLMs: an edited or regenerated conversation no longer resumes from a checkpoint of the old text** on models with sliding-window or recurrent layers, such as Gemma and the hybrid Qwen models. Taken from upstream.
+- **LLMs: MoE models on the GPU can no longer write the sum of their experts over the memory it reads from,** which rarely gave a wrong result, and very large matrix outputs no longer overflow their offsets. Taken from upstream.
+- **LLMs: Gemma 2 runs its attention on the GPU with flash attention on, so it no longer slows down with a quantized KV cache on Radeon RX 6000 cards.** Its attention went to the CPU in every layer, which the app does whenever the KV cache is quantized: on an RX 6700 XT gemma-2 2B goes from 51 to 142 t/s and gemma-2 9B from 20 to 54.
+- **LLMs: LFM2 models no longer stop the engine with code 8.** Keeping a checkpoint or the prompt cache of an LFM2 model, which happens on almost every message, stopped the engine; they now answer and pick a conversation up from the cache. Reported by [mnerd](https://github.com/mnerd) in [#144](https://github.com/engeldlgado/toshllm/issues/144).
+- **Logs: an engine crash shows as errors.** Its abort, backtrace and restart notice counted as information, so the error count read 0 after a crash; the backtrace now reads compact, the restart notice gives its reason once, the cards of a narrow window keep one row, and a wrapped line no longer leaves a gap above it; a long name such as an IOKit error wraps at its parts instead of a hyphen the log does not have.
+- **Video: the resolution picker shows the size a run will use** instead of an empty box, and the side panel's controls line up on the right, as in Images.
+- **The web chat builds from source again with npm 10,** whose `npm ci` stopped on a package missing from the lock file. Reported by [Basten7](https://github.com/Basten7) in [#142](https://github.com/engeldlgado/toshllm/issues/142).
+- **Buttons and descriptions that were cut are whole again,** such as Attach file and Suggestions on an empty chat, the library's description and the About credits.
+- **The system card's cores and threads and a server's context in Logs are translated.**
+
+## [0.87.29] - 2026-10-22
+
+### Fixed
+
+- **LLMs: GLM-4-0414 models run a tool they call after writing some text.** The model writes what it is about to do, then the call in a block of its own, and that call came out in the answer as text; it now runs, with the text before it kept as the answer. Reported by [andruwa13](https://github.com/andruwa13) in [#129](https://github.com/engeldlgado/toshllm/issues/129).
+- **Servers: a setting locked while the server runs says so.** The model's micro-batch, its experts on the CPU and the other launch settings cannot change while the server runs, but their stepper and dropdown still looked editable and did nothing; they now look locked, and each locked panel says to stop the server to change them. The stepper's minus and plus take a click anywhere on their square, not only on the sign.
+- **Chat: an answer is no longer cut where its text holds a line or paragraph separator (U+2028, U+2029) or U+0085.** The app split the server's events at those characters as well as at line ends, so the piece of the answer they were in was lost; it now splits only at line ends, in the chat, its tools and MCP servers.
+- **Agent and chat: an operation a service only accepted is never said to be done.** A tool's result whose own status says the work was accepted, queued or is still running is shown as "accepted, not confirmed", and the model is told to say it is pending; it used to count as finished.
+- **Chat: a figure's status travels with every export.** What the agent says a figure is, such as a draft that does not close, goes into the shapefile's table, a column of the CSV and a text of the DXF, and a shapefile's table says how much of a gap its polygon closes; the polygon closed it silently.
+- **Web chat: an answer whose connection ends with nothing to resume from stops as an error,** marked incomplete, instead of loading forever with the send button blocked.
+- **Web chat: the context meter follows an agent's turns,** from the agent's own count, and an answer cut by a full context says so instead of blaming the limit of tokens per answer.
+- **Web chat: a message with an image gets an answer when the server's agent is on.** The agent handed the turn back, as it does to the app, and the web chat showed an empty answer; clients other than the app now get the model's answer to it.
+- **Chat: the context meter no longer reads "0k" for a full conversation.** It shows the server's count while it is current, tenths under ten thousand tokens, and an estimate marked "≈" after a turn the server did not count, such as an agent's answer by rules; the conversation is summarized on the server's count while it is current and on the estimate otherwise, so such turns no longer keep a full conversation from being summarized. Images count in the estimate, and after a summary the meter shows the summarized conversation instead of the figure from before it.
+- **Chat: a conversation that did not fit the context can go on.** The meter shows what the request needed, the app summarizes the older messages, and the message says it can be sent again; a summary of a conversation too long to summarize in one request is made from each message cut to its share. Near the end of the context, older turns go without their images and with shorter tool results.
+- **Chat: an answer cut because the conversation filled the context says so,** instead of pointing to the limit of tokens per answer and Continue, which would not fit. A turn the server ended with no answer says so instead of leaving nothing, a draft of an agent turn that failed is not kept as its answer, and a stop is no longer reported as a cut connection.
+- **Chat: what an agent marks to keep of an answer survives the summary,** as written after it, so an agent still finds what that answer named, such as a document it traced.
+- **Agent: a conversation that no longer fits the model's context goes on.** The server's agent leaves out its oldest exchanges for that turn, as the engine's tokenizer counts them and with room kept for the answer, and the answer says how many; every message after the context filled used to fail. A message that alone does not fit still says so, with the tokens it needs.
+- **Agent: an answer cut when the conversation filled the context says so,** instead of blaming the limit of tokens per answer, and an answer streamed until its tokens ran out is marked as incomplete; only answers written in one piece were. The answer's `tosh.context` says how full the context is after the turn.
+
+## [0.87.28] - 2026-10-20
+
+### Improved
+
+- **Chat: a PDF sent as page images also carries its own text, page by page,** in the app and the web chat, so a model or agent can read the figures the document writes. Every page's text goes, and text cut at the size limit says where; a scan without a text layer sends its images alone.
+- **Web chat: an agent shows what it is doing while it works**, such as the page it is reading, until its answer starts.
+- **Chat: files dropped anywhere on the chat are attached, with a visible target while one is dragged over it.** A file dropped on the message field came in as its path; dropped text still goes into the field.
+- **Chat: pages attached together keep their names' order.** A document's pages picked or dropped at once could arrive in any order and be read out of sequence; files whose names carry numbers ("page1", "page10", "735") go in their order, and others keep the order they came in.
+- **Chat: a file attached again is not added twice.** It is told by its contents, so two files with the same name and different contents are both attached.
+- **Chat: while an answer is prepared, the app says what is happening and for how long**: the prompt's progress when the server reports it, the model's pass and what an agent says it is doing, in the app's language, instead of phrases that rotated on their own.
+- **Settings: requests that set no response limit get the chat's own by default.** The web chat and API clients without `max_tokens` stop where the in-app chat does, instead of writing until the context runs out; "No limit" is still available.
+
+### Fixed
+
+- **Web chat: an error the server sends during an answer is shown.** It used to leave an empty message, or keep a draft as the answer; what arrived before it is now marked as incomplete, and a GPU failure is told as such instead of "Compute error.".
+- **Chat: an error the server sends during an answer is shown as it is**, not replaced by a failed attempt to resume the stream.
+- **Math: the engine's failures are told as such.** A request larger than the context says how many tokens it needs and the context holds, and a GPU that fails says the request did not finish; neither comes out as "I couldn't validate the mathematical interpretation". An answer cut at its token limit says it is incomplete, in the app, the web chat and the API.
+- **Engine: after a GPU job times out, the server restarts by itself**, at most once every ten minutes, and not if it was stopped or restarted by hand in the meantime. The engine kept failing every request until it was restarted by hand.
+- **Chat: a GPU failure is told as such whatever reaches the app.** An answer cut by the restart no longer says "Could not connect to the server", a second failure within ten minutes says the server was not restarted and how to do it, and a connection cut for any other reason says the answer is incomplete.
+- **Chat: a conversation holding a tool call the model cut short answers again.** Every later message failed with "context full" while the context was far from full; the cut call now goes back empty in the app, the web chat, the agent and API clients, and "context full" is only shown when the engine says so.
+- **LLMs: GLM-4-0414 models keep a tool's name as declared when they call it.** In a conversation that already held a call written as text, the model copied it with another case or a space in the name, and the call came out as text again; once a name is begun it can only be finished as declared. Reported by [andruwa13](https://github.com/andruwa13) in [#129](https://github.com/engeldlgado/toshllm/issues/129).
+
+## [0.87.27] - 2026-10-19
+
+### Added
+
+- **MCP: each server is told how long the engine waits for a call.** It gets `TOSH_MCP_TIMEOUT_MS` in its environment, so an agent can end its turn and answer before the engine gives up on it.
+- **Settings: with two or more concurrent requests, each one can keep its own share of the context.** "Separate context per request" generates 7 to 11% faster with several requests at once on a Radeon RX 6700 XT, but no conversation can grow past its share. It is off by default.
+
+### Improved
+
+- **LLMs: Qwen 3.5 to 3.8 models start a follow-up answer sooner.** On a Radeon RX 6700 XT the prompt of a short turn takes half as long (Qwen3.8-9B 500 to 250 ms, Qwen3.5-4B 430 to 180 ms), and an agent's turn about 14% less.
+- **LLMs: with two or more requests at once, a long prompt no longer stops the others for seconds.** A reply in progress pauses under a second instead of up to three, and first words come 15 to 35% sooner; a single request runs as before.
+- **LLMs: requests that start alike, such as an agent's passes with their instructions and tools, reuse that start from one another while they run.** With four agent turns at once on Qwen3.8-9B, 25% more turns per minute and the slowest one 45% shorter.
+- **Models: a vision projector beside a model can be picked for it when it matches the model's dimension, even from another family.** One projector serves several models without a copy for each, and a catalog model can still download its own.
+
+### Fixed
+
+- **LLMs: GLM-4-0414 models call tools instead of writing the call as text.** The name and arguments of a tool came out in the answer, sometimes with a result the model made up; the call now runs and the answer uses what it returned. Reported by [andruwa13](https://github.com/andruwa13) in [#129](https://github.com/engeldlgado/toshllm/issues/129).
+- **LLMs: Qwen 3.5 to 3.8 models split across GPUs by tensor start again with MTP.** They stopped at startup since 0.87.13. Reported by [Basten7](https://github.com/Basten7) in [#130](https://github.com/engeldlgado/toshllm/issues/130).
+- **LLMs on Radeon RX 400/500, Vega, Radeon VII and Radeon Pro Vega/WX: Q2_K models no longer write past an array in the matrix-vector kernel.** Reported by [SergeySlice](https://github.com/SergeySlice) in [#131](https://github.com/engeldlgado/toshllm/issues/131).
+- **Engine and math: the agent answers on a server that listens on an IPv6 address.** Every turn failed on an address such as `::1`.
+- **Engine: API keys and the agent's key are compared in constant time.** How long a refusal takes no longer depends on how much of a guessed key is right.
+- **MCP: calls waiting for a server that is slow to start can be cancelled, and a start that fails is not retried by each of them.** Every queued call used to wait the full timeout again; now they fail together, and the start is tried again a few seconds later.
+- **MCP: a server that stops answering is replaced.** After two calls in a row time out and it misses a ping, new calls go to a fresh process while the old one finishes the calls it had; one that hangs again waits 10 s, then 20 and so on up to 5 minutes before it starts again.
+- **Math: an API client that only reads the text no longer gets words the agent took back.** Text of a pass that may still end in a tool call goes out as a draft, which the app and the web chat show as before until the answer replaces it; cancelling a turn also stops every request the agent has in flight.
+
+## [0.87.26] - 2026-10-17
+
+### Added
+
+- **Russian interface.** Contributed by [SergeySlice](https://github.com/SergeySlice) in [#127](https://github.com/engeldlgado/toshllm/issues/127).
+- **Chat: a figure an agent places in a coordinate system, such as a State Plane zone, exports at those coordinates.** Its DXF drawing and its CSV of corners carry the system's X and Y, so they open in place in CAD or GIS.
+- **Chat: a figure an agent sends exports as a shapefile, in a ZIP.** It is a polygon when the figure should close and a line otherwise, with its title and notice as attributes and, when the agent gives its coordinate system, a .prj, in the app and the web chat.
+- **Chat: a figure an agent sends can carry a notice that each of its exports repeats.** It goes under the drawing in the PNG, as text on a layer of its own in the DXF and as a column in the CSV, in the app and the web chat.
+- **Engine: `--tiles-path` serves a folder of map files at `/tiles/`, in byte ranges.** A map reads a PMTiles file of many gigabytes a piece at a time instead of loading it whole.
+- **Engine: a server listening beyond this computer without an API key says so once at startup.** It names the addresses others can reach and the MCP servers they can use; nothing is blocked and no key is made.
+- **Math: the runtime lists each helper module with its SHA-256 in `HELPERS.sha256`.** In the app it sits in `Contents/Resources/tosh-sympy`, so anyone can check which relay and math helpers an install runs.
+- **Settings: a folder of offline maps and a base map style, with the map options.** The folder's PMTiles regions draw the background of maps in the app and the web chat without internet, with place names when their fonts sit in an assets subfolder, and the app hands the folder to the server on its own. A style of `none` draws a plain background without connecting.
+- **Engine and chat: an extension's agent can take the chat's own tools with every turn.** With `--mcp-agent-client-tools`, a request that brings tools reaches the agent, which offers them to the model beside its own and hands back the calls to them, streamed like any tool call. The app sends its tools, MCP servers included, to an agent whose extension asks for them, runs the calls it gets back and sends the next round to the agent again.
+- **Chat: the tools popover can uncheck every tool at once.** With many MCP servers on, one click starts from none so you pick only the few you need; the popover also shows how many are on. Requested in [#126](https://github.com/engeldlgado/toshllm/issues/126).
+
+### Improved
+
+- **Web chat: maps draw with MapLibre, on OpenFreeMap online and on map files the server holds without internet.** OpenFreeMap takes the place of the OpenStreetMap tiles, whose policy is for light use; a server can name its own style instead, or PMTiles regions with their fonts under `--tiles-path`, and with neither reachable the layers still show on a plain ground. A server can also name an index of its regions, read each time a map opens, so regions it adds while running show without a restart.
+- **Chat: maps in the app draw with MapLibre too, and only road routes stay on Apple Maps.** Apple's terms keep its route data on its own map; every other map uses OpenFreeMap online, a style of your own or the offline regions, and a click on a feature still shows its attributes.
+- **Chat: a Markdown table gives each column the width of its text, wrapping past a limit, and scrolls sideways when it is wider than the answer.** Long words that cannot wrap, such as slugs, no longer squeeze the other columns, and the table has no widths left to work out as the window changes.
+
+### Fixed
+
+- **MCP: a remote server can no longer send your headers or requests to another address (security fix).** The app and the engine's relay refuse an endpoint or a redirect on another scheme, host or port, which up to 0.87.25 could receive them; update earlier installs, and check that a `remote.py` you run from a path of your own matches `HELPERS.sha256`.
+- **MCP: a local server that stops answering no longer holds a request past its timeout.** Cancelling returns at once too, later requests keep working, idle servers no longer stall the app, and one that closes its input no longer ends it.
+- **MCP: servers on the older HTTP+SSE transport connect from the app.** Connecting used to wait without end.
+- **Engine: an MCP tool call through `/tools` stops when its client goes away.** The server is told within half a second and the next call to it no longer waits out the abandoned one's timeout, so cancelling an agent's turn also stops its tool call.
+- **Math: after a calculation the answer is written in the language of the question, and an integral or a root the exact tools can give is computed exactly.** A note added after each tool call made the model answer in English, and the numerical tool came first for definite integrals.
+- **Engine: with the server open to the local network and no API key, other computers no longer get the built-in shell and file tools.** They still chat and use the agent and the tools of extensions; this computer, or a request with the API key, keeps every tool.
+- **Settings: the VRAM reserve reaches the engine.** The app passed it in a variable the engine never read, so only router mode and DFlash kept it; Dynamic MoE's memory plan now leaves what you set. Automatic, the new default, keeps the engine's own 8% of the card. Reported in [#124](https://github.com/engeldlgado/toshllm/issues/124).
+- **Web chat: an agent's answer survives a phone locking or switching apps.** The agent kept going only while the browser stayed connected, so a long turn such as reading a scanned deed failed when the page went to the background; it now runs to its end and the page picks the answer up when it comes back.
+
+## [0.87.25] - 2026-10-15
+
+### Added
+
+- **Chat: an agent can draw figures that no map places under its answer, such as each tract of a deed.** They show small, several to a row, and each one, like a map, can be enlarged; their corners are numbered from the start and, when a figure should close and does not, what it lacks shows in red; each exports as a PNG image, a DXF drawing for CAD and a CSV of its corners.
+- **Web chat: the engine's agent answers from the browser as it does in the app.** The web chat no longer sends tools of its own unless you add them, so requests reach the agent; its steps, figures and maps show under the answer with the same exports. A new browser starts with the app's image size and PDF handling, and a PDF's pages are drawn at that size, so a scanned deed reads as in the app.
+
+### Improved
+
+- **Chat: a map exports one GeoJSON file per layer and kind of geometry.** ArcGIS Pro's JSON To Features tool reads one kind per run, so each file now goes in at once.
+
+### Fixed
+
+- **Chat: a long prompt on a slower GPU is no longer stopped as if the engine had hung.** Each batch of prompt the engine reported counted as the answer starting, which left 30 seconds for the next one, and a Radeon Pro 580X takes longer with a large context. The engine is now stopped only when neither prompt nor answer comes for three minutes, and the message names MoE models only when one is loaded. Reported in [#123](https://github.com/engeldlgado/toshllm/issues/123).
+- **Chat: the context meter counts the definitions of the active tools before the first reply.** With several MCP servers on they can take tens of thousands of tokens, and the meter showed 0 until an answer came back; its tooltip now says how much they take. Reported in [#123](https://github.com/engeldlgado/toshllm/issues/123).
+- **Chat: a photo or recording reaches the model when the math tools run the turn.** The turn went to the math agent with the text alone, so the answer ignored the attachment and a message with only a photo failed.
+
+## [0.87.24] - 2026-10-14
+
+### Added
+
+- **Chat: the model can draw places, routes and areas on a map under its answer.** What it draws is dashed and marked as approximate; a route by road comes from Apple Maps, with its distance and time, only after you allow the internet.
+- **Chat: an extension's agent can attach a map of its data to an answer.** A click on a feature shows its attributes, and the features export as GeoJSON.
+- **Chat: a remote MCP server can be offered to the server agent, like a local one.** It works over HTTP or SSE, with its headers kept in the Keychain.
+- **Tools and agents from a folder of extensions, each with its own settings page.** An extension stays off until you approve it; docs/extensions.md has the format and two examples to copy.
+- **Ukrainian interface.** Contributed by [andruwa13](https://github.com/andruwa13) in [#121](https://github.com/engeldlgado/toshllm/pull/121).
+
+### Improved
+
+- **Chat: an answer that ends inside its reasoning keeps that reasoning under the warning instead of disappearing.** Reported in [#122](https://github.com/engeldlgado/toshllm/issues/122).
+- **Chat: the cards of MCP tool calls lay out their arguments and result line by line, with one line on what came back.**
+
+## [0.87.23] - 2026-10-12
+
+### Fixed
+
+- **LLMs: turbo values in the key-value cache no longer close the engine on Radeon Vega, RX 400/500, FirePro and their Radeon Pro versions.** The suggested q8_0 keys with turbo4 values quit once a chat passed a few thousand tokens. Reported in [#119](https://github.com/engeldlgado/toshllm/issues/119).
+- **Chat: an answer that calls a tool no longer shows up twice while the next step writes.** The step before the tool kept its bubble and repeated the new text word for word until the turn ended. Reported in [#117](https://github.com/engeldlgado/toshllm/issues/117).
+
+## [0.87.22] - 2026-10-10
+
+### Changed
+
+- **Images: Qwen-Image 2.1 Turbo now downloads Unsloth's builds.** The four sizes weigh and run the same as before; a Turbo already downloaded from AtomicChat keeps working without downloading it again.
+
+### Improved
+
+- **Images: the last stage of every image is shorter again.** On a Radeon RX 6700 XT it goes from 9.9 to 8.8 seconds for Z-Image Turbo at 1024x1024 and from 33.3 to 31.0 for Qwen-Image 2.1 Turbo at 1920x1920, with the same image.
+
+### Fixed
+
+- **Images: Qwen-Image 2.1 can be set to 1920 px on a card that also draws the desktop.** The size list stopped at 1792, one step below the size 0.87.21 made possible.
+
+## [0.87.21] - 2026-10-10
+
+### Added
+
+- **Images: Qwen-Image 2.1 Turbo, in four sizes from 8 GB up.** It draws in 8 steps instead of 25, so a 1024x1024 image takes about a minute on a Radeon RX 6700 XT; like Qwen-Image 2.1 it writes text, edits from reference images and has a non-commercial license.
+
+### Improved
+
+- **Images: large images generate faster on Radeon RX 6000 and Radeon Pro W6000.** On a Radeon RX 6700 XT each step of a 1920x1920 Qwen-Image 2.1 Turbo image takes 32.6 seconds instead of 37.1, with the same image.
+- **Images: the last stage of every image takes about half the time.** On a Radeon RX 6700 XT it goes from 12.6 to 5.7 seconds for Qwen-Image 2.1 Turbo at 1024x1024 and from 18.6 to 9.9 for Z-Image Turbo, with the same image.
+- **Video: Wan videos take less time, with the same frames.** On a Radeon RX 6700 XT a 17-frame 832x480 Wan 2.1 1.3B video at 10 steps takes 187 seconds instead of 206.
+
+### Fixed
+
+- **Images: large images no longer stop with a GPU timeout on a card that also draws the desktop.** On a Radeon RX 6700 XT, Qwen-Image 2.1 Turbo at 1920x1920 failed halfway through and now completes, at the same speed.
+
+## [0.87.20] - 2026-10-09
+
+### Improved
+
+- **LLMs: i-quant, Q2_0, MXFP4 and Q8_0 MoE models with an MTP head generate faster when experts run on the CPU.** With MoE offload on a Radeon RX 6700 XT, Qwen3.6-35B-A3B writes 8-11% faster in UD-IQ2_M and UD-IQ3_XXS; under Dynamic MoE it gains 7-10% with 42% of the experts in video memory and nothing with the whole 12 GB card.
+
+## [0.87.19] - 2026-10-08
+
+### Improved
+
+- **LLMs: with the math tools on, answers that need no calculation stream again.** Only calculations wait for their check now, in the app's chat, the web chat and API clients.
+
+### Fixed
+
+- **LLMs: Llama 4 no longer stops with an error when the chat offers it tools.** Its text answers go out as such, and its tool calls are read in either of the two formats it writes.
+
+## [0.87.18] - 2026-10-07
+
+### Fixed
+
+- **LLMs: answers no longer stop mid-sentence in long chats.** Qwen3.6-35B-A3B cut 2 answers in 18 turns of a replayed chat and cuts none in 27 now.
+- **LLMs: turning reasoning off works on models whose template always opens the reasoning block.** Qwopus3.5-9B-Coder wrote 794 characters of reasoning with it off and writes none now.
+- **Audio: voice input asks for the microphone again.** The signed release was denied without a prompt; macOS now shows its permission dialog and lists ToshLLM under Privacy & Security, Microphone.
+
+## [0.87.17] - 2026-10-06
+
+### Added
+
+- **LLMs: Dynamic MoE can read the experts that do not fit in RAM from the SSD.** An engine switch for now (`TOSH_AUTO_DISK_EXPERTS=1`): Qwen3.8-Flash-Next Coder runs on a 32 GB Mac with a 12 GB card at 14-18 tokens a second, and decode asks for the next layer's experts ahead.
+
+### Changed
+
+- **LLMs: the engine moves to llama.cpp v0.6.0.** It brings upstream's fixes for Qwen3.8-Flash-Next and its MTP head, for speculative decoding and for the recurrent state of hybrid models, and loads models faster. Dense models and Dynamic MoE run within 2% of the previous engine.
+
+### Improved
+
+- **LLMs: MTP keeps more of its draft when the chat has a temperature.** The model verifies a sampled draft by rejection instead of keeping only exact matches, with the same text distribution. At temperature 0.7 prose is up to 7% faster with a 9B model and 3% with Qwen3.6-35B-A3B under Dynamic MoE.
+- **LLMs: Dynamic MoE keeps more experts in VRAM.** The plan takes an 8-bit cache or a smaller prompt batch when they free room for experts. On a 12 GB card Qwen3.6-35B-A3B at 128K reads a prompt 8% faster and writes code 10-15% faster; gemma-4-26B and GLM-4.7 write 10% faster and read a prompt up to 13% slower.
+- **LLMs: Qwen3.8-Flash-Next runs its attention indexer on AMD GPUs.** It ran on the CPU because its kernel needs matrix units AMD cards do not have. On one card of a Radeon Pro Vega II Duo, generation goes from about 15 to 20 tokens a second with a 6K prompt.
+
+### Fixed
+
+- **LLMs: the download list no longer marks Qwen3.8-Flash-Next as too big.** The fit badge counted its 27 GB n-gram table, which stays on disk, and guessed the experts from the file size; it now reads both from the model's header.
+- **LLMs: Qwen3.8-Flash-Next plans its memory on 48 and 64 GB Macs.** Dynamic MoE no longer counts its 27 GB n-gram table, read from disk, as RAM it needs: the Q2_0 asked for about 54 GB and now plans with 48 GB and a 12 GB card.
+- **LLMs: the FirePro D500 and D700 keep the AMD attention kernels when generating.** The AMD kernel asked for 34 KB of local memory and those cards give 32 KB, so it fell back to slower kernels. A version with half the work groups now fits. Reported in [#12](https://github.com/engeldlgado/toshllm/issues/12).
+
+## [0.87.16] - 2026-10-05
+
+### Added
+
+- **LLMs: a local MCP server can be approved for the server agent.** "Available to the server agent" in the server's MCP settings makes the engine start it for the agent alone: its tools answer through the agent for the app's chat, the web chat and API clients, and stay hidden from `/tools`. A value the user never gave is not sent to it, and math keeps its checks.
+- **LLMs: the engine alone for macOS 12.** The release also carries `toshllm-engine-<version>-macos12-x86_64.zip`, for Macs that cannot run the app: the same engine with a start script and the chat page in the browser.
+
+### Improved
+
+- **LLMs: Qwen3.8-Flash-Next writes faster on Radeon Pro Vega II.** On one card of a Radeon Pro Vega II Duo with Dynamic MoE and MTP, code goes from 32.7 to 36.2 tokens a second and prose from 28.8 to about 31; without MTP it gains about 1%.
 
 ### Fixed
 
@@ -17,9 +290,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 - **LLMs: a numbered list split by paragraphs keeps the numbers it was written with** instead of starting each part at 1.
 
-- **LLMs: formulas inside list items and headings, and numbers such as `$84$`, render as math.** Prices such as `$10` stay as text.
+- **LLMs: formulas inside list items and headings, and numbers such as `$84$`, render as math.** Prices such as `$10` stay as text, and a formula with arithmetic such as `$|4/3 - 1.33| \approx 0$` no longer turns into plain text.
 
 - **LLMs: a long formula or matrix on its own line renders as a formula** instead of its LaTeX source.
+
+- **LLMs: on macOS 12 Monterey, Radeon RX 6000 cards generate Q8_0 models correctly.** The engine reads their weights aligned there by itself; the one-token cases of its own tests that failed on a Radeon RX 6800 under macOS 12 now pass.
+
+- **LLMs: a request with `tool_choice: "required"` always ends in a tool call.** The model could write a whole answer instead and run out of tokens; now it may write a short preamble at most, and `auto` is unchanged.
 
 ## [0.87.15] - 2026-10-03
 

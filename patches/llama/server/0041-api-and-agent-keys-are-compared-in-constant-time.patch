@@ -1,0 +1,78 @@
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index c1b517a34..c826697be 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -106,10 +106,21 @@ json server_slot_stats::to_json() const {
+ 
+ //
+ // random string / id
+ //
+ 
++bool same_secret(const std::string & a, const std::string & b) {
++    if (a.size() != b.size()) {
++        return false;
++    }
++    volatile unsigned char diff = 0;
++    for (size_t i = 0; i < a.size(); ++i) {
++        diff |= (unsigned char) (a[i] ^ b[i]);
++    }
++    return diff == 0;
++}
++
+ std::string random_string() {
+     static const std::string str("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+ 
+     std::random_device rd;
+     std::mt19937 generator(rd());
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 6165d871c..ca9f9af30 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -97,10 +97,13 @@ json format_error_response(const std::string & message, const enum error_type ty
+ //
+ // random string / id
+ //
+ 
+ std::string random_string();
++
++// compares two secrets in time that does not depend on where they differ
++bool same_secret(const std::string & a, const std::string & b);
+ std::string gen_chatcmplid();
+ std::string gen_tool_call_id();
+ 
+ // get a random marker; note: each time the server restarts, the marker will be different
+ const char * get_media_marker();
+diff --git a/tools/server/server-http.cpp b/tools/server/server-http.cpp
+index aeb782fe2..f940e3bbb 100644
+--- a/tools/server/server-http.cpp
++++ b/tools/server/server-http.cpp
+@@ -280,11 +280,11 @@ bool server_http_context::init_listener(const common_params & params) {
+         if (req_api_key.substr(0, prefix.size()) == prefix) {
+             req_api_key = req_api_key.substr(prefix.size());
+         }
+ 
+         // validate the API key
+-        if (std::find(api_keys.begin(), api_keys.end(), req_api_key) != api_keys.end()) {
++        if (std::any_of(api_keys.begin(), api_keys.end(), [&](const std::string & key) { return same_secret(key, req_api_key); })) {
+             return true; // API key is valid
+         }
+ 
+         // API key is invalid or not provided
+         res.status = 401;
+diff --git a/tools/server/server-tools.cpp b/tools/server/server-tools.cpp
+index 4bc757ff5..bdfd75bb9 100644
+--- a/tools/server/server-tools.cpp
++++ b/tools/server/server-tools.cpp
+@@ -2089,11 +2089,11 @@ void server_tools::setup(const std::vector<std::string> & enabled_tools,
+         }
+         const auto * mcp_tool = dynamic_cast<const server_mcp_tool *>(&tool);
+         if (mcp_tool == nullptr || agent_only.count(mcp_tool->server_name) == 0) {
+             return false;
+         }
+-        return agent_key.empty() || get_header(req.headers, "x-tosh-agent-key") != agent_key;
++        return agent_key.empty() || !same_secret(get_header(req.headers, "x-tosh-agent-key"), agent_key);
+     };
+ 
+     // The built-in tools reach this computer's shell and files: another computer gets them only with the
+     // API key, which the server then checks on every request.
+     auto local_only = [this](const server_http_req & req, const server_tool & tool) {

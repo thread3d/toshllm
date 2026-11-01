@@ -1,0 +1,124 @@
+{
+  "format": 1,
+  "id": "places",
+  "version": "1.0.0",
+  "name": {"es": "Lugares", "en": "Places"},
+  "description": {
+    "es": "Ejemplo completo: capitales, montañas, monumentos y lugares propios, distancias entre ellos y un mapa, respondidos por un agente propio.",
+    "en": "Complete example: capitals, mountains, landmarks and places of your own, distances between them and a map, answered by an agent of its own."
+  },
+  "author": "ToshLLM",
+  "servers": {
+    "places": {
+      "command": "{python}",
+      "args": ["-I", "-B", "{extension}/server.py"],
+      "timeout_ms": 20000,
+      "enabled_by": "TOSH_PLACES_ENABLED",
+      "agent_only": true
+    }
+  },
+  "agent": {
+    "command": "{python}",
+    "args": ["-I", "-B", "{extension}/agent.py"],
+    "timeout_ms": 900000
+  },
+  "settings": [
+    {
+      "id": "places",
+      "title": {"es": "Lugares", "en": "Places"},
+      "detail": {
+        "es": "Lugares conocidos y los tuyos, con distancias y mapa. Las preguntas que no son de lugares las responde el chat con sus propias herramientas.",
+        "en": "Well-known places and your own, with distances and a map. Questions that are not about places are answered by the chat with its own tools."
+      },
+      "notice": {
+        "when_empty": ["TOSH_PLACES_EXTRA", "TOSH_PLACES_FILES"],
+        "text": {
+          "es": "Solo los lugares de serie: añade los tuyos en Lugares propios o en Archivos.",
+          "en": "Built-in places only: add your own in Own places or in Files."
+        }
+      },
+      "fields": [
+        {
+          "key": "TOSH_PLACES_ENABLED",
+          "kind": "toggle",
+          "default": "1",
+          "title": {"es": "Lugares activo", "en": "Places on"},
+          "help": {
+            "es": "Arranca el servidor de lugares con el motor; apagado, el agente responde sin él.",
+            "en": "Starts the places server with the engine; switched off, the agent answers without it."
+          }
+        },
+        {
+          "key": "TOSH_PLACES_UNITS",
+          "kind": "choice",
+          "default": "km",
+          "options": [
+            {"value": "km", "title": {"es": "Kilómetros", "en": "Kilometres"}},
+            {"value": "mi", "title": {"es": "Millas", "en": "Miles"}}
+          ],
+          "title": {"es": "Unidad", "en": "Unit"},
+          "help": {
+            "es": "Unidad de las distancias y radios.",
+            "en": "Unit of distances and radii."
+          }
+        },
+        {
+          "key": "TOSH_PLACES_CATEGORIES",
+          "kind": "choices",
+          "default": "capital,mountain,landmark,custom",
+          "options": [
+            {"value": "capital", "title": {"es": "Capitales", "en": "Capitals"}},
+            {"value": "mountain", "title": {"es": "Montañas", "en": "Mountains"}},
+            {"value": "landmark", "title": {"es": "Monumentos", "en": "Landmarks"}},
+            {"value": "custom", "title": {"es": "Los míos", "en": "My own"}}
+          ],
+          "title": {"es": "Categorías", "en": "Categories"},
+          "help": {
+            "es": "Qué lugares conoce el agente.",
+            "en": "Which places the agent knows."
+          }
+        },
+        {
+          "key": "TOSH_PLACES_HOME",
+          "kind": "text",
+          "placeholder": "Madrid",
+          "title": {"es": "Lugar de partida", "en": "Home place"},
+          "help": {
+            "es": "Desde dónde se miden las distancias cuando la pregunta no lo dice.",
+            "en": "Where distances are measured from when the question does not say."
+          }
+        },
+        {
+          "key": "TOSH_PLACES_EXTRA",
+          "kind": "json",
+          "placeholder": "{\"Office\": [40.4531, -3.6883]}",
+          "title": {"es": "Lugares propios", "en": "Own places"},
+          "help": {
+            "es": "Objeto JSON de nombres a [latitud, longitud], o a {\"latitude\", \"longitude\", \"country\"}.",
+            "en": "JSON object of names to [latitude, longitude], or to {\"latitude\", \"longitude\", \"country\"}."
+          }
+        },
+        {
+          "key": "TOSH_PLACES_FILES",
+          "kind": "paths",
+          "file_types": ["geojson", "json", "csv"],
+          "folder_types": ["*"],
+          "title": {"es": "Archivos", "en": "Files"},
+          "help": {
+            "es": "GeoJSON de puntos o CSV con columnas name, latitude y longitude, o carpetas que los contengan.",
+            "en": "Point GeoJSON or CSV with name, latitude and longitude columns, or folders holding them."
+          }
+        },
+        {
+          "key": "TOSH_PLACES_SERVICE_KEY",
+          "kind": "secret",
+          "title": {"es": "Clave del servicio", "en": "Service key"},
+          "help": {
+            "es": "Se guarda en el Llavero. El ejemplo solo dice si está puesta; una extensión real la mandaría a su servicio.",
+            "en": "Kept in the Keychain. The example only says whether it is set; a real extension would send it to its service."
+          }
+        }
+      ]
+    }
+  ]
+}

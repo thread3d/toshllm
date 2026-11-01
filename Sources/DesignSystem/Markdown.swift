@@ -403,8 +403,10 @@ struct RichText: View {
                     else { known = false; break }
                     text.replaceSubrange(r, with: glyph)
                 }
+                // arithmetic stays for KaTeX: `|4/3 - x| \approx 0` as text reads as prose
                 guard known, text != body,
-                      text.range(of: #"^[\p{L}\p{N}\p{Sm}\p{So}\s.,;:+\-=<>()\[\]|/*!'…·]*$"#,
+                      !text.contains(where: { "+-*/=<>|^".contains($0) }),
+                      text.range(of: #"^[\p{L}\p{N}\p{Sm}\p{So}\s.,;:()\[\]!'…·]*$"#,
                                  options: .regularExpression) != nil
                 else { continue }
                 out.replaceSubrange(whole, with: text)
@@ -559,31 +561,58 @@ private struct InlineMarkdown: View {
 private struct MDTable: View {
     let headers: [String]
     let rows: [[String]]
+    @Environment(\.chatFontScale) private var scale
+
+    /// A column is as wide as its longest text, up to this; past it the text wraps in its cell.
+    private static let widest: CGFloat = 320
+
+    // Fixed column widths leave the layout nothing to negotiate: cells sharing the width, with words that
+    // cannot wrap, kept macOS 15 laying the table out for minutes.
+    private func widths() -> [CGFloat] {
+        let size = ChatFont.Base.body.points * scale
+        let regular = NSFont.systemFont(ofSize: size), bold = NSFont.systemFont(ofSize: size, weight: .semibold)
+        return headers.indices.map { c in
+            let text = rows.map { Self.width(c < $0.count ? $0[c] : "", regular) }.max() ?? 0
+            // bold and code runs are measured as plain text, hence the slack
+            return min(max(text, Self.width(headers[c], bold)) * 1.08 + 4, Self.widest).rounded(.up)
+        }
+    }
+
+    private static func width(_ markdown: String, _ font: NSFont) -> CGFloat {
+        String(RichText.inline(markdown).characters).split(separator: "\n")
+            .map { (String($0) as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+    }
 
     var body: some View {
-        Grid(alignment: .topLeading, horizontalSpacing: 16, verticalSpacing: 0) {
-            GridRow {
-                ForEach(Array(headers.enumerated()), id: \.offset) { _, h in
-                    Text(RichText.inline(h))
-                        .fontWeight(.semibold)
-                        .padding(.vertical, 6)
+        let widths = widths()
+        ScrollView(.horizontal) {
+            VStack(alignment: .leading, spacing: 0) {
+                row(headers, widths: widths, header: true)
+                Divider()
+                ForEach(Array(rows.enumerated()), id: \.offset) { i, cells in
+                    row(cells, widths: widths, header: false)
+                        .background(i.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.07))
                 }
             }
-            Divider()
-            ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
-                GridRow {
-                    ForEach(0..<headers.count, id: \.self) { c in
-                        Text(RichText.inline(c < row.count ? row[c] : ""))
-                            .padding(.vertical, 5)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .background(i.isMultiple(of: 2) ? Color.clear : Color.secondary.opacity(0.07))
+            .padding(.vertical, 4)
+            .fixedSize(horizontal: true, vertical: false)
+            .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
+        }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .textSelection(.enabled)
+    }
+
+    private func row(_ cells: [String], widths: [CGFloat], header: Bool) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            ForEach(0..<headers.count, id: \.self) { c in
+                Text(RichText.inline(c < cells.count ? cells[c] : ""))
+                    .fontWeight(header ? .semibold : .regular)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: widths[c], alignment: .leading)
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 4)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
-        .textSelection(.enabled)
+        .padding(.vertical, header ? 6 : 5)
+        .padding(.horizontal, 12)
     }
 }
 

@@ -1,0 +1,107 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -463,10 +463,11 @@ typedef struct {
+     uint64_t nb13;
+     int32_t  ne0;
+     int32_t  ne1;
+     int16_t  r2;
+     int16_t  r3;
++    int32_t  band;  // src1 tiles per band in the tile order, 0 = plain order
+ } ggml_metal_kargs_mul_mm;
+ 
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2595,26 +2595,40 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+             /*.nb13 =*/ nb13,
+             /*.ne0  =*/ ne0,
+             /*.ne1  =*/ ne1,
+             /*.r2   =*/ r2,
+             /*.r3   =*/ r3,
++            /*.band =*/ 0,
+         };
+ 
++        const int nr0 = pipeline.nr0;
++        const int nr1 = pipeline.nr1;
++        const int nsg = pipeline.nsg;
++
++        // bands only pay with a last-level cache that holds them; TOSH_MM_BAND_MB sets another
++        // size, 0 the plain order
++        if (props_dev->simd_width == 32 && !props_dev->has_unified_memory &&
++            (strstr(props_dev->desc, "RX 6") || strstr(props_dev->desc, "W6"))) {
++            static const int64_t band_bytes = (int64_t) (getenv("TOSH_MM_BAND_MB") ? atoi(getenv("TOSH_MM_BAND_MB")) : 16) << 20;
++            const int64_t tile_bytes = (int64_t) nr1*nb11;
++            const int64_t ntx = (ne11 + nr1 - 1)/nr1;
++            if (band_bytes > 0 && tile_bytes > 0) {
++                const int64_t band = std::max<int64_t>(1, band_bytes/tile_bytes);
++                args.band = band < ntx ? (int32_t) band : 0;
++            }
++        }
++
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+ 
+         const size_t smem = pipeline.smem;
+ 
+         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-        const int nr0 = pipeline.nr0;
+-        const int nr1 = pipeline.nr1;
+-        const int nsg = pipeline.nsg;
+-
+         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+     } else {
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+ 
+         const int nr0 = pipeline.nr0;
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -11743,10 +11743,11 @@ kernel void kernel_mul_mm(
+         device const char * src0,
+         device const char * src1,
+         device       char * dst,
+         threadgroup  char * shmem [[threadgroup(0)]],
+         uint3  tgpig[[threadgroup_position_in_grid]],
++        uint3  tgpg [[threadgroups_per_grid]],
+         ushort tiitg[[thread_index_in_threadgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+ 
+     constexpr int NR0 = 64;
+ 
+@@ -11755,13 +11756,26 @@ kernel void kernel_mul_mm(
+ 
+     constexpr int NK  = 32;
+     constexpr int NL0 = NK/16;
+     constexpr int NL1 = NK/8;
+ 
++    // in bands of src1 tiles every src0 tile runs over one band before the next one starts, so
++    // a src1 larger than the cache is read from the cache once per band, not from memory
++    uint tx = tgpig.x;
++    uint ty = tgpig.y;
++    if (args.band > 0) {
++        const uint lin = tgpig.y*tgpg.x + tgpig.x;
++        const uint b0  = (lin / (args.band*tgpg.y))*args.band;
++        const uint bw  = min((uint) args.band, tgpg.x - b0);
++        const uint rem = lin - b0*tgpg.y;
++        ty = rem / bw;
++        tx = b0 + rem % bw;
++    }
++
+     const int im = tgpig.z;
+-    const int r0 = tgpig.y*NR0;
+-    const int r1 = tgpig.x*NR1;
++    const int r0 = ty*NR0;
++    const int r1 = tx*NR1;
+ 
+     // if this block is of 64x32 shape or smaller
+     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+     const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+ 

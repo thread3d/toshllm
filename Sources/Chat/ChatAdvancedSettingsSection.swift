@@ -18,6 +18,10 @@ struct ChatAdvancedSettingsSection: View {
     @AppStorage(SettingsKeys.mathAgentEnabled) private var mathAgentEnabled = false
     @AppStorage(SettingsKeys.mathToolsAllowed) private var mathToolsAllowed = true
     @AppStorage(SettingsKeys.memoryToolsEnabled) private var memoryToolsEnabled = true
+    @AppStorage(SettingsKeys.chatMapToolEnabled) private var chatMapToolEnabled = true
+    @AppStorage(SettingsKeys.chatRoadRouteEnabled) private var chatRoadRouteEnabled = true
+    @AppStorage(SettingsKeys.mapStyle) private var mapStyle = ""
+    @AppStorage(SettingsKeys.mapFolder) private var mapFolder = ""
     @AppStorage(SettingsKeys.toolResultLimit) private var toolResultLimit = ToolResultLimit.defaultCharacters
     @State private var blockedToolModels: [String] = ToolSupport.blockedModels
     @AppStorage(SettingsKeys.memoryArchiveHookURL) private var archiveHookURL = ""
@@ -355,6 +359,48 @@ struct ChatAdvancedSettingsSection: View {
                 }
             }
 
+            if destination == .agents {
+                ChatSettingsGroup(title: loc.t("Mapa", "Map")) {
+                    SettingsRow(icon: "map",
+                                title: loc.t("Mapa en el chat", "Map in the chat"),
+                                help: loc.t("Da al modelo una herramienta para dibujar puntos, líneas y áreas en un mapa bajo su respuesta. Lo que dibuja va con línea discontinua y marcado como posiciones aproximadas, porque las coordenadas pueden ser estimadas por el modelo; los mapas de datos que devuelve un agente, como los de un servicio GIS, no cambian.",
+                                       "Gives the model a tool to draw points, lines and areas on a map under its answer. What it draws is dashed and marked as approximate positions, since the model may estimate the coordinates; maps of data an agent returns, such as a GIS service's, are unchanged.")) {
+                        SettingsToggle(isOn: $chatMapToolEnabled)
+                    }
+                    if chatMapToolEnabled {
+                        SettingsRow(icon: "car",
+                                    title: loc.t("Rutas por carretera (Apple Maps)", "Road routes (Apple Maps)"),
+                                    help: loc.t("Cuando pides una ruta por carretera, la app te pide permiso para enviar los puntos a Apple Maps por internet, y dibuja el recorrido real con su distancia y su tiempo. Si no das permiso, o lo apagas aquí, el modelo traza una línea recta y lo dice.",
+                                                "When you ask for a route by road, the app asks your permission to send the points to Apple Maps over the internet, and draws the real route with its distance and time. Without your permission, or with this off, the model draws a straight line and says so.")) {
+                            SettingsToggle(isOn: $chatRoadRouteEnabled)
+                        }
+                    }
+                    SettingsRow(icon: "square.3.layers.3d",
+                                title: loc.t("Estilo del mapa base", "Base map style"),
+                                help: loc.t("Dirección de un estilo de MapLibre (style.json) para el fondo de los mapas, en la app y en el chat web. Vacío usa OpenFreeMap por internet, y none dibuja un fondo liso sin conectarse. Las rutas por carretera se dibujan siempre sobre Apple Maps.",
+                                            "Address of a MapLibre style (style.json) for the background of maps, in the app and in the web chat. Empty uses OpenFreeMap over the internet, and none draws a plain background without connecting. Road routes are always drawn on Apple Maps.")) {
+                        DeferredSettingsTextField("", text: $mapStyle, prompt: "OpenFreeMap", width: 220)
+                            .autocorrectionDisabled()
+                    }
+                    SettingsRow(icon: "externaldrive",
+                                title: loc.t("Mapas sin internet", "Offline maps"),
+                                subtitle: mapFolder.isEmpty ? nil : mapFolder,
+                                help: loc.t("Carpeta con regiones en formato PMTiles, como las que publica Protomaps. Si tiene alguna, el fondo de los mapas se dibuja con ellas sin internet, también en el chat web, y gana sobre el estilo. Los nombres de lugares necesitan las fuentes en una subcarpeta assets; sin ella el mapa sale sin rótulos.",
+                                            "Folder with regions in PMTiles format, like the ones Protomaps publishes. When it holds any, the background of maps is drawn from them without internet, in the web chat too, and over the style. Place names need the fonts in an assets subfolder; without it the map shows no labels.")) {
+                        HStack(spacing: 8) {
+                            if !mapFolder.isEmpty {
+                                Button(loc.t("Quitar", "Remove")) { mapFolder = "" }
+                                    .glassButton()
+                                    .help(loc.t("Vuelve al mapa en línea.", "Goes back to the online map."))
+                            }
+                            Button(loc.t("Elegir…", "Choose…")) { chooseMapFolder() }
+                                .glassButton()
+                                .help(loc.t("Elige la carpeta de regiones.", "Choose the folder of regions."))
+                        }
+                    }
+                }
+            }
+
             if destination == .general {
                 ChatSettingsGroup(title: loc.t("Adjuntos", "Attachments")) {
                     integerStepper(loc.t("Texto pegado a archivo", "Paste text to file"),
@@ -485,13 +531,23 @@ struct ChatAdvancedSettingsSection: View {
         }
     }
 
+    private func chooseMapFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = loc.t("Elegir", "Choose")
+        if panel.runModal() == .OK, let url = panel.url { mapFolder = url.path }
+    }
+
     private func reset() {
         topP = 0.95; minP = 0.05; topK = 40; repeatPenalty = 1; repeatLastN = 64; seed = -1
         dynatempRange = 0; dynatempExponent = 1; xtcProbability = 0; xtcThreshold = 0.1
         typicalP = 1; presencePenalty = 0; frequencyPenalty = 0; dryMultiplier = 0
         dryBase = 1.75; dryAllowedLength = 2; dryPenaltyLastN = 0; samplers = ""
         backendSampling = false; customJSON = ""; agenticMaxTurns = 10; pasteLongTextLength = 2500
-        maxImageMegapixels = 1; pdfAsImages = false
+        maxImageMegapixels = ProductDefaults.double(SettingsKeys.chatMaxImageMegapixels, or: 1)
+        pdfAsImages = ProductDefaults.bool(SettingsKeys.chatPDFAsImages, or: false)
         autoCompact = true; smoothTyping = true; agentToolsEnabled = false; jsSandboxEnabled = false
         sympyEnabled = false; scientificEnabled = false; mathAgentEnabled = false; mathToolsAllowed = true
         memoryToolsEnabled = true; toolsRuntime = ""; toolResultLimit = ToolResultLimit.defaultCharacters

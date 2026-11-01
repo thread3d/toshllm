@@ -14,8 +14,8 @@ _COMMON = ("assumptions", "precision", "substitutions")
 
 TOOLS = {
     "expression": {
-        "description": "Exact algebra and calculus on one expression. Math is plain text: x**2*sin(x), "
-                       "sqrt(2), exp(-t), pi, E, oo.",
+        "description": "Exact algebra and calculus on one expression, definite integrals with lower and upper "
+                       "included. Math is plain text: x**2*sin(x), sqrt(2), exp(-t), pi, E, oo.",
         "operations": [
             "simplify", "expand", "factor", "cancel", "together", "apart", "evaluate",
             "differentiate", "integrate", "limit", "series", "summation", "product",

@@ -42,8 +42,9 @@ HEAD_SHA="$(git -C "$TREE" rev-parse --short HEAD)"
 typeset -a rows failed_files
 ok=0; threeway=0; bad=0; rejected_hunks=0
 
-for patch in "$ROOT"/patches/llama/*.patch; do
-    name="${patch:t}"
+# same order as build-engines.sh: recursive, by file name across the area folders
+for patch in ${(f)"$(find "$ROOT/patches/llama" -name '*.patch' | awk -F/ '{print $NF"\t"$0}' | sort | cut -f2-)"}; do
+    name="${patch#$ROOT/patches/llama/}"
     if git -C "$TREE" apply "$patch" 2>/dev/null; then
         rows+=("OK|$name|")
         ok=$((ok+1))

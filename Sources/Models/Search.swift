@@ -57,6 +57,12 @@ final class SearchStore: ObservableObject {
 
     /// expert_count from each candidate's GGUF header, keyed by download URL.
     @Published var headerMoE: [String: Bool] = [:]
+    /// Expert banks and on-demand tables of a large MoE, from every part's tensor table.
+    @Published var headerSplit: [String: GGUFWeightSplit] = [:]
+
+    func weightSplit(repo: String, file: HFFile) -> GGUFWeightSplit? {
+        headerSplit[downloadURL(repo: repo, file: file.path)]
+    }
 
     /// A renamed MoE is invisible to the filename guess, and calling it dense sizes
     /// the fit estimate against full VRAM instead of expert offload.
@@ -231,6 +237,44 @@ final class SearchStore: ObservableObject {
                 if let moe { headerMoE[url] = moe }
             }
         }
+
+        // the size alone puts a large MoE's dense part and on-demand tables in RAM with its experts
+        let large = files.filter { isMoE(repo: repo, file: $0) && $0.sizeBytes >= 8 << 30 }
+            .filter { headerSplit[downloadURL(repo: repo, file: $0.path)] == nil }
+        await withTaskGroup(of: (String, GGUFWeightSplit?).self) { group in
+            for file in large {
+                let parts = file.paths.map { downloadURL(repo: repo, file: $0) }
+                group.addTask { (parts[0], await Self.probeSplit(urls: parts)) }
+            }
+            for await (url, split) in group {
+                if let split { headerSplit[url] = split }
+            }
+        }
+    }
+
+    nonisolated private static func probeSplit(urls: [String]) async -> GGUFWeightSplit? {
+        var total = GGUFWeightSplit()
+        for url in urls {
+            guard let part = await probeSplitPart(urlString: url) else { return nil }
+            total = total + part
+        }
+        return total
+    }
+
+    /// The tensor table follows the tokenizer, which can take several MB in a first part.
+    nonisolated private static func probeSplitPart(urlString: String) async -> GGUFWeightSplit? {
+        guard let url = URL(string: urlString) else { return nil }
+        for limit in [1 << 20, 32 << 20] {
+            var request = URLRequest(url: url)
+            request.setValue("bytes=0-\(limit - 1)", forHTTPHeaderField: "Range")
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let range = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Range"),
+                  let slash = range.lastIndex(of: "/"),
+                  let fileSize = UInt64(range[range.index(after: slash)...]) else { return nil }
+            if let split = GGUFMetadataCache.weightSplit(from: data, fileSize: fileSize) { return split }
+            if data.count < limit { return nil }
+        }
+        return nil
     }
 
     /// nil when unreadable (offline, non-GGUF, truncated): caller keeps the guess.

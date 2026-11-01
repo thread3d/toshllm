@@ -1,0 +1,184 @@
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index 1b5de8e8c..4da104717 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -278,10 +278,16 @@ export class ChatService {
+ 					contentParts.push({
+ 						image_url: { url: pdfFile.images[i] },
+ 						type: ContentPartType.IMAGE_URL
+ 					});
+ 				}
++				if (pdfFile.textLayer) {
++					contentParts.push({
++						text: formatAttachmentText(AttachmentLabel.PDF_FILE, `${pdfFile.name} (text layer)`, pdfFile.textLayer),
++						type: ContentPartType.TEXT
++					});
++				}
+ 			} else {
+ 				contentParts.push({
+ 					text: formatAttachmentText(AttachmentLabel.PDF_FILE, pdfFile.name, pdfFile.content),
+ 					type: ContentPartType.TEXT
+ 				});
+diff --git a/tools/ui/src/lib/types/database.d.ts b/tools/ui/src/lib/types/database.d.ts
+index ce53e99f8..f31f14784 100644
+--- a/tools/ui/src/lib/types/database.d.ts
++++ b/tools/ui/src/lib/types/database.d.ts
+@@ -70,10 +70,12 @@ export interface DatabaseMessageExtraPdfFile {
+ 	name: string;
+ 	size?: number;
+ 	content: string;
+ 	images?: string[];
+ 	processedAsImages: boolean;
++	/** The PDF's own text page by page, sent beside its page images. */
++	textLayer?: string;
+ }
+ 
+ export interface DatabaseMessageExtraTextFile {
+ 	type: AttachmentType.TEXT;
+ 	name: string;
+diff --git a/tools/ui/src/lib/utils/convert-files-to-extra.ts b/tools/ui/src/lib/utils/convert-files-to-extra.ts
+index 507e2bb28..d0290295a 100644
+--- a/tools/ui/src/lib/utils/convert-files-to-extra.ts
++++ b/tools/ui/src/lib/utils/convert-files-to-extra.ts
+@@ -1,6 +1,6 @@
+-import { convertPDFToImage, convertPDFToText } from './pdf-processing';
++import { convertPDFToImage, convertPDFToText, convertPDFToTextLayer } from './pdf-processing';
+ import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
+ import { isLikelyTextFile, readFileAsText } from './text-files';
+ import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
+ import { SETTINGS_KEYS } from '$lib/constants';
+ import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
+@@ -153,17 +153,21 @@ export async function parseFilesToMessageExtras(
+ 							{
+ 								duration: 3000
+ 							}
+ 						);
+ 
++						// the PDF's own text goes with its pages: what an image blurs, the text layer still says
++						const textLayer = await convertPDFToTextLayer(file.file);
++
+ 						extras.push({
+ 							base64Data: base64Data,
+ 							content: `PDF file with ${images.length} pages`,
+ 							images: images,
+ 							name: file.name,
+ 							processedAsImages: true,
+ 							size: file.size,
++							textLayer: textLayer || undefined,
+ 							type: AttachmentType.PDF
+ 						});
+ 					} catch (imageError) {
+ 						console.warn(
+ 							`Failed to process PDF ${file.name} as images, falling back to text:`,
+diff --git a/tools/ui/src/lib/utils/pdf-processing.ts b/tools/ui/src/lib/utils/pdf-processing.ts
+index de1407708..49dede874 100644
+--- a/tools/ui/src/lib/utils/pdf-processing.ts
++++ b/tools/ui/src/lib/utils/pdf-processing.ts
+@@ -45,10 +45,46 @@ async function getFileAsBuffer(file: File): Promise<ArrayBuffer> {
+ 		};
+ 		reader.readAsArrayBuffer(file);
+ 	});
+ }
+ 
++/**
++ * The PDF's own text page by page, for a PDF sent as page images: "[Page N]" before each page and an end line, or
++ * an empty string when it has no usable text layer, as a scan has none.
++ * @param file - The PDF file to process
++ * @returns Promise resolving to the text layer, or ''
++ */
++export async function convertPDFToTextLayer(file: File): Promise<string> {
++	if (!browser) {
++		return '';
++	}
++
++	try {
++		const buffer = await getFileAsBuffer(file);
++		const pdf = await pdfjs.getDocument({ data: buffer }).promise;
++		const pages: string[] = [];
++
++		for (let i = 1; i <= pdf.numPages; i++) {
++			const page = await pdf.getPage(i);
++			const content = await page.getTextContent();
++			// eslint-disable-next-line @typescript-eslint/no-explicit-any
++			const text = content.items.map((item: any) => (item.str ?? '') + (item.hasEOL ? '\n' : ' ')).join('');
++			pages.push(text.replace(/[ \t]+\n/g, '\n').trim());
++		}
++
++		if (pages.join('').replace(/\s/g, '').length < 80) {
++			return '';
++		}
++
++		return pages.map((text, i) => `[Page ${i + 1}]\n${text}`).join('\n') + '\n[End of text layer]';
++	} catch (error) {
++		console.warn('Could not read the PDF text layer:', error);
++
++		return '';
++	}
++}
++
+ /**
+  * Extract text content from a PDF file
+  * @param file - The PDF file to process
+  * @returns Promise resolving to the extracted text content
+  */
+diff --git a/tools/ui/tests/unit/pdf-text-layer.test.ts b/tools/ui/tests/unit/pdf-text-layer.test.ts
+new file mode 100644
+index 000000000..ced773268
+--- /dev/null
++++ b/tools/ui/tests/unit/pdf-text-layer.test.ts
+@@ -0,0 +1,55 @@
++import { beforeAll, describe, expect, it } from 'vitest';
++
++beforeAll(() => {
++	const store = new Map<string, string>();
++	(globalThis as unknown as { localStorage: Storage }).localStorage = {
++		clear: () => store.clear(),
++		getItem: (k) => (store.has(k) ? store.get(k)! : null),
++		key: (i) => Array.from(store.keys())[i] ?? null,
++		get length() {
++			return store.size;
++		},
++		removeItem: (k) => {
++			store.delete(k);
++		},
++		setItem: (k, v) => {
++			store.set(k, String(v));
++		}
++	};
++});
++
++import { AttachmentType } from '$lib/enums';
++import { ChatService } from '$lib/services/chat.service';
++
++const pdf = (textLayer?: string) => ({
++	base64Data: '',
++	content: 'PDF file with 1 pages',
++	images: ['data:image/jpeg;base64,AAAA'],
++	name: 'deed.pdf',
++	processedAsImages: true,
++	textLayer,
++	type: AttachmentType.PDF
++});
++
++describe('a PDF sent as page images', () => {
++	it('carries its own text beside the images', async () => {
++		const layer = '[Page 1]\nThence North 10°00\'00" East 100.00 feet\n[End of text layer]';
++		const message = { content: 'Compute it', role: 'user', extra: [pdf(layer)] };
++		// eslint-disable-next-line @typescript-eslint/no-explicit-any
++		const data = await ChatService.convertDbMessageToApiChatMessageData(message as any);
++		// eslint-disable-next-line @typescript-eslint/no-explicit-any
++		const parts = data.content as any[];
++		expect(parts.filter((p) => p.type === 'image_url')).toHaveLength(1);
++		const text = parts.find((p) => p.type === 'text' && p.text.includes('(text layer)'));
++		expect(text.text).toContain('--- PDF File: deed.pdf (text layer) ---\n[Page 1]');
++		expect(text.text.endsWith('[End of text layer]')).toBe(true);
++	});
++
++	it('sends the images alone when the PDF has no text layer', async () => {
++		const message = { content: 'Compute it', role: 'user', extra: [pdf()] };
++		// eslint-disable-next-line @typescript-eslint/no-explicit-any
++		const data = await ChatService.convertDbMessageToApiChatMessageData(message as any);
++		// eslint-disable-next-line @typescript-eslint/no-explicit-any
++		expect((data.content as any[]).some((p) => p.type === 'text' && p.text.includes('(text layer)'))).toBe(false);
++	});
++});

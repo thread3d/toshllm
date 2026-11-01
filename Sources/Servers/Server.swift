@@ -74,6 +74,9 @@ struct ServerSettings {
     /// for the GPU, and a prefill aborted by a client timeout stays in the slot so
     /// the retry resumes where it left off.
     var parallelSlots: Int = 1
+    /// Each slot gets its own share of the context: faster with several requests at once, but
+    /// no single conversation can grow past its share.
+    var separateKV: Bool = false
     var apiKeyEnabled: Bool = false
     /// Serve beyond loopback and advertise with Bonjour. Off by default: it opens
     /// the API to the whole local network, so it wants `apiKeyEnabled` alongside.
@@ -245,8 +248,7 @@ struct ServerSettings {
     /// by port so independent servers don't overwrite each other's slot 0 / prefix
     /// files in a shared folder.
     static func slotCacheDir(port: Int) -> URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ToshLLM/slots/\(port)/\(slotKVSignature())")
+        let dir = AppSupport.directory.appendingPathComponent("slots/\(port)/\(slotKVSignature())")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -382,6 +384,9 @@ struct ServerSettings {
             if imageMaxTokens > 0 { args += ["--image-max-tokens", String(imageMaxTokens)] }
         }
         if jinja || mmproj != nil { args.append("--jinja") }
+        // History turns come back without their reasoning, and a template that preserves it
+        // writes an empty block in each one; the model then ends answers mid-sentence.
+        args.append("--no-reasoning-preserve")
         if !usesAutoPlan {
             if launchKV.k != "f16" { args += ["-ctk", launchKV.k] }
             if launchKV.v != "f16" { args += ["-ctv", launchKV.v] }
@@ -394,9 +399,9 @@ struct ServerSettings {
         }
         if parallelSlots > 0 { args += ["--parallel", String(parallelSlots)] }
         // An explicit --parallel N splits the context pool across slots instead of
-        // sharing it (only "auto" unifies), so ask for one pool ourselves: the chat
-        // keeps its full window and API requests don't multiply KV memory.
-        if parallelSlots > 1 { args.append("--kv-unified") }
+        // sharing it (only "auto" unifies), so ask for one pool ourselves unless the user
+        // chose separate shares: the chat then keeps its full window.
+        if parallelSlots > 1 && !separateKV { args.append("--kv-unified") }
         // Which devices to split across is decided by the env vars below.
         if isSplitting { args += ["--split-mode", effectiveSplitMode] }
         if let counts = layerBalancedTensorSplit {
@@ -409,7 +414,8 @@ struct ServerSettings {
             if !toolsRuntime.isEmpty { args += ["--tools-runtime", toolsRuntime] }
         }
         let sympyArguments = SymPyToolsService.serverArguments(enabled: sympyEnabled, scientific: scientificEnabled,
-                                                                agent: mathAgentEnabled)
+                                                                agent: mathAgentEnabled, shared: MCPServerStore.load(),
+                                                                extensions: EngineExtensions.active())
         if !sympyArguments.isEmpty {
             if !args.contains("--jinja") { args.append("--jinja") }
             args += sympyArguments
@@ -433,13 +439,13 @@ struct ServerSettings {
                      "-ngld", String(selection.ngld),
                      "-ctkd", "q8_0", "-ctvd", "q8_0"]
         } else if Self.mtpEnabled(forModel: modelPath), let draft = Self.mtpDraftPath(forModel: modelPath) {
-            args += ["-md", draft, "--spec-type", "draft-mtp"]
+            args += ["-md", draft, "--spec-type", "draft-mtp"] + Self.mtpSamplingArgs
             args += Self.mtpDraftWidthArgs(forModel: modelPath, gpuArchitecture: selectedGPUArchitecture)
         } else if Self.mtpEnabled(forModel: modelPath), Self.modelHasMTP(at: modelPath) {
-            args += ["--spec-type", "draft-mtp"]
+            args += ["--spec-type", "draft-mtp"] + Self.mtpSamplingArgs
             args += Self.mtpDraftWidthArgs(forModel: modelPath, gpuArchitecture: selectedGPUArchitecture)
         }
-        if let ui = Self.chatUIPath { args += ["--path", ui] }
+        args += Self.chatUIArgs
         args += extraArgTokens.cli
         return args
     }
@@ -447,13 +453,18 @@ struct ServerSettings {
     /// Router writes one entry per model with the same context, but a multi-head model
     /// caches several times more per token than a GQA one and can overflow VRAM on
     /// load, which hangs the driver. Shrink the context for the models that don't fit.
+    /// The reserve the user set, or the share the engine's memory plan keeps on its own.
+    nonisolated static func effectiveVramReserveMB(_ setting: Int, vramMB: Int) -> Int {
+        setting > 0 ? setting : Int(min(max(0.08 * Double(vramMB), 768), 1536))
+    }
+
     nonisolated static func routerCtx(forModel path: String, requested: Int, ncmoe: Int,
                                       kvScale: Double, reserveMB: Int) -> Int {
         let kvPerToken = ModelSpec.kvBytesPerToken(atPath: path) * kvScale
         guard kvPerToken > 0, requested > 2048 else { return requested }
-        let vramGB = Double(ServerController.availableGPUs().map(\.vramMB).max() ?? 0) / 1024
-        guard vramGB > 0 else { return requested }
-        let budget = vramGB - Double(reserveMB) / 1024
+        let vramMB = ServerController.availableGPUs().map(\.vramMB).max() ?? 0
+        guard vramMB > 0 else { return requested }
+        let budget = Double(vramMB - effectiveVramReserveMB(reserveMB, vramMB: vramMB)) / 1024
         let size = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int64) ?? 0
         let weightsGB = Double(size) / 1_073_741_824 * (ncmoe > 0 ? 0.45 : 1.0)
         let computeGB = 0.9
@@ -481,14 +492,15 @@ struct ServerSettings {
             if !toolsRuntime.isEmpty { args += ["--tools-runtime", toolsRuntime] }
         }
         let sympyArguments = SymPyToolsService.serverArguments(enabled: sympyEnabled, scientific: scientificEnabled,
-                                                                agent: mathAgentEnabled)
+                                                                agent: mathAgentEnabled, shared: MCPServerStore.load(),
+                                                                extensions: EngineExtensions.active())
         if !sympyArguments.isEmpty {
             if !args.contains("--jinja") { args.append("--jinja") }
             args += sympyArguments
         }
         if uiMcpProxy { args.append("--ui-mcp-proxy") }
         if apiKeyEnabled { args += ["--api-key", Keychain.apiKey()] }
-        if let ui = Self.chatUIPath { args += ["--path", ui] }
+        args += Self.chatUIArgs
         args += extraArgTokens.cli
         return args
     }
@@ -496,13 +508,12 @@ struct ServerSettings {
     /// Same folder `ModelStore` scans (`~/models` or the custom override),
     /// resolved independently since `ServerController` has no `ModelStore`.
     static var modelsDirectory: URL {
-        let custom = UserDefaults.standard.string(forKey: SettingsKeys.modelsDir) ?? ""
+        let custom = ModelStore.customDirectoryPath
         return custom.isEmpty ? ModelStore.defaultDirectory : URL(fileURLWithPath: custom, isDirectory: true)
     }
 
     static func routerPresetPath(port: Int) -> URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ToshLLM/router")
+        let dir = AppSupport.directory.appendingPathComponent("router")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("preset-\(port).ini")
     }
@@ -544,12 +555,13 @@ struct ServerSettings {
                 if imageMaxTokens > 0 { lines.append("image-max-tokens = \(imageMaxTokens)") }
             }
             if jinja || mmproj != nil { lines.append("jinja = true") }
+            lines.append("reasoning-preserve = false")
             if cacheTypeK != "f16" { lines.append("cache-type-k = \(cacheTypeK)") }
             if cacheTypeV != "f16" { lines.append("cache-type-v = \(cacheTypeV)") }
             lines.append("cache-ram = \(cacheRAM)")
             if cacheReuse && mmproj == nil { lines.append("cache-reuse = 256") }
             if parallelSlots > 0 { lines.append("parallel = \(parallelSlots)") }
-            if parallelSlots > 1 { lines.append("kv-unified = true") }
+            if parallelSlots > 1 && !separateKV { lines.append("kv-unified = true") }
             if isSplitting { lines.append("split-mode = \(effectiveSplitMode)") }
             if persistCache && effectiveFaAmd {
                 // the engine rejects a slot path that isn't an existing directory
@@ -569,11 +581,13 @@ struct ServerSettings {
             } else if Self.mtpEnabled(forModel: path), let draft = Self.mtpDraftPath(forModel: path) {
                 lines.append("model-draft = \(draft)")
                 lines.append("spec-type = draft-mtp")
+                lines.append("spec-draft-sampling = probabilistic")
                 if let n = Self.mtpDraftWidth(forModel: path, gpuArchitecture: selectedGPUArchitecture) {
                     lines.append("spec-draft-n-max = \(n)")
                 }
             } else if Self.mtpEnabled(forModel: path), Self.modelHasMTP(at: path) {
                 lines.append("spec-type = draft-mtp")
+                lines.append("spec-draft-sampling = probabilistic")
                 if let n = Self.mtpDraftWidth(forModel: path, gpuArchitecture: selectedGPUArchitecture) {
                     lines.append("spec-draft-n-max = \(n)")
                 }
@@ -734,15 +748,40 @@ struct ServerSettings {
         return nil
     }
 
+    /// The bundled web chat, starting in a new browser with the app's own image and PDF settings.
+    static var chatUIArgs: [String] {
+        guard let ui = chatUIPath else { return [] }
+        let d = UserDefaults.standard
+        let megapixels = d.object(forKey: SettingsKeys.chatMaxImageMegapixels) == nil
+            ? 1 : d.double(forKey: SettingsKeys.chatMaxImageMegapixels)
+        var config: [String: Any] = ["pdfAsImage": d.bool(forKey: SettingsKeys.chatPDFAsImages),
+                                     "maxImageMPixels": megapixels]
+        var tiles: [String] = []
+        if !MapBase.style.isEmpty { config["mapStyle"] = MapBase.style }
+        if let folder = MapBase.folder, !MapBase.regions.isEmpty {
+            tiles = ["--tiles-path", folder.path]
+            config["mapRegions"] = MapBase.regions.map { "/tiles/" + ($0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? $0) }
+                .joined(separator: ",")
+            if !MapBase.labels { config["mapLabels"] = false }
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]) else {
+            return ["--path", ui] + tiles
+        }
+        return ["--path", ui, "--ui-config", String(decoding: data, as: UTF8.self)] + tiles
+    }
+
     var environment: [String: String] {
         var env = ProcessInfo.processInfo.environment
+        env.merge(EngineExtensions.environment()) { $1 }
+        env.merge(SymPyToolsService.engineEnvironment(MCPServerStore.load())) { $1 }
         // Finder-launched apps inherit a minimal PATH. Video input is decoded by
         // llama.cpp through ffmpeg/ffprobe, so expose their standard macOS locations.
         env["PATH"] = VideoRuntimeAvailability.augmentedPath(env["PATH"])
         // The engine logs this, so a log pasted from a bug report identifies the
         // app build even when the engine binary is older than the app.
         env["TOSH_APP_VERSION"] = AppInfo.version
-        env["GGML_METAL_VRAM_RESERVE_MB"] = String(vramReserveMB)
+        // the engine's memory plan keeps its own share of the card unless the user set one
+        if vramReserveMB > 0 { env["GGML_METAL_VRAM_RESERVE_MB"] = String(vramReserveMB) }
         // Physical GPU selection (consumed by the patched Metal backend, which maps
         // these to MTLCopyAllDevices() — the same order as the app's GPU picker).
         let gpus = ServerController.availableGPUs()
@@ -799,11 +838,6 @@ struct ServerSettings {
             if planWithoutDMoE { env["TOSH_AUTO"] = "nodmoe" } else if executionMode == "dmoe" { env["TOSH_AUTO"] = "dmoe" }
             env["TOSH_AUTO_KV"] = autoKVMode
             if dynamicMoeLeanRAM { env["TOSH_AUTO_HOST_BANK"] = "lean" }
-            // the engine keeps this family's separate head behind a switch
-            if Self.mtpEnabled(forModel: modelPath), Self.mtpDraftPath(forModel: modelPath) != nil,
-               Self.ggufString("general.architecture", at: modelPath) == "qwen4exp" {
-                env["TOSH_QWEN4EXP_MTP_EXPERIMENTAL"] = "1"
-            }
             env["TOSH_AUTO_PLAN_FILE"] = AutoMemoryPlan.planURL(port: port).path
         } else if prefetchExperts && ((ncmoe > 0 && !manualFullGPU) || routerMode) {
             // At/above the measured cliff the prefetch overlap collapses and stalls the
@@ -894,7 +928,7 @@ struct ServerSettings {
             flashAttn: d.string(forKey: SettingsKeys.flashAttn) ?? "auto",
             noMmap: bool(SettingsKeys.noMmap, true),
             jinja: bool(SettingsKeys.jinja, true),
-            vramReserveMB: int(SettingsKeys.vramReserve, 1024),
+            vramReserveMB: int(SettingsKeys.vramReserve, 0),
             gpuIndex: int(SettingsKeys.gpuIndex, -1),
             gpuList: gpuList(fromCSV: d.string(forKey: SettingsKeys.gpuList)),
             extraArgs: d.string(forKey: SettingsKeys.extraArgs) ?? "",
@@ -912,8 +946,11 @@ struct ServerSettings {
             cacheRAM: int(SettingsKeys.cacheRAM, 2048),
             reasoningInline: bool(SettingsKeys.reasoningInline, false),
             defaultReasoning: d.string(forKey: SettingsKeys.serverDefaultReasoning) ?? "model",
-            defaultMaxTokens: int(SettingsKeys.serverDefaultMaxTokens, 0),
+            // -1 is "same as the chat": the web chat and API clients get the in-app chat's limit
+            defaultMaxTokens: int(SettingsKeys.serverDefaultMaxTokens, -1) < 0
+                ? int(SettingsKeys.chatMaxTokens, 2048) : int(SettingsKeys.serverDefaultMaxTokens, -1),
             parallelSlots: int(SettingsKeys.parallelSlots, 1),
+            separateKV: bool(SettingsKeys.separateKV, false),
             apiKeyEnabled: bool(SettingsKeys.apiKeyEnabled, false),
             localNetworkDiscovery: bool(SettingsKeys.localNetworkDiscovery, false),
             specMTP: bool(SettingsKeys.specMTP, false),
@@ -1068,7 +1105,8 @@ struct ServerSettings {
             * (keyLength + valueLength) * q8BytesPerElement
         let mainKVScale = (Estimator.kvTypeScale(cacheTypeK) + Estimator.kvTypeScale(cacheTypeV)) / 2
         let vramGB = Double(selected.reduce(0) { $0 + $1.vramMB }) / 1024
-        let reserveGB = honorReserve ? Double(vramReserveMB * max(1, selected.count)) / 1024 : 0
+        let reserveGB = honorReserve
+            ? Double(selected.reduce(0) { $0 + Self.effectiveVramReserveMB(vramReserveMB, vramMB: $1.vramMB) }) / 1024 : 0
         return DflashMemoryPlanner.plan(
             vramGB: vramGB, reserveGB: reserveGB,
             baseFileGB: baseBytes / 1_073_741_824, baseLayers: baseLayers, ncmoe: ncmoe,
@@ -1187,6 +1225,10 @@ struct ServerSettings {
     /// Finds the MTP head of a model: beside it, or in the `MTP/` folder the upstream
     /// repackagers ship. Names vary (`mtp-<model>.gguf`, `<model>.mtp.gguf`, `<model>-MTP-Q8_0`),
     /// so the file name only proposes a candidate and the header decides.
+    /// The MTP head samples its draft and the target verifies it by rejection: with a temperature
+    /// above zero more of the draft is accepted, and at zero it is the same as taking the argmax.
+    nonisolated static let mtpSamplingArgs = ["--spec-draft-sampling", "probabilistic"]
+
     nonisolated static func mtpDraftPath(forModel modelPath: String) -> String? {
         guard !modelPath.isEmpty, !GGUFFile.isDraft(modelPath) else { return nil }
         let modelURL = URL(fileURLWithPath: modelPath)
@@ -1378,12 +1420,43 @@ struct ServerSettings {
     }
 
     /// Whether to offer the projector control for a model: it has a paired or
-    /// pinned projector, an explicit choice (incl. off), or is a catalog vision model.
+    /// pinned projector, an explicit choice (incl. off), a projector beside it that
+    /// matches its dimension, or is a catalog vision model.
     nonisolated static func mightSupportVision(modelPath: String) -> Bool {
         if mmprojOverride(forModel: modelPath) != nil { return true }
         if mmprojPath(forModel: modelPath) != nil { return true }
+        if !compatibleProjectors(forModel: modelPath).isEmpty { return true }
         let name = URL(fileURLWithPath: modelPath).lastPathComponent
         return Catalog.models.contains { $0.fileName == name && $0.isVision }
+    }
+
+    /// Whether a projector named after this model sits beside it, as a download saves it.
+    nonisolated static func hasOwnProjector(forModel modelPath: String) -> Bool {
+        func core(_ s: String) -> String {
+            String(s.lowercased().replacingOccurrences(of: "mmproj", with: "").filter { $0.isLetter || $0.isNumber })
+        }
+        let url = URL(fileURLWithPath: modelPath)
+        let mn = core(url.deletingPathExtension().lastPathComponent)
+        guard !mn.isEmpty,
+              let files = try? FileManager.default.contentsOfDirectory(at: url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+        else { return false }
+        return files.contains {
+            $0.pathExtension.lowercased() == "gguf" && $0.lastPathComponent.lowercased().contains("mmproj")
+                && core($0.deletingPathExtension().lastPathComponent) == mn
+        }
+    }
+
+    /// Projectors beside the model whose output matches its embedding, by name. Auto-pairing
+    /// also asks for a matching name, so these are the ones a user may pick by hand.
+    nonisolated static func compatibleProjectors(forModel modelPath: String) -> [String] {
+        guard !modelPath.isEmpty, let embd = ggufUInt32("embedding_length", at: modelPath) else { return [] }
+        let dir = URL(fileURLWithPath: modelPath).deletingLastPathComponent()
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return [] }
+        return files
+            .filter { $0.pathExtension.lowercased() == "gguf" && $0.lastPathComponent.lowercased().contains("mmproj") }
+            .filter { ggufUInt32("projection_dim", at: $0.path) == embd && !isIncompatibleMmproj(model: modelPath, projector: $0.path) }
+            .map(\.path)
+            .sorted { URL(fileURLWithPath: $0).lastPathComponent < URL(fileURLWithPath: $1).lastPathComponent }
     }
 
     /// The DFlash draft downloaded for a model, saved as `<model>.dflash.gguf`.
@@ -2063,7 +2136,7 @@ final class ServerController: ObservableObject {
                         }
                         self.retryWithoutMmproj = true
                         EngineLock.remove(pid: proc.processIdentifier)
-                        self.consume("\n[ToshLLM] el proyector (mmproj) no se pudo cargar — reintentando solo-texto (visión desactivada) / projector failed to load — retrying text-only (vision disabled)\n")
+                        self.consume("\n[ToshLLM] the projector (mmproj) failed to load — retrying text-only, vision disabled\n")
                         self.state = .starting
                         self.launch(settings)
                         return
@@ -2074,7 +2147,9 @@ final class ServerController: ObservableObject {
                     // a second one within ten minutes stays failed so a repeating cause is not hidden.
                     if wasServing, self.lastCrashRelaunch.map({ Date().timeIntervalSince($0) > 600 }) ?? true {
                         self.lastCrashRelaunch = Date()
-                        self.consume("\n[ToshLLM] el motor se detuvo (\(why)) — reiniciando / the engine stopped (\(why)) — restarting\n")
+                        // the log is the engine's, in English; the diagnosis carries both languages
+                        let reason = why.range(of: " / ").map { String(why[$0.upperBound...]) } ?? why
+                        self.consume("\n[ToshLLM] the engine stopped (\(reason)) — restarting\n")
                         self.state = .starting
                         self.launch(settings)
                         return
@@ -2429,7 +2504,7 @@ final class ServerController: ObservableObject {
     private func startDiscoveryIfNeeded(port: Int) {
         guard discoveryEnabled else { return }
         stopDiscovery()
-        let service = NetService(domain: "local.", type: "_http._tcp.", name: "ToshLLM API", port: Int32(port))
+        let service = NetService(domain: "local.", type: "_http._tcp.", name: "\(AppInfo.name) API", port: Int32(port))
         let txt: [String: Data] = [
             "path": Data("/v1".utf8),
             "protocol": Data("openai-compatible".utf8),
@@ -2462,10 +2537,27 @@ final class ServerController: ObservableObject {
             if line.contains("mixed expert execution failed"), !recoveredFromExecutorFailure,
                state == .running, let settings = launchedSettings {
                 recoveredFromExecutorFailure = true
-                autoPlanNote = (UserDefaults.standard.string(forKey: SettingsKeys.language) ?? "en") == "es"
-                    ? "El sistema dejó sin CPU a Dynamic MoE; el servidor se reinició."
-                    : "The system starved Dynamic MoE of CPU; the server was restarted."
+                autoPlanNote = Localizer().t("El sistema dejó sin CPU a Dynamic MoE; el servidor se reinició.",
+                                             "The system starved Dynamic MoE of CPU; the server was restarted.")
                 restartAfterFailure(settings)
+            }
+            if GPURecovery.reports(line), state == .running, let settings = launchedSettings, let failed = process {
+                if GPURecovery.shared.admit(port: currentPort) {
+                    autoPlanNote = Localizer().t(
+                        "Un trabajo de la GPU no terminó a tiempo y el motor dejó de poder usarla; el servidor se reinició. Vuelve a enviar el último mensaje.",
+                        "A GPU job did not finish in time and the engine could no longer use the GPU; the server was restarted. Send the last message again.")
+                    // the request in flight gets its error before the process goes
+                    Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(3))
+                        // a server the user stopped or restarted meanwhile is left as it is
+                        guard let self, self.process === failed, self.state == .running else { return }
+                        self.restartAfterFailure(settings)
+                    }
+                } else {
+                    autoPlanNote = Localizer().t(
+                        "La GPU volvió a fallar menos de 10 minutos después del último reinicio automático, así que el servidor no se reinició: reinícialo a mano.",
+                        "The GPU failed again less than 10 minutes after the last automatic restart, so the server was not restarted: restart it by hand.")
+                }
             }
             if line.contains("draft acceptance ="),
                let m = line.range(of: #"draft acceptance = ([0-9]+\.[0-9]+)"#, options: .regularExpression) {

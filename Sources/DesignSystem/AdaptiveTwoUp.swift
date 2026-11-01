@@ -17,9 +17,12 @@ struct AdaptiveTwoUp<First: View, Second: View>: View {
 
     var body: some View {
         if #available(macOS 15, *) {
-            stack.onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
-                wide = width >= threshold
-            }
+            // measures the width offered, not the stack's own: a stacked layout is narrower
+            // than the row it came from and would never switch back
+            stack.frame(maxWidth: .infinity, alignment: .leading)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                    wide = width >= threshold
+                }
         } else {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: alignment, spacing: spacing) { first; second }

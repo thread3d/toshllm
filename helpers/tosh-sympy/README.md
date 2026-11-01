@@ -207,15 +207,67 @@ below changes meaning or goes away; new fields may appear.
 |---|---|
 | `version` | `1` |
 | `intent` | `no_math`, `conceptual`, `computational`, `ambiguous` |
-| `outcome` | `answered`, `validated_results_only`, `clarification_required`, `unresolved`, `turn_limit` |
+| `outcome` | `answered`, `validated_results_only`, `clarification_required`, `unresolved`, `turn_limit`, `cut_at_limit` (the answer ran out of its tokens), `cut_at_context` (the conversation filled the context while it was written) |
 | `calls[]` | `tool`, `arguments`, `status` (`ok` or an error code such as `transcription_mismatch`, `needs_review`, `no_closed_form`, `timeout`), `interpreted_input`, `result_kind` |
 | `validated_results[]` | `tool`, `operation`, `result_kind`, `result` (the tool's own fields), `interpreted_input` |
 | `passes` | model passes the turn took |
 | `seconds` | wall time of the turn |
+| `context` | `used`: tokens the conversation takes with this answer, the whole of it even when the turn left out its oldest messages, which then is more than `n_ctx`; `n_ctx`: the model's context; `left_out`: oldest messages of the conversation left out of this turn |
 
-`usage` adds up every pass. Status codes and the fields above never change language; the texts
+`usage` adds up every pass, so a client measures how full the context is by `context.used`, not by it.
+A conversation that no longer fits the context, with room left for the answer, loses its oldest
+exchanges for that turn, as the engine's tokenizer counts them; the answer ends saying how many, and a
+message that alone does not fit gets `exceed_context_size_error`. Status codes and the fields above never change language; the texts
 the agent writes itself (a question back, the list of validated results) follow the language of
 the conversation, Spanish or English, and English when in doubt.
+
+### Another agent
+
+An extension can bring its own agent in place of this one (see
+[`docs/extensions.md`](../../docs/extensions.md#the-agent)). The engine calls its `run` tool with
+`request` (the client's request as sent), `base_url`, `api_key` and `agent_key`, and takes back a
+chat completion or `{"status": n, "error": {...}}`. The agent reaches the model and the tools
+through `base_url` with `X-Tosh-Agent: off`, so its passes never come back to it, and sends
+`X-Tosh-Agent-Key: <agent_key>` on `/tools`: without it the tools of servers started with
+`--mcp-agent-only` are neither listed nor run. Progress goes out as MCP progress notifications whose
+message is one event as above; for a `tool_call`, `state` is `completed` or `failed`, and an
+optional `summary` is one readable line about the result that the app shows on the call.
+A pass the agent streams goes out as `{"type": "delta", "content": "..."}` events (or
+`reasoning_content`), forwarded as the model writes; `{"type": "retract"}` after a pass that ended in tool
+calls tells the client to drop that text. The answer's content then starts with the text streamed since the
+last `retract`, and only the rest of it goes out at the end.
+
+When the app has tools of its own besides the math ones it sends `"tosh": {"client_tools": true}`.
+An agent may then hand back a turn that is outside its field: it answers with empty content,
+runs nothing and sets `"tosh": {"version": 1, "outcome": "declined"}`, and the app answers that
+turn with its own tools, as it would without the extension. Other clients never send the field,
+so they always get an answer.
+A turn whose last message brings images, audio or video is handed back the same way to a client that sends
+`tosh` options, as the app does; any other client gets the model's own answer to it.
+
+An answer whose words a later turn needs, such as the reference and the figures of what it traced, puts them in
+`"keep"` in its `tosh`, as written in the answer. A client that summarizes older messages to save context keeps
+each one as it is, after a line `Kept from earlier answers, as written:` at the end of the summary, with a `---`
+line between them, so that the agent can still find what they name.
+
+An agent can offer a map of an answer without delaying it: it adds `"map_request": {"show": bool, ...}`
+to the answer's `tosh`, without any geometry. A client sends that object back as
+`"tosh": {"map_request": {...}}` in a request of its own, and the agent answers it, with no model
+pass, with `"tosh": {"map": {"layers": [...]}}`: each layer a GeoJSON FeatureCollection in
+longitude/latitude with an optional `title`, `subtitle` (which of its features these are), `fields`
+(`[{"name", "alias"}]`, the order and names to show a clicked feature's attributes in), `complete` (false when not
+every feature fit) and `link` (`{"title", "url"}`, the layer in its own viewer). The app draws it at once when `show` is
+true, the request having asked for a map, and otherwise offers it under the answer.
+
+Figures that no coordinates place on the ground, such as the tracts traced from a deed's calls, go in the answer's
+own `tosh` as `"sketches": [{"points": [[x, y], ...], "unit": "ft", "closed": bool, "title": "...", "corners": [...]}]`,
+each the path east and north of its first point, in order. The app draws them under the answer without a map, small
+and several to a row, each one enlarged on request; it numbers `corners` (the points themselves when absent) from 1
+and, when `closed`, shows in red the gap between the last point and the first. A figure that lies in a coordinate
+system of its own, such as a State Plane zone, adds `"origin": [x, y]` (its first point there) and `"plane"` (the
+system's name): its DXF and CSV are then written at those coordinates. An optional `standing` (a short label of what the
+figure is, such as whether it closes or is only a draft) goes into every export: the shapefile's table, a column of
+the CSV and a text of the DXF; a shapefile's table also says how much of a gap its polygon closes.
 
 ### Direct calls
 
@@ -249,12 +301,21 @@ curl http://127.0.0.1:8080/tools -H 'Content-Type: application/json' \
 Any OpenAI client works with the base URL `http://host:8080/v1`; to send the header, use its
 extra-headers option, or start the engine without `--mcp-agent-explicit`.
 
+## Remote MCP servers
+
+`llama-server` only starts servers it talks to over stdio, so a remote one approved for the agent
+runs through `tosh_sympy/remote.py`, a local server that relays every message to its URL over
+Streamable HTTP, or the older HTTP+SSE transport when the server lacks it. Headers come from
+environment variables the app sets on the engine (`--headers-env`, `--header-env Name=VAR`),
+never from arguments.
+
 ## Tests
 
 ```sh
 ./scripts/build-sympy.sh
 vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_helper.py
 vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_agent.py
+vendor/tosh-sympy/python/bin/python3 -I helpers/tosh-sympy/tests/test_remote.py
 TOSH_ENGINE_URL=http://127.0.0.1:8080 TOSH_ENGINE_AGENT=1 python3 helpers/tosh-sympy/tests/test_engine_api.py
 TOSH_SYMPY_E2E_MODEL=~/models/Qwen3-4B-Q4_K_M.gguf ./scripts/test.sh --filter SymPyEngine
 ```

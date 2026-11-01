@@ -23,4 +23,13 @@ final class ToolResultLimitTests: XCTestCase {
         XCTAssertTrue(capped.hasSuffix(String(repeating: "t", count: 250)))
         XCTAssertTrue(capped.contains("1000 of 2000 characters omitted"))
     }
+
+    func testAnOperationAServiceOnlyAcceptedIsToldApart() {
+        XCTAssertTrue(ToolResultStatus.acceptedOnly(#"{"status": "accepted", "job_id": "j-17"}"#))
+        XCTAssertTrue(ToolResultStatus.acceptedOnly(#"{"result": {"jobStatus": "submitted"}}"#))
+        XCTAssertTrue(ToolResultStatus.acceptedOnly(#"{"state": " QUEUED "}"#))
+        XCTAssertFalse(ToolResultStatus.acceptedOnly(#"{"status": "completed", "edits": 3}"#))
+        XCTAssertFalse(ToolResultStatus.acceptedOnly(#"{"message": "the job was accepted by the team"}"#))
+        XCTAssertFalse(ToolResultStatus.acceptedOnly("accepted"))
+    }
 }

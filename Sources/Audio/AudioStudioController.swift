@@ -62,9 +62,7 @@ final class AudioStudioController: ObservableObject {
     private var redoHistory: [([SubtitleCue], [SubtitleCue])] = []
 
     private static var recoveryURL: URL {
-        URL.applicationSupportDirectory
-            .appending(path: "ToshLLM", directoryHint: .isDirectory)
-            .appending(path: "AudioRecovery.json")
+        AppSupport.directory.appending(path: "AudioRecovery.json")
     }
 
     var isBusy: Bool {

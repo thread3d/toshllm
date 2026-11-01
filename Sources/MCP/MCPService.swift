@@ -23,7 +23,8 @@ actor ToshMCPService {
 
     func discoverTools() async -> [BuiltinToolInfo] {
         var output: [BuiltinToolInfo] = []
-        for server in MCPServerStore.load() where server.enabled {
+        // a server shared with the engine is reached through its agent instead
+        for server in MCPServerStore.load() where server.enabled && !server.sharedWithEngine {
             do {
                 try await connect(server)
                 let result = try await request(serverID: server.id, method: "tools/list", params: [:])
@@ -304,12 +305,14 @@ actor ToshMCPService {
         if let sessionID { request.setValue(sessionID, forHTTPHeaderField: "Mcp-Session-Id") }
         applyHeaders(server, to: &request)
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let redirects = MCPRedirectGuard(url)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request, delegate: redirects)
+        try redirects.check()
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 0
         let sessionHeader = http?.value(forHTTPHeaderField: "Mcp-Session-Id")
         if http?.mimeType == "text/event-stream" {
-            for try await line in bytes.lines {
+            for try await line in bytes.streamLines {
                 guard line.hasPrefix("data:"),
                       let eventData = line.dropFirst(5).trimmingCharacters(in: .whitespaces).data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: eventData) as? [String: Any]
@@ -343,6 +346,7 @@ actor ToshMCPService {
         request.setValue("mcp", forHTTPHeaderField: "Sec-WebSocket-Protocol")
         applyHeaders(server, to: &request)
         let socket = URLSession.shared.webSocketTask(with: request)
+        socket.delegate = MCPRedirectGuard(url)
         socket.resume()
         sessions[server.id]?.webSocket = socket
     }
@@ -350,7 +354,12 @@ actor ToshMCPService {
     private func sendWebSocket(serverID: UUID, payload: [String: Any], id: Int) async throws -> WireResponse {
         guard let socket = sessions[serverID]?.webSocket else { throw MCPError.invalidResponse }
         let data = try JSONSerialization.data(withJSONObject: payload)
-        try await socket.send(.data(data))
+        do {
+            try await socket.send(.data(data))
+        } catch {
+            try (socket.delegate as? MCPRedirectGuard)?.check()
+            throw error
+        }
         while true {
             let message = try await socket.receive()
             let value: Data
@@ -381,13 +390,21 @@ actor ToshMCPService {
             request.timeoutInterval = 3_600
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
             applyHeaders(server, to: &request)
-            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            let redirects = MCPRedirectGuard(url)
+            let (bytes, response) = try await URLSession.shared.bytes(for: request, delegate: redirects)
+            try redirects.check()
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 throw MCPError.remote("Legacy MCP SSE connection failed")
             }
             var event = "message"
             var dataLines: [String] = []
-            for try await line in bytes.lines {
+            var pending = Data()
+            // `bytes.lines` drops empty lines, and an empty line is what ends an event.
+            for try await byte in bytes {
+                guard byte == 0x0A else { pending.append(byte); continue }
+                if pending.last == 0x0D { pending.removeLast() }
+                let line = String(decoding: pending, as: UTF8.self)
+                pending.removeAll(keepingCapacity: true)
                 if Task.isCancelled { throw CancellationError() }
                 if line.hasPrefix("event:") {
                     event = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
@@ -396,8 +413,10 @@ actor ToshMCPService {
                 } else if line.isEmpty, !dataLines.isEmpty {
                     let data = dataLines.joined(separator: "\n")
                     dataLines.removeAll(keepingCapacity: true)
-                    if event == "endpoint", let endpoint = URL(string: data, relativeTo: url)?.absoluteURL,
-                       endpoint.host == url.host {
+                    if event == "endpoint" {
+                        guard let endpoint = MCPOrigin.endpoint(data, of: url) else {
+                            throw MCPError.remote("The MCP server announced an endpoint on another origin; nothing was sent there.")
+                        }
                         sessions[server.id]?.legacyEndpoint = endpoint
                         legacyReady.removeValue(forKey: server.id)?.resume(returning: endpoint)
                     } else if let bytes = data.data(using: .utf8),
@@ -437,7 +456,9 @@ actor ToshMCPService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         applyHeaders(session.server, to: &request)
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let redirects = MCPRedirectGuard(endpoint)
+        let (_, response) = try await URLSession.shared.data(for: request, delegate: redirects)
+        try redirects.check()
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else { throw MCPError.remote("HTTP \(status)") }
     }

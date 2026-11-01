@@ -27,25 +27,34 @@ struct VisionProjectorControl: View {
         let enabled = override != "" && (loadEnabled?.wrappedValue ?? true)
         let resolved = ServerSettings.mmprojPath(forModel: modelPath)
         let mismatch = resolved.map { ServerSettings.mmprojIncompatible(model: modelPath, projector: $0) } ?? false
-        let current = resolved.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent }
-            ?? loc.t("automático", "automatic")
+        let candidates = ServerSettings.compatibleProjectors(forModel: modelPath)
+        let current = resolved.map(Self.stem)
+            ?? (candidates.isEmpty ? loc.t("automático", "automatic") : loc.t("ninguno emparejado, elige uno", "none paired, pick one"))
         if layout == .settings {
-            settingsRows(enabled: enabled, current: current, mismatch: mismatch)
+            settingsRows(enabled: enabled, current: current, mismatch: mismatch, candidates: candidates)
         } else if layout == .detail {
-            detailRow(override: override, current: current, mismatch: mismatch)
+            detailRow(override: override, current: current, mismatch: mismatch, candidates: candidates)
         } else {
-            inlineRow(enabled: enabled, current: current, mismatch: mismatch)
+            inlineRow(enabled: enabled, current: current, mismatch: mismatch, candidates: candidates)
         }
     }
 
-    private func detailRow(override: String?, current: String, mismatch: Bool) -> some View {
-        let selected = override == "" ? "off" : (override == nil ? "auto" : "custom")
+    private static func stem(_ path: String) -> String {
+        URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+    }
+
+    private func detailRow(override: String?, current: String, mismatch: Bool, candidates: [String]) -> some View {
+        let selected = override == "" ? "off" : (override ?? "auto")
         var options: [ToshDropdown<String>.Option] = [
             .init(value: "auto", title: loc.t("Automático", "Automatic"), subtitle: current, systemImage: "wand.and.stars"),
             .init(value: "off", title: loc.t("Solo texto", "Text only"), subtitle: loc.t("No cargar proyector", "Do not load a projector"), systemImage: "eye.slash")
         ]
-        if let override, !override.isEmpty {
-            options.append(.init(value: "custom", title: loc.t("Proyector personalizado", "Custom projector"),
+        for path in candidates {
+            options.append(.init(value: path, title: Self.stem(path),
+                                 subtitle: loc.t("Compatible con la dimensión del modelo", "Matches the model's dimension"), systemImage: "eye"))
+        }
+        if let override, !override.isEmpty, !candidates.contains(override) {
+            options.append(.init(value: override, title: loc.t("Proyector personalizado", "Custom projector"),
                                  subtitle: URL(fileURLWithPath: override).lastPathComponent, systemImage: "doc"))
         }
         options.append(.init(value: "choose", title: loc.t("Elegir archivo…", "Choose file…"),
@@ -55,18 +64,21 @@ struct VisionProjectorControl: View {
             case "off": set("")
             case "auto": set(nil)
             case "choose": pick()
-            default: break
+            default: set(value)
             }
         }), options: options,
             placeholder: mismatch ? loc.t("Proyector incompatible", "Incompatible projector") : loc.t("Seleccionar visión", "Select vision"),
             width: 220, listWidth: 320)
     }
 
-    private func inlineRow(enabled: Bool, current: String, mismatch: Bool) -> some View {
+    private func inlineRow(enabled: Bool, current: String, mismatch: Bool, candidates: [String]) -> some View {
         HStack(spacing: 8) {
             if switchLeading { toggle(enabled) }
             if enabled {
                 Menu {
+                    ForEach(candidates, id: \.self) { path in
+                        Button(Self.stem(path)) { set(path) }
+                    }
                     Button(loc.t("Elegir archivo…", "Choose file…")) { pick() }
                     Button(loc.t("Automático", "Automatic")) { set(nil) }
                 } label: {
@@ -89,7 +101,7 @@ struct VisionProjectorControl: View {
         }
     }
 
-    private func settingsRows(enabled: Bool, current: String, mismatch: Bool) -> some View {
+    private func settingsRows(enabled: Bool, current: String, mismatch: Bool, candidates: [String]) -> some View {
         Group {
             Toggle(loc.t("Leer imágenes", "Read images"),
                    isOn: Binding(get: { enabled }, set: { set($0 ? nil : "") }))
@@ -99,6 +111,9 @@ struct VisionProjectorControl: View {
                 LabeledContent(loc.t("Proyector", "Projector")) {
                     Menu(current) {
                         Button(loc.t("Automático", "Automatic")) { set(nil) }
+                        ForEach(candidates, id: \.self) { path in
+                            Button(Self.stem(path)) { set(path) }
+                        }
                         Button(loc.t("Elegir archivo…", "Choose file…")) { pick() }
                     }
                     .fixedSize()

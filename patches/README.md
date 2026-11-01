@@ -3,7 +3,7 @@
 Patches against the pinned upstream commits, one directory per engine:
 
 ```
-llama/          llama.cpp, seven patches that rebuild the ported tree
+llama/          llama.cpp, one patch per feature in a folder per area
 shared-metal/   the Metal backend for whisper.cpp and stable-diffusion.cpp
 whisper/        whisper.cpp, outside the Metal backend
 image/          stable-diffusion.cpp, outside the Metal backend
@@ -15,26 +15,23 @@ moving a file.
 
 ## `llama/`
 
-`0001` to `0007` are the port to upstream `9575389609d6`, split by the files they touch. They are a
-baseline, not somewhere to add things: **a new change gets its own numbered patch after them**,
-one patch per change, so each one can be read, measured and reverted on its own.
+The port to upstream `d81235049` (v0.6.0), one patch per feature, in a folder per area:
 
-| | area |
+| folder | what lives there |
 |---|---|
-| `0001-metal-kernels` | `ggml/src/ggml-metal/kernels/` |
-| `0002-metal-backend-host` | the rest of `ggml/src/ggml-metal/` |
-| `0003-moe-cache` | `tosh-moe/`, turbo quant |
-| `0004-ggml-core` | `ggml/` outside the Metal backend |
-| `0005-llama-core` | `src/` |
-| `0006-common-and-spec` | `common/` |
-| `0007-tools-and-build` | `tools/`, `tests/`, top level CMake |
+| `metal/` | the AMD Metal backend: host side, reductions and quant loads, matvec and ToshGEMM for both lane widths, AMD flash and sparse attention, fusions, older GCN and macOS 12 |
+| `quant/` | turbo KV cache, Prism ternary types |
+| `mgpu/` | multi-GPU: tensor groups, events and subgraphs, allreduce, TP2 fused boundary |
+| `moe/` | expert prefetch, Dynamic MoE, its host cache and auto plan |
+| `core/` | CPU expert dot products, loader and scheduler, 8-bit recurrent state |
+| `model/` | DFlash, Flash-Next, rope and clip fixes |
+| `spec/` | MTP |
+| `server/` | chat templates and tool calls, MCP agent, reasoning budget, checkpoints, requests running together |
 
-Only touch one of the seven when the change belongs to the port itself. Together with everything
-numbered after them they reconstruct the built tree byte for byte, which is what the round-trip
-check below verifies.
-
-The seven replaced the old per-area folders (`llama/metal/`, `llama/core/`, `llama/model/`,
-`llama/server/`) at the port; the running numbering they used did not go away.
+The number is global across the folders. Patches overlap in files, so they only apply in order.
+**A new change gets its own numbered patch after the last one**, in the folder of its area, so it
+can be read, measured and reverted on its own. When a batch of those is closed, fold each into
+the feature patch it belongs to.
 
 ## `shared-metal/`
 
@@ -49,32 +46,26 @@ because its decode block does not match at wider context. The build script asser
 are expected to reject and stops instead of shipping a backend missing one. Do not remove that
 check.
 
-## Regenerating one
+## Changing one
 
-The vendor tree carries every patch at once, so `git diff` there is all of them. Because the
-`llama/` sets are disjoint by file, one patch is its own files diffed out of the live tree:
+The vendor tree carries every patch at once, so `git diff` there is all of them, and it may also
+carry experiments that are in no patch. Work in a worktree that has only the series:
 
 ```sh
-f=patches/llama/0002-metal-backend-host.patch
-files=(${(f)"$(grep '^diff --git' $f | sed 's|.* b/||')"})
-git -C vendor/llama.cpp diff -U8 -- $files > $f
+git -C vendor/llama.cpp worktree add -f /tmp/series --detach <LLAMA_COMMIT>
+# apply the patches before the one to change, commit, apply that one, edit, then
+git -C /tmp/series diff -U8 <base-commit> > patches/llama/<area>/<NNNN-name>.patch
 ```
 
 Three rules that have each cost real time:
 
-- **`-U8` for `llama/`.** Verified: at that width `0002`, `0004`, `0005` and `0006` regenerate
-  byte for byte, and anything narrower rewrites every hunk header in the file. `0001`, `0003`
-  and `0007` also add files, which `git diff` will not carry on its own. Never the `git diff`
-  default of three: with it a hunk lands in a different kernel and the build still exits 0.
-- **Check the tree is the one you think it is** before regenerating. If the files modified in
-  the vendor tree do not match the files the series touches, stop: an experiment was left
-  applied, or a patch was left reverted, and regenerating will overwrite it.
-  ```sh
-  diff <(cat patches/llama/000*.patch | grep '^diff --git' | sed 's|.* b/||' | sort -u) \
-       <(git -C vendor/llama.cpp status --short | awk '{print $2}' | sort -u)
-  ```
-- **Verify the round trip.** Add a worktree at the pinned commit, apply the whole series into
-  it, and diff it against the live tree. No source file may differ.
+- **`-U8` for `llama/`.** Anything narrower rewrites every hunk header in the file, and the
+  `git diff` default of three lets a hunk land in a different kernel while the build still
+  exits 0. Add new files with `git add -A` and take `git diff --cached`, or they are left out.
+- **Every later patch must still apply.** `scripts/check-patch-series.sh <LLAMA_COMMIT>` runs the
+  whole series in a throwaway worktree and reports each patch.
+- **Verify the round trip.** Apply the whole series into a worktree at the pinned commit, and
+  diff it against the tree you built and measured. No source file may differ.
 
 `scripts/build-engines.sh` resets the vendor tree and re-applies the patch files, so working
 tree edits are discarded: regenerate before building, never after.

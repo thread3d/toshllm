@@ -7,6 +7,28 @@ import CryptoKit
 import os
 import Security
 
+/// Defaults a product packaged from this tree sets differently (`TOSH_APP_DEFAULTS` in make-app.sh), registered
+/// at launch so that every `@AppStorage` falls back to them until the user changes the setting.
+enum ProductDefaults {
+    static func values(in bundle: Bundle = .main) -> [String: Any] {
+        bundle.url(forResource: "AppDefaults", withExtension: "plist")
+            .flatMap { NSDictionary(contentsOf: $0) as? [String: Any] } ?? [:]
+    }
+
+    static func register() {
+        let values = values()
+        if !values.isEmpty { UserDefaults.standard.register(defaults: values) }
+    }
+
+    static func double(_ key: String, or fallback: Double) -> Double {
+        (values()[key] as? NSNumber)?.doubleValue ?? fallback
+    }
+
+    static func bool(_ key: String, or fallback: Bool) -> Bool {
+        (values()[key] as? NSNumber)?.boolValue ?? fallback
+    }
+}
+
 // MARK: - Settings keys (single source of truth)
 
 /// Every persisted setting key lives here. Views, `ServerSettings.fromDefaults`
@@ -103,6 +125,14 @@ enum SettingsKeys {
     /// memory_list / memory_archive / memory_recall. Off for setups where an
     /// external memory server already covers the job and the model mixes the two.
     static let memoryToolsEnabled = "memoryToolsEnabled"
+    /// show_map: the model draws points, lines and areas on a map under its answer.
+    static let chatMapToolEnabled = "chatMapToolEnabled"
+    /// show_road_route: Apple Maps routes by road, each call approved by the user since it uses the internet.
+    static let chatRoadRouteEnabled = "chatRoadRouteEnabled"
+    /// The base map's MapLibre style URL; empty for OpenFreeMap.
+    static let mapStyle = "mapStyle"
+    /// A folder of PMTiles regions, with their fonts and sprites under assets/, drawn without internet.
+    static let mapFolder = "mapFolder"
 
     /// Models whose template accepts tools but that write the call in the wrong shape: the
     /// engine rejects it and the turn dies, so they stop being offered any tool.
@@ -114,6 +144,8 @@ enum SettingsKeys {
     static let mlock = "mlock"
     static let cacheRAM = "cacheRAM"
     static let parallelSlots = "parallelSlots"
+    /// With two or more slots, each one keeps its own share of the context instead of one shared pool.
+    static let separateKV = "separateKV"
     static let reasoningInline = "reasoningInline"
     /// Reasoning level for requests that do not choose one: "model", "off", "low", "medium", "high".
     static let serverDefaultReasoning = "serverDefaultReasoning"
@@ -264,9 +296,9 @@ enum SettingsKeys {
         audioVADProfile, audioVADThreshold, audioVADMinSpeechMS,
         audioVADMinSilenceMS, audioVADMaxSpeechSeconds, audioVADSpeechPadMS,
         extraArgs, embeddings, agentToolsEnabled, toolsRuntime, jsSandboxEnabled, sympyEnabled, scientificEnabled, mathAgentEnabled, mathToolsAllowed, toolResultLimit,
-        memoryToolsEnabled, toolsUnsupportedModels, mcpServers, uiMcpProxy,
+        memoryToolsEnabled, chatMapToolEnabled, chatRoadRouteEnabled, mapStyle, mapFolder, toolsUnsupportedModels, mcpServers, uiMcpProxy,
         cacheTypeK, cacheTypeV, mlock, cacheRAM,
-        parallelSlots, reasoningInline, serverDefaultReasoning, serverDefaultMaxTokens, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
+        parallelSlots, separateKV, reasoningInline, serverDefaultReasoning, serverDefaultMaxTokens, specMTP, mtpDisabledModels, faAmd, prefetchExperts, ubatch,
         dynamicMoeEnabled, dynamicMoeLeanRAM, routerMode, routerModelsMax,
         persistCache, multiGPU, multiGPUCount, splitMode, splitGroupSize, mgpuEvents, mgpuPeer,
         forcePrivateBuffers, cacheReuse, apiKeyEnabled, localNetworkDiscovery,
@@ -284,6 +316,15 @@ enum SettingsKeys {
         imagenAspect, imagenBaseSize, imagenSteps, imagenFormat, imagenOffloadCPU, imagenGPU,
     ]
 
+    /// The folder extensions are read from; empty means Application Support/<data folder>/Extensions.
+    static let extensionsFolder = "extensionsFolder"
+    /// A setting an extension declares, kept per extension.
+    static func extensionValue(_ id: String, _ key: String) -> String { "extension.\(id).value.\(key)" }
+    /// The extension.json digest the person approved, for an extension from the folder.
+    static func extensionApproval(_ id: String) -> String { "extension.\(id).approved" }
+    /// An extension inside the app that the person switched off.
+    static func extensionOff(_ id: String) -> String { "extension.\(id).off" }
+
     /// Clears every tunable option so they revert to defaults, keeping models intact.
     static func resetOptionsToDefaults() {
         let defaults = UserDefaults.standard
@@ -294,7 +335,7 @@ enum SettingsKeys {
 // MARK: - Logging
 
 enum AppLog {
-    private static let subsystem = "dev.engel.toshllm"
+    private static let subsystem = AppInfo.identifier
     static let server = Logger(subsystem: subsystem, category: "server")
     static let downloads = Logger(subsystem: subsystem, category: "downloads")
     static let speech = Logger(subsystem: subsystem, category: "speech")
@@ -306,7 +347,7 @@ enum AppLog {
 enum AppSupport {
     static var directory: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ToshLLM")
+            .appendingPathComponent(AppInfo.dataFolder)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -492,6 +533,7 @@ enum ShellWords {
 /// binaries) instead of pattern-killing by path.
 enum EngineLock {
     private static var url: URL { AppSupport.directory.appendingPathComponent("engine.pid") }
+    private static let engineMarker = AppInfo.name + ".app/Contents/Resources/bin"
 
     private static func read() -> [Int32] {
         (try? String(contentsOf: url, encoding: .utf8))?
@@ -531,8 +573,8 @@ enum EngineLock {
             guard length > 0 else { continue }
             let path = String(cString: buffer)
 
-            // Only processes from a ToshLLM bundle are ours to kill.
-            guard path.contains("ToshLLM.app/Contents/Resources/bin") else { continue }
+            // Only processes from our own bundle are ours to kill.
+            guard path.contains(engineMarker) else { continue }
 
             AppLog.app.warning("Reaping orphaned engine pid \(pid) at \(path)")
             kill(pid, SIGTERM)
@@ -560,7 +602,7 @@ enum EngineLock {
             var buffer = [CChar](repeating: 0, count: 4096)
             guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { continue }
             let path = String(cString: buffer)
-            guard path.contains("ToshLLM.app/Contents/Resources/bin"), path.hasSuffix("/llama-server") else { continue }
+            guard path.contains(engineMarker), path.hasSuffix("/llama-server") else { continue }
             AppLog.app.warning("Reaping stray engine pid \(pid) at \(path)")
             kill(pid, SIGTERM)
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
@@ -583,12 +625,16 @@ enum FileHash {
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
+
+    static func sha256(of data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 // MARK: - Keychain (API key storage)
 
 enum Keychain {
-    private static let service = "dev.engel.toshllm"
+    private static let service = AppInfo.identifier
 
     static func get(_ account: String) -> String? {
         let query: [String: Any] = [

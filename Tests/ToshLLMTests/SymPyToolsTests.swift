@@ -85,6 +85,99 @@ final class SymPyToolsTests: XCTestCase {
         XCTAssertEqual(SymPyToolsService.serverArguments(enabled: false, agent: true, resources: resources), [])
     }
 
+    private func sharedServer(_ name: String, approved: Bool = true, transport: MCPTransport = .stdio) -> MCPServer {
+        var server = MCPServer(name: name, url: "")
+        server.transport = transport
+        server.command = "/usr/local/bin/gis-mcp"
+        server.arguments = ["--layer", "city parks"]
+        server.environment = ["TOKEN": "abc"]
+        server.timeoutSeconds = 30
+        server.engineAccess = approved
+        return server
+    }
+
+    private func mcpServers(_ arguments: [String]) throws -> [String: Any] {
+        guard let json = arguments.dropFirst().first else { return [:] }
+        let config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        return try XCTUnwrap(config["mcpServers"] as? [String: Any])
+    }
+
+    func testApprovedServersReachTheEngineAndTheAgent() throws {
+        let resources = try makeRuntime()
+        let shared = [sharedServer("City GIS"), sharedServer("not approved", approved: false),
+                      sharedServer("remote", transport: .streamableHTTP), sharedServer("SymPy"), sharedServer("city gis")]
+        let servers = try mcpServers(SymPyToolsService.serverArguments(enabled: true, resources: resources, shared: shared))
+        XCTAssertEqual(Set(servers.keys), ["sympy", "agent", "city-gis"])
+        let gis = try XCTUnwrap(servers["city-gis"] as? [String: Any])
+        XCTAssertEqual(gis["command"] as? String, "/usr/local/bin/gis-mcp")
+        XCTAssertEqual(gis["args"] as? [String], ["--layer", "city parks"])
+        XCTAssertEqual(gis["env"] as? [String: String], ["TOKEN": "abc"])
+        XCTAssertEqual(gis["timeout_ms"] as? Int, 30_000)
+        let agentEnv = (servers["agent"] as? [String: Any])?["env"] as? [String: String]
+        XCTAssertEqual(agentEnv?["TOSH_AGENT_SERVERS"], "city-gis")
+
+        // only the agent may list and run them
+        let arguments = SymPyToolsService.serverArguments(enabled: true, resources: resources, shared: shared)
+        XCTAssertEqual(Array(arguments.suffix(2)), ["--mcp-agent-only", "city-gis"])
+
+        // the agent runs for them even with the math tools off; without its runtime they stay out
+        let alone = SymPyToolsService.serverArguments(enabled: false, resources: resources, shared: shared)
+        XCTAssertEqual(Set(try mcpServers(alone).keys), ["agent", "city-gis"])
+        XCTAssertEqual(SymPyToolsService.serverArguments(enabled: false, resources: nil, shared: shared), [])
+        XCTAssertEqual(SymPyToolsService.serverArguments(enabled: true, resources: nil, shared: shared), [])
+        XCTAssertFalse(SymPyToolsService.serverArguments(enabled: true, resources: resources)
+            .contains("--mcp-agent-only"))
+    }
+
+    func testAnApprovedRemoteServerReachesTheEngineThroughTheRelay() throws {
+        let resources = try makeRuntime()
+        var remote = MCPServer(name: "Cloud GIS", url: "https://mcp.example/mcp")
+        remote.transport = .serverSentEvents
+        remote.timeoutSeconds = 45
+        remote.engineAccess = true
+        var socket = MCPServer(name: "socket", url: "wss://mcp.example/ws")
+        socket.transport = .webSocket
+        socket.engineAccess = true
+        XCTAssertFalse(socket.sharedWithEngine, "the relay speaks http(s), not WebSocket")
+
+        let servers = try mcpServers(SymPyToolsService.serverArguments(enabled: false, resources: resources,
+                                                                       shared: [remote, socket]))
+        XCTAssertEqual(Set(servers.keys), ["agent", "cloud-gis"])
+        let entry = try XCTUnwrap(servers["cloud-gis"] as? [String: Any])
+        let runtime = resources.appendingPathComponent("tosh-sympy")
+        XCTAssertEqual(entry["command"] as? String, runtime.appendingPathComponent("python/bin/python3").path)
+        XCTAssertEqual(entry["args"] as? [String], ["-I", "-B", runtime.appendingPathComponent("tosh_sympy/remote.py").path,
+                                                    "--url", "https://mcp.example/mcp", "--timeout", "45",
+                                                    "--transport", "sse"])
+        XCTAssertEqual(SymPyToolsService.headersVariable(remote), "TOSH_MCP_HEADERS_CLOUD_GIS")
+    }
+
+    func testTogglingApprovalAddsAndRemovesTheServer() throws {
+        let resources = try makeRuntime()
+        var server = sharedServer("City GIS", approved: false)
+        XCTAssertFalse(try mcpServers(SymPyToolsService.serverArguments(enabled: true, resources: resources,
+                                                                        shared: [server])).keys.contains("city-gis"))
+        server.engineAccess = true
+        XCTAssertTrue(try mcpServers(SymPyToolsService.serverArguments(enabled: true, resources: resources,
+                                                                       shared: [server])).keys.contains("city-gis"))
+        server.enabled = false
+        XCTAssertFalse(try mcpServers(SymPyToolsService.serverArguments(enabled: true, resources: resources,
+                                                                        shared: [server])).keys.contains("city-gis"))
+        server.enabled = true
+        server.command = "  "
+        XCTAssertFalse(try mcpServers(SymPyToolsService.serverArguments(enabled: true, resources: resources,
+                                                                        shared: [server])).keys.contains("city-gis"))
+        XCTAssertTrue(MCPServer(name: "new", url: "").engineAccess == nil)
+    }
+
+    func testEngineAccessIsOffForServersSavedBefore() throws {
+        let saved = #"[{"id":"\#(UUID().uuidString)","name":"Old","url":"","enabled":true,"transport":"stdio","timeoutSeconds":60,"command":"x","arguments":[],"environment":{},"workingDirectory":""}]"#
+        let servers = try JSONDecoder().decode([MCPServer].self, from: Data(saved.utf8))
+        XCTAssertNil(servers[0].engineAccess)
+        XCTAssertFalse(servers[0].sharedWithEngine)
+        XCTAssertEqual(sharedServer("  Ñu  Server!! ").engineName, "u--server")
+    }
+
     func testRoutingRuleIsSentOnlyWithBothToolSets() {
         let rule = ScientificToolsService.routingRule
         XCTAssertEqual(ScientificToolsService.system("", sympy: true, scientific: true), rule)
@@ -220,6 +313,15 @@ final class SymPyToolsTests: XCTestCase {
             }
         }
         XCTAssertEqual(shape, ["user", "tools 4", "assistant", "tool", "user"])
+    }
+
+    func testAMessageThatEndsInToolCallsChangesRowIdentity() {
+        var message = ChatMessage(role: "assistant", content: "")
+        let streaming = TranscriptRow.rows([message]).map(\.id)
+        message.toolCalls = [call("c1", result: integral)]
+        let round = TranscriptRow.rows([message]).map(\.id)
+        XCTAssertEqual(streaming, [.message(message.id)])
+        XCTAssertEqual(round, [.tools(message.id)])
     }
 
     private let refused = #"{"success": false, "operation": "limit", "error": {"code": "transcription_mismatch", "message": "Not computed."}}"#

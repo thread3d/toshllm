@@ -17,8 +17,8 @@ _COMMON = ("max_values", "parameters")
 
 TOOLS = {
     "compute": {
-        "description": "Numerical (floating point) calculus: definite integral, root of an equation, "
-                       "interpolation or spline through data points, evaluation.",
+        "description": "Numerical calculus, when no exact form exists or a decimal is asked: definite integral, "
+                       "root, interpolation or spline through data, evaluation.",
         "operations": ["integrate", "root", "interpolate", "evaluate"],
         "properties": {
             "expression": {**_TEXT, "description": "Function, sin(x**2), or for root the whole equation, "

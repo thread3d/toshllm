@@ -871,11 +871,19 @@ private struct DetailPanel<Content: View>: View {
     let icon: String
     var fill = false
     @ViewBuilder let content: Content
+    @Environment(\.isEnabled) private var isEnabled
+    @EnvironmentObject private var loc: Localizer
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: icon).font(.system(size: 16, weight: .semibold))
             Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            // a panel is only locked while its server runs: say so, or its controls look broken
+            if !isEnabled {
+                Label(loc.t("Detén el servidor para cambiar esto: se aplica al arrancar.",
+                            "Stop the server to change these: they apply when it starts."), systemImage: "lock")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             Divider()
             content
         }.padding(16).frame(maxWidth: .infinity, maxHeight: fill ? .infinity : nil, alignment: .topLeading).cardSurface()
@@ -906,12 +914,15 @@ private struct CompactIntegerStepper: View {
     @Binding var value: Int
     let range: ClosedRange<Int>
 
+    @Environment(\.isEnabled) private var isEnabled
+
     var body: some View {
         HStack(spacing: 0) {
             stepButton("minus", enabled: value > range.lowerBound) { value -= 1 }
             Text("\(value)")
                 .font(.system(size: 13, weight: .semibold, design: .rounded))
                 .monospacedDigit()
+                .foregroundStyle(isEnabled ? Color.primary : Color.secondary)
                 .frame(width: 42)
             stepButton("plus", enabled: value < range.upperBound) { value += 1 }
         }
@@ -922,9 +933,11 @@ private struct CompactIntegerStepper: View {
 
     private func stepButton(_ image: String, enabled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
+            // a plain button only takes clicks on the glyph's own pixels: the whole square must take them
             Image(systemName: image).font(.system(size: 10, weight: .bold)).frame(width: 30, height: 30)
+                .contentShape(Rectangle())
         }
-        .buttonStyle(.plain).foregroundStyle(enabled ? Color.primary : Color.secondary.opacity(0.35))
+        .buttonStyle(.plain).foregroundStyle(enabled && isEnabled ? Color.primary : Color.secondary.opacity(0.35))
         .disabled(!enabled)
     }
 }

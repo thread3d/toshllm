@@ -34,7 +34,8 @@ else:
 VERSION = "1.1.0"
 PROTOCOL = "2024-11-05"
 # numeric data is typed out in the request, so the scientific tools take a larger one
-MAX_REQUEST_BYTES = (1024 if TOOLSET in ("scientific", "agent") else 64) * 1024
+# an agent turn carries the user's attached images
+MAX_REQUEST_BYTES = (64 * 1024 if TOOLSET == "agent" else 1024 if TOOLSET == "scientific" else 64) * 1024
 MAX_REPLY_BYTES = 96 * 1024
 STARTUP_SECONDS = 30
 
@@ -272,7 +273,12 @@ def _handle(message, worker):
                                                    "message": json.dumps(event)})
 
         def work():
-            reply = agent.run(params.get("arguments") or {}, emit, lambda engine: _TURNS.__setitem__(message_id, engine))
+            try:
+                reply = agent.run(params.get("arguments") or {}, emit,
+                                  lambda engine: _TURNS.__setitem__(message_id, engine))
+            except Exception as error:  # a turn that fails still answers, or the engine waits out its timeout
+                reply = {"status": 502, "error": {"message": f"the agent failed: {type(error).__name__}",
+                                                  "type": "agent_error"}}
             _TURNS.pop(message_id, None)
             _respond(message_id, {"content": [{"type": "text", "text": json.dumps(reply)}], "isError": False})
         threading.Thread(target=work, daemon=True).start()

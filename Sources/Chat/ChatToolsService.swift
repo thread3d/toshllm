@@ -70,6 +70,25 @@ struct ToolExecutionResult: Sendable, Equatable {
 
 /// Tool output goes back into the prompt verbatim, so one directory listing or web page can
 /// fill the context. The head and the tail are kept because errors usually land at the end.
+/// A tool's result that says the operation was only taken in, by a status field of its own: a job queued or
+/// accepted is not one done, and the model must not say it was.
+enum ToolResultStatus {
+    static let pending: Set<String> = ["accepted", "pending", "queued", "submitted", "scheduled", "in_progress",
+                                       "in-progress", "inprogress", "running", "processing", "started", "waiting"]
+    static let note = "[The service accepted this operation but has not said it finished: do not say it was done; say it was accepted and is pending.]\n"
+
+    static func acceptedOnly(_ text: String) -> Bool {
+        guard let data = text.data(using: .utf8),
+              let reply = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let parts = [reply] + ["result", "data", "job", "operation"].compactMap { reply[$0] as? [String: Any] }
+        return parts.contains { part in
+            ["status", "state", "jobStatus", "job_status", "operationStatus"].contains { key in
+                (part[key] as? String).map { pending.contains($0.trimmingCharacters(in: .whitespaces).lowercased()) } ?? false
+            }
+        }
+    }
+}
+
 enum ToolResultLimit {
     static let defaultCharacters = 20_000
 
@@ -86,6 +105,9 @@ enum ToolResultLimit {
             + "\n\n[… \(total - limit) of \(total) characters omitted …]\n\n"
             + String(text.suffix(tail))
     }
+
+    /// An older result as it goes once the context is nearly full: a few lines of each end.
+    nonisolated static func shortened(_ text: String) -> String { apply(text, limit: 2000) }
 }
 
 enum ChatToolsError: LocalizedError {
@@ -113,6 +135,8 @@ enum ChatToolsService {
     /// which runs math turns, cannot ask.
     static func isAlwaysAllowed(_ name: String, bundled: Bool = true) -> Bool {
         if UserDefaults.standard.bool(forKey: permissionKey(name)) { return true }
+        // drawing on the chat's own map reads and writes nothing
+        if bundled && name == ChatMapTool.toolName { return true }
         return bundled && mathToolsAllowed && MathTranscriptionService.isMathTool(name)
     }
 
@@ -147,12 +171,15 @@ enum ChatToolsService {
         let agent = UserDefaults.standard.bool(forKey: SettingsKeys.agentToolsEnabled)
         let sympy = SymPyToolsService.isEnabled
         let scientific = ScientificToolsService.isEnabled
-        guard agent || sympy || scientific else { return [] }
+        let extensions = EngineExtensions.chatToolPrefixes()
+        guard agent || sympy || scientific || !extensions.isEmpty else { return [] }
         // a server started before a math switch was turned on has no /tools: not worth failing the chat
         let tools = agent ? try await list(port: port) : ((try? await list(port: port)) ?? [])
         return tools.filter {
             if SymPyToolsService.isTool($0.name) { return sympy }
             if ScientificToolsService.isTool($0.name) { return scientific }
+            let name = $0.name
+            if extensions.contains(where: { name.hasPrefix($0) }) { return true }
             return agent
         }
     }
@@ -196,14 +223,14 @@ enum ChatToolsService {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(status) else {
             var detail = ""
-            for try await line in bytes.lines {
+            for try await line in bytes.streamLines {
                 detail += line
                 if detail.count > 1_000 { break }
             }
             throw ChatToolsError.server(status: status, message: detail)
         }
         var output = ""
-        for try await line in bytes.lines {
+        for try await line in bytes.streamLines {
             try Task.checkCancellation()
             guard line.hasPrefix("data: "),
                   let data = String(line.dropFirst(6)).data(using: .utf8),

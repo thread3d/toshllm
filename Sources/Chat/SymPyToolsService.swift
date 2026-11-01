@@ -37,11 +37,19 @@ enum SymPyToolsService {
     /// agent, which the chat asks for by header; with `agent` it also answers API clients that
     /// do not ask, which otherwise get the model as it is.
     static func serverArguments(enabled: Bool, scientific: Bool = false, agent: Bool = false,
-                                resources: URL? = Bundle.main.resourceURL) -> [String] {
-        guard enabled || scientific, let runtime = runtimeDirectory(resources: resources) else { return [] }
+                                resources: URL? = Bundle.main.resourceURL, shared: [MCPServer] = [],
+                                extensions: [EngineExtensions.Extension] = []) -> [String] {
+        // approved servers exist only for the agent, so they need its runtime too
+        var servers = engineServers(shared, runtime: runtimeDirectory(resources: resources))
+        let approved = servers.keys.sorted()
+        guard enabled || scientific || !approved.isEmpty || !extensions.isEmpty,
+              let runtime = runtimeDirectory(resources: resources)
+        else { return [] }
         let python = runtime.appendingPathComponent("python/bin/python3").path
         let helper = runtime.appendingPathComponent("tosh_sympy/server.py").path
-        var servers: [String: Any] = [:]
+        let bundled = EngineExtensions.engineEntries(extensions, runtime: runtime, trustKey: trustKey)
+        let enabled = enabled || bundled.mathTools
+        let scientific = scientific || bundled.mathTools
         if enabled {
             servers[serverName] = ["command": python, "args": ["-I", "-B", helper], "timeout_ms": 30_000,
                                    "env": ["TOSH_TRUST_KEY": trustKey]]
@@ -54,11 +62,80 @@ enum SymPyToolsService {
         }
         // a turn can take minutes: it runs every round and tool call of the answer
         servers[agentName] = ["command": python, "args": ["-I", "-B", helper, agentName],
-                              "timeout_ms": 900_000, "env": ["TOSH_TRUST_KEY": trustKey]]
+                              "timeout_ms": 900_000,
+                              "env": ["TOSH_TRUST_KEY": trustKey,
+                                      "TOSH_AGENT_SERVERS": (approved + bundled.servers.keys.sorted()).joined(separator: ",")]]
+        servers.merge(bundled.servers) { current, _ in current }
+        if let replacement = bundled.agent { servers[agentName] = replacement }
+        let agentOnly = approved + bundled.agentOnly
+        let arguments = mcpServersArguments(servers)
+        guard !arguments.isEmpty else { return [] }
+        return arguments + ["--mcp-agent", agentName] + (agent ? [] : ["--mcp-agent-explicit"])
+            + (agentOnly.isEmpty ? [] : ["--mcp-agent-only", agentOnly.joined(separator: ",")])
+            + (bundled.clientTools ? ["--mcp-agent-client-tools"] : [])
+    }
+
+    /// The MCP servers an administrator approved for the engine, by the name the engine gives them.
+    /// A name the engine's own servers use, or one already taken, is left out, and so is a remote
+    /// server when there is no runtime to run its relay.
+    static func engineServers(_ shared: [MCPServer], runtime: URL? = nil) -> [String: Any] {
+        let reserved: Set = [serverName, ScientificToolsService.serverName, agentName]
+        var servers: [String: Any] = [:]
+        for server in shared where server.sharedWithEngine {
+            let name = server.engineName
+            guard !reserved.contains(name), servers[name] == nil else { continue }
+            if !server.transport.isLocal {
+                if let runtime { servers[name] = remoteEntry(server, runtime: runtime) }
+                continue
+            }
+            var entry: [String: Any] = ["command": server.command, "args": server.arguments,
+                                        "env": server.environment, "timeout_ms": server.timeoutSeconds * 1000]
+            if !server.workingDirectory.isEmpty { entry["cwd"] = server.workingDirectory }
+            servers[name] = entry
+        }
+        return servers
+    }
+
+    /// The bundled relay, run as a local server that forwards to the remote one.
+    static func relayEntry(runtime: URL, url: String, transport: String?, timeoutSeconds: Int,
+                           headerArguments: [String]) -> [String: Any] {
+        let python = runtime.appendingPathComponent("python/bin/python3").path
+        let relay = runtime.appendingPathComponent("tosh_sympy/remote.py").path
+        var args = ["-I", "-B", relay, "--url", url, "--timeout", String(timeoutSeconds)]
+        if let transport { args += ["--transport", transport] }
+        return ["command": python, "args": args + headerArguments, "timeout_ms": timeoutSeconds * 1000]
+    }
+
+    private static func remoteEntry(_ server: MCPServer, runtime: URL) -> [String: Any] {
+        let transport: String? = server.transport == .streamableHTTP ? "http"
+            : server.transport == .serverSentEvents ? "sse" : nil
+        let headers = (Keychain.get(server.credentialAccount) ?? "").isEmpty ? []
+            : ["--headers-env", headersVariable(server)]
+        return relayEntry(runtime: runtime, url: server.url, transport: transport,
+                          timeoutSeconds: server.timeoutSeconds, headerArguments: headers)
+    }
+
+    /// The relay reads a server's headers from this variable of the engine's environment, so a token
+    /// never shows on a command line.
+    static func headersVariable(_ server: MCPServer) -> String {
+        "TOSH_MCP_HEADERS_" + server.engineName.uppercased().replacingOccurrences(of: "-", with: "_")
+    }
+
+    /// The headers of every approved remote server, for the engine's environment.
+    static func engineEnvironment(_ shared: [MCPServer]) -> [String: String] {
+        var env: [String: String] = [:]
+        for server in shared where server.sharedWithEngine && !server.transport.isLocal {
+            if let headers = Keychain.get(server.credentialAccount), !headers.isEmpty {
+                env[headersVariable(server)] = headers
+            }
+        }
+        return env
+    }
+
+    private static func mcpServersArguments(_ servers: [String: Any]) -> [String] {
         guard let data = try? JSONSerialization.data(withJSONObject: ["mcpServers": servers],
                                                      options: [.sortedKeys]) else { return [] }
-        return ["--mcp-servers-json", String(decoding: data, as: UTF8.self), "--mcp-agent", agentName]
-            + (agent ? [] : ["--mcp-agent-explicit"])
+        return ["--mcp-servers-json", String(decoding: data, as: UTF8.self)]
     }
 
     /// What the call was asked to work on, for the tool card.

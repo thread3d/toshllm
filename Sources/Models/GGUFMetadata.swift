@@ -83,6 +83,17 @@ struct GGUFTensorFlags: Sendable {
     let otherBytesPerLayer: UInt64
 }
 
+/// How a model's bytes split for the memory estimate, from the tensor offsets of every file.
+struct GGUFWeightSplit: Sendable, Equatable {
+    /// The routed expert banks: what Dynamic MoE spreads over VRAM, RAM and the CPU.
+    var expertBytes: UInt64 = 0
+    /// Tables the engine reads from the file on demand, so neither RAM nor VRAM holds them whole.
+    var lazyBytes: UInt64 = 0
+
+    static func + (a: GGUFWeightSplit, b: GGUFWeightSplit) -> GGUFWeightSplit {
+        GGUFWeightSplit(expertBytes: a.expertBytes &+ b.expertBytes, lazyBytes: a.lazyBytes &+ b.lazyBytes)
+    }
+}
 
 /// Average bytes one element takes, by GGUF type id. Unknown types fall back to a
 /// four-bit quant, the most common case in the catalogue.
@@ -123,6 +134,7 @@ enum GGUFMetadataCache {
     nonisolated(unsafe) private static var metadataEntries: [FileKey: MetadataEntry] = [:]
     nonisolated(unsafe) private static var tensorEntries: [FileKey: GGUFTensorFlags] = [:]
     nonisolated(unsafe) private static var nextNEntries: [FileKey: Bool] = [:]
+    nonisolated(unsafe) private static var splitEntries: [FileKey: GGUFWeightSplit?] = [:]
 
     static func metadata(at path: String) -> GGUFMetadata? {
         guard let key = fileKey(for: path) else { return nil }
@@ -185,6 +197,80 @@ enum GGUFMetadataCache {
         return found
     }
 
+    /// The split across every part of a local model, or nil when a part's header cannot be read.
+    static func weightSplit(at path: String) -> GGUFWeightSplit? {
+        guard let key = fileKey(for: path) else { return nil }
+        lock.lock()
+        if let cached = splitEntries[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let siblings = splitSiblings(of: key.path)
+        var total: GGUFWeightSplit? = GGUFWeightSplit()
+        for part in siblings.count > 1 ? siblings : [key.path] {
+            guard let size = fileKey(for: part)?.size,
+                  let data = readPrefix(at: part, limit: 32 * 1024 * 1024),
+                  let split = weightSplit(from: data, fileSize: size) else { total = nil; break }
+            total = total.map { $0 + split }
+        }
+
+        lock.lock()
+        removeStaleEntries(for: key.path, keeping: key)
+        splitEntries[key] = total
+        lock.unlock()
+        return total
+    }
+
+    /// One file's share, or nil when `data` ends before the tensor table does. The sizes come from
+    /// the offsets, so a type this app does not know is still counted exactly.
+    static func weightSplit(from data: Data, fileSize: UInt64) -> GGUFWeightSplit? {
+        var cursor = GGUFDataCursor(data: data)
+        guard cursor.readBytes(count: 4) == Data([0x47, 0x47, 0x55, 0x46]),
+              let version = cursor.readUInt32(), version >= 2,
+              let tensorCount = cursor.readUInt64(), tensorCount <= 10_000_000,
+              let metadataCount = cursor.readUInt64(), metadataCount <= 1_000_000 else { return nil }
+
+        var alignment: UInt64 = 32
+        for _ in 0..<metadataCount {
+            guard let key = cursor.readString(maxLength: 1 << 20),
+                  let valueType = cursor.readUInt32() else { return nil }
+            if key == "general.alignment", valueType == 4 {
+                guard let value = cursor.readUInt32(), value > 0 else { return nil }
+                alignment = UInt64(value)
+            } else {
+                guard cursor.skipValue(type: valueType) else { return nil }
+            }
+        }
+
+        var tensors: [(name: String, offset: UInt64)] = []
+        tensors.reserveCapacity(Int(tensorCount))
+        for _ in 0..<tensorCount {
+            guard let name = cursor.readString(maxLength: 1 << 20),
+                  let dimensions = cursor.readUInt32(), dimensions <= 8,
+                  cursor.skip(count: Int(dimensions) * 8),
+                  cursor.readUInt32() != nil,
+                  let offset = cursor.readUInt64() else { return nil }
+            tensors.append((name, offset))
+        }
+        let dataStart = (UInt64(cursor.offset) + alignment - 1) / alignment * alignment
+        guard fileSize >= dataStart else { return nil }
+        let dataBytes = fileSize - dataStart
+
+        tensors.sort { $0.offset < $1.offset }
+        var split = GGUFWeightSplit()
+        for (i, tensor) in tensors.enumerated() {
+            let end = i + 1 < tensors.count ? tensors[i + 1].offset : dataBytes
+            guard end >= tensor.offset else { return nil }
+            let bytes = end - tensor.offset
+            if tensor.name.contains("_exps.") { split.expertBytes &+= bytes }
+            // the engine's rule (TENSOR_READ_LAZY, auto mode): the per-layer token table past 4 GiB
+            if tensor.name == "per_layer_token_embd.weight", bytes > 4 << 30 { split.lazyBytes &+= bytes }
+        }
+        return split
+    }
+
     private static func fileKey(for path: String) -> FileKey? {
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: standardized),
@@ -197,6 +283,7 @@ enum GGUFMetadataCache {
         metadataEntries = metadataEntries.filter { $0.key.path != path || $0.key == key }
         tensorEntries = tensorEntries.filter { $0.key.path != path || $0.key == key }
         nextNEntries = nextNEntries.filter { $0.key.path != path || $0.key == key }
+        splitEntries = splitEntries.filter { $0.key.path != path || $0.key == key }
     }
 
     private static func readPrefix(at path: String, limit: Int) -> Data? {

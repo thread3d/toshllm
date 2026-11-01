@@ -1,0 +1,3483 @@
+diff --git a/tools/ui/package-lock.json b/tools/ui/package-lock.json
+index 86d599e67..b06ab0a86 100644
+--- a/tools/ui/package-lock.json
++++ b/tools/ui/package-lock.json
+@@ -10,16 +10,17 @@
+ 			"devDependencies": {
+ 				"@chromatic-com/storybook": "5.2.1",
+ 				"@eslint/compat": "1.4.1",
+ 				"@eslint/js": "9.39.2",
+ 				"@internationalized/date": "3.12.2",
+ 				"@lucide/svelte": "1.25.0",
+ 				"@modelcontextprotocol/sdk": "1.30.0",
+ 				"@playwright/test": "1.56.1",
++				"@protomaps/basemaps": "5.7.2",
+ 				"@storybook/addon-a11y": "10.5.6",
+ 				"@storybook/addon-docs": "10.5.6",
+ 				"@storybook/addon-mcp": "0.7.0",
+ 				"@storybook/addon-svelte-csf": "5.1.2",
+ 				"@storybook/addon-vitest": "10.5.6",
+ 				"@storybook/sveltekit": "10.5.6",
+ 				"@sveltejs/adapter-static": "3.0.10",
+ 				"@sveltejs/kit": "2.70.2",
+@@ -42,22 +43,24 @@
+ 				"eslint-plugin-perfectionist": "^5.10.1",
+ 				"eslint-plugin-simple-import-sort": "^14.0.0",
+ 				"eslint-plugin-storybook": "10.5.6",
+ 				"eslint-plugin-svelte": "3.19.0",
+ 				"fflate": "0.8.3",
+ 				"globals": "16.5.0",
+ 				"highlight.js": "11.11.1",
+ 				"http-server": "14.1.1",
++				"maplibre-gl": "6.11.2",
+ 				"mdast": "3.0.0",
+ 				"mdsvex": "0.12.7",
+ 				"mermaid": "11.15.0",
+ 				"mode-watcher": "1.1.0",
+ 				"pdfjs-dist": "5.4.54",
+ 				"playwright": "1.56.1",
++				"pmtiles": "4.5.0",
+ 				"prettier": "3.8.3",
+ 				"prettier-plugin-svelte": "4.1.0",
+ 				"prettier-plugin-tailwindcss": "0.8.0",
+ 				"rehype-highlight": "7.0.2",
+ 				"rehype-katex": "7.0.1",
+ 				"rehype-stringify": "10.0.1",
+ 				"remark": "15.0.1",
+ 				"remark-breaks": "4.0.0",
+@@ -164,16 +167,17 @@
+ 			}
+ 		},
+ 		"node_modules/@babel/core": {
+ 			"version": "7.29.7",
+ 			"resolved": "https://registry.npmjs.org/@babel/core/-/core-7.29.7.tgz",
+ 			"integrity": "sha512-RgHBCvtjbOK2gXSNBNIkNoEc9qoVEtau3hj8gEqKQuL3HZAibKarWFEI3Lfm6EYKkLalOh8eSrj9b+ch9H/VBA==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@babel/code-frame": "^7.29.7",
+ 				"@babel/generator": "^7.29.7",
+ 				"@babel/helper-compilation-targets": "^7.29.7",
+ 				"@babel/helper-module-transforms": "^7.29.7",
+ 				"@babel/helpers": "^7.29.7",
+ 				"@babel/parser": "^7.29.7",
+ 				"@babel/template": "^7.29.7",
+@@ -1794,31 +1798,42 @@
+ 				"node": ">=20.0.0",
+ 				"yarn": ">=1.22.18"
+ 			},
+ 			"peerDependencies": {
+ 				"storybook": "^0.0.0-0 || ^10.1.0 || ^10.1.0-0 || ^10.2.0-0 || ^10.3.0-0 || ^10.4.0-0 || ^10.5.0-0 || ^10.6.0-0"
+ 			}
+ 		},
+ 		"node_modules/@emnapi/core": {
+-			"version": "1.9.2",
+-			"resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.9.2.tgz",
+-			"integrity": "sha512-UC+ZhH3XtczQYfOlu3lNEkdW/p4dsJ1r/bP7H8+rhao3TTTMO1ATq/4DdIi23XuGoFY+Cz0JmCbdVl0hz9jZcA==",
++			"version": "1.11.3",
++			"resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.11.3.tgz",
++			"integrity": "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg==",
++			"dev": true,
++			"license": "MIT",
++			"optional": true,
++			"dependencies": {
++				"@emnapi/wasi-threads": "1.2.3",
++				"tslib": "^2.4.0"
++			}
++		},
++		"node_modules/@emnapi/core/node_modules/@emnapi/wasi-threads": {
++			"version": "1.2.3",
++			"resolved": "https://registry.npmjs.org/@emnapi/wasi-threads/-/wasi-threads-1.2.3.tgz",
++			"integrity": "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"optional": true,
+ 			"dependencies": {
+-				"@emnapi/wasi-threads": "1.2.1",
+ 				"tslib": "^2.4.0"
+ 			}
+ 		},
+ 		"node_modules/@emnapi/runtime": {
+-			"version": "1.10.0",
+-			"resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.10.0.tgz",
+-			"integrity": "sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA==",
++			"version": "1.11.3",
++			"resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.3.tgz",
++			"integrity": "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"optional": true,
+ 			"dependencies": {
+ 				"tslib": "^2.4.0"
+ 			}
+ 		},
+ 		"node_modules/@emnapi/wasi-threads": {
+@@ -3044,27 +3059,16 @@
+ 			},
+ 			"engines": {
+ 				"node": ">=20.9.0"
+ 			},
+ 			"funding": {
+ 				"url": "https://opencollective.com/libvips"
+ 			}
+ 		},
+-		"node_modules/@img/sharp-wasm32/node_modules/@emnapi/runtime": {
+-			"version": "1.11.3",
+-			"resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.3.tgz",
+-			"integrity": "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==",
+-			"dev": true,
+-			"license": "MIT",
+-			"optional": true,
+-			"dependencies": {
+-				"tslib": "^2.4.0"
+-			}
+-		},
+ 		"node_modules/@img/sharp-webcontainers-wasm32": {
+ 			"version": "0.35.3",
+ 			"resolved": "https://registry.npmjs.org/@img/sharp-webcontainers-wasm32/-/sharp-webcontainers-wasm32-0.35.3.tgz",
+ 			"integrity": "sha512-2rnq7bX3NzeR2T4YWgz8qiG4h3TSdMe+vN1iQXpJleSJ3SM5zQ8Fy2SyyXAWlbxpEZ2Y+Z4u1BePgJEYbSy80Q==",
+ 			"cpu": [
+ 				"wasm32"
+ 			],
+ 			"dev": true,
+@@ -3141,16 +3145,17 @@
+ 			}
+ 		},
+ 		"node_modules/@internationalized/date": {
+ 			"version": "3.12.2",
+ 			"resolved": "https://registry.npmjs.org/@internationalized/date/-/date-3.12.2.tgz",
+ 			"integrity": "sha512-FY1Y+H64NDs+HAF6omlnWxm3mEpfgaCSWtL5l551ZZfImA+kGjPFgrnJrGjH6lfmLL0g8Z/mBu1R3kufeCp6Jw==",
+ 			"dev": true,
+ 			"license": "Apache-2.0",
++			"peer": true,
+ 			"dependencies": {
+ 				"@swc/helpers": "^0.5.0"
+ 			}
+ 		},
+ 		"node_modules/@isaacs/fs-minipass": {
+ 			"version": "4.0.1",
+ 			"resolved": "https://registry.npmjs.org/@isaacs/fs-minipass/-/fs-minipass-4.0.1.tgz",
+ 			"integrity": "sha512-wgm9Ehl2jpeqP3zw/7mo3kRHFp5MEDhqAdwy1fTGkHAwnkGOVsgpvQhL8B5n1qlb01jV3n/bI0ZfZp5lWA1k4w==",
+@@ -3229,16 +3234,111 @@
+ 			"resolved": "https://registry.npmjs.org/@lucide/svelte/-/svelte-1.25.0.tgz",
+ 			"integrity": "sha512-v9m+dD68jxVnqkU3K59mG/RSRFlPGzmKCGSyMfnXcaGv9jODDQMyQkcp1CGvk3Y/cUj9v7f8rw1n//K0B53xGQ==",
+ 			"dev": true,
+ 			"license": "ISC",
+ 			"peerDependencies": {
+ 				"svelte": "^5"
+ 			}
+ 		},
++		"node_modules/@mapbox/jsonlint-lines-primitives": {
++			"version": "2.0.3",
++			"resolved": "https://registry.npmjs.org/@mapbox/jsonlint-lines-primitives/-/jsonlint-lines-primitives-2.0.3.tgz",
++			"integrity": "sha512-0SElaV0uMxEnxzBhhX9WTuPyUeMsAN/SS0i16tjuba4/mio63MG9khjC1a0JAiPGXAwvwm4UfHJURCN7nyudQg==",
++			"dev": true,
++			"license": "MIT",
++			"engines": {
++				"node": ">= 22"
++			}
++		},
++		"node_modules/@mapbox/point-geometry": {
++			"version": "1.1.0",
++			"resolved": "https://registry.npmjs.org/@mapbox/point-geometry/-/point-geometry-1.1.0.tgz",
++			"integrity": "sha512-YGcBz1cg4ATXDCM/71L9xveh4dynfGmcLDqufR+nQQy3fKwsAZsWd/x4621/6uJaeB9mwOHE6hPeDgXz9uViUQ==",
++			"dev": true,
++			"license": "ISC"
++		},
++		"node_modules/@mapbox/tiny-sdf": {
++			"version": "2.3.0",
++			"resolved": "https://registry.npmjs.org/@mapbox/tiny-sdf/-/tiny-sdf-2.3.0.tgz",
++			"integrity": "sha512-gBvcNDBBB66bgQYvnaJ6Jk+VCaMmVq5+IZR2kWPisT88Z8s0kBQt6hfVi8QgRW8Vpg0UWZzBA4ZSyzHHC+VeRA==",
++			"dev": true,
++			"license": "BSD-2-Clause"
++		},
++		"node_modules/@mapbox/unitbezier": {
++			"version": "1.0.0",
++			"resolved": "https://registry.npmjs.org/@mapbox/unitbezier/-/unitbezier-1.0.0.tgz",
++			"integrity": "sha512-fqd515fjBmANKGGsQ286E2Wvj/XvDFpGzwJxq4CI6jMQue6Oy04uCKp+JWKF00xRTmk6cEu1jPJ9p3xqH8YWqQ==",
++			"dev": true,
++			"license": "BSD-2-Clause"
++		},
++		"node_modules/@mapbox/vector-tile": {
++			"version": "3.0.0",
++			"resolved": "https://registry.npmjs.org/@mapbox/vector-tile/-/vector-tile-3.0.0.tgz",
++			"integrity": "sha512-Qf10S1uIHMk20ri/IVBnpS+esUEkVaR5Hftmz88jTInrpmWgPGJfPe3LVjjlE77trLx8tH6qjTG7uWH9hIq/0Q==",
++			"dev": true,
++			"license": "BSD-3-Clause",
++			"dependencies": {
++				"@mapbox/point-geometry": "~1.1.0",
++				"@types/geojson": "^7946.0.16",
++				"pbf": "^5.0.0"
++			}
++		},
++		"node_modules/@maplibre/geojson-vt": {
++			"version": "6.3.0",
++			"resolved": "https://registry.npmjs.org/@maplibre/geojson-vt/-/geojson-vt-6.3.0.tgz",
++			"integrity": "sha512-3Zw2jsU9pIJG3G2CQFbLjWj2MlAHodhD7cSY+15iywUuLmmkgzcKRnueVRZ4AcC/5wOtfhidcJAAzBpoBNs3Xg==",
++			"dev": true,
++			"license": "ISC",
++			"dependencies": {
++				"kdbush": "^4.1.0"
++			}
++		},
++		"node_modules/@maplibre/maplibre-gl-style-spec": {
++			"version": "26.4.4",
++			"resolved": "https://registry.npmjs.org/@maplibre/maplibre-gl-style-spec/-/maplibre-gl-style-spec-26.4.4.tgz",
++			"integrity": "sha512-hG4RZR4PBd/+6A3ODdZ3AnQRF106ZQk1y3bhwDg8bH/A4Oz2tnRUJVVWs9BZa6gXZ1d3UKe89C+Mm+olGBELvA==",
++			"dev": true,
++			"license": "ISC",
++			"dependencies": {
++				"@mapbox/jsonlint-lines-primitives": "^2.0.3",
++				"@mapbox/unitbezier": "^1.0.0",
++				"json-stringify-pretty-compact": "^4.0.0",
++				"minimist": "^1.2.8",
++				"quickselect": "^3.0.0",
++				"tinyqueue": "^3.0.0"
++			},
++			"bin": {
++				"gl-style-format": "dist/gl-style-format.mjs",
++				"gl-style-migrate": "dist/gl-style-migrate.mjs",
++				"gl-style-validate": "dist/gl-style-validate.mjs"
++			}
++		},
++		"node_modules/@maplibre/mlt": {
++			"version": "1.3.0",
++			"resolved": "https://registry.npmjs.org/@maplibre/mlt/-/mlt-1.3.0.tgz",
++			"integrity": "sha512-7M2O7ABM80Oi8XPkfkrjKB8mOBIxGoVgkA52Mu4RMWoBvvMdagQ522+WxVYujZsMpqIr3BpzrTbXrm4k8lCzCQ==",
++			"dev": true,
++			"license": "(MIT OR Apache-2.0)",
++			"dependencies": {
++				"@mapbox/point-geometry": "^1.1.0"
++			}
++		},
++		"node_modules/@maplibre/vt-pbf": {
++			"version": "4.3.2",
++			"resolved": "https://registry.npmjs.org/@maplibre/vt-pbf/-/vt-pbf-4.3.2.tgz",
++			"integrity": "sha512-j6p0AdjvAR19Z3XaCysle7A4ZSo08tYOzxD0Y9NQylwPAkwJJeYub5b2eVucdeDh7erhv69DahoLOevDRERRUw==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"@mapbox/point-geometry": "^1.1.0",
++				"@types/geojson": "^7946.0.16",
++				"pbf": "^5.1.0"
++			}
++		},
+ 		"node_modules/@mdx-js/react": {
+ 			"version": "3.1.1",
+ 			"resolved": "https://registry.npmjs.org/@mdx-js/react/-/react-3.1.1.tgz",
+ 			"integrity": "sha512-f++rKLQgUVYDAtECQ6fn/is15GkEH9+nZPM3MS0RcxVqoTfawHvDlSCH7JbMhAM6uJ32v3eXLvLmLvjGu7PTQw==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"@types/mdx": "^2.0.0"
+@@ -3877,16 +3977,28 @@
+ 				"@emnapi/core": "1.9.2",
+ 				"@emnapi/runtime": "1.9.2",
+ 				"@napi-rs/wasm-runtime": "^1.1.4"
+ 			},
+ 			"engines": {
+ 				"node": "^20.19.0 || >=22.12.0"
+ 			}
+ 		},
++		"node_modules/@oxc-parser/binding-wasm32-wasi/node_modules/@emnapi/core": {
++			"version": "1.9.2",
++			"resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.9.2.tgz",
++			"integrity": "sha512-UC+ZhH3XtczQYfOlu3lNEkdW/p4dsJ1r/bP7H8+rhao3TTTMO1ATq/4DdIi23XuGoFY+Cz0JmCbdVl0hz9jZcA==",
++			"dev": true,
++			"license": "MIT",
++			"optional": true,
++			"dependencies": {
++				"@emnapi/wasi-threads": "1.2.1",
++				"tslib": "^2.4.0"
++			}
++		},
+ 		"node_modules/@oxc-parser/binding-wasm32-wasi/node_modules/@emnapi/runtime": {
+ 			"version": "1.9.2",
+ 			"resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.9.2.tgz",
+ 			"integrity": "sha512-3U4+MIWHImeyu1wnmVygh5WlgfYDtyf0k8AbLhMFxOipihf6nrWC4syIm/SwEeec0mNSafiiNnMJwbza/Is6Lw==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"optional": true,
+ 			"dependencies": {
+@@ -4204,16 +4316,27 @@
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"optional": true,
+ 			"dependencies": {
+ 				"@emnapi/wasi-threads": "1.2.1",
+ 				"tslib": "^2.4.0"
+ 			}
+ 		},
++		"node_modules/@oxc-resolver/binding-wasm32-wasi/node_modules/@emnapi/runtime": {
++			"version": "1.10.0",
++			"resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.10.0.tgz",
++			"integrity": "sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA==",
++			"dev": true,
++			"license": "MIT",
++			"optional": true,
++			"dependencies": {
++				"tslib": "^2.4.0"
++			}
++		},
+ 		"node_modules/@oxc-resolver/binding-win32-arm64-msvc": {
+ 			"version": "11.20.0",
+ 			"resolved": "https://registry.npmjs.org/@oxc-resolver/binding-win32-arm64-msvc/-/binding-win32-arm64-msvc-11.20.0.tgz",
+ 			"integrity": "sha512-qPi25YNPe4YenS8MgsQU2+bIFHxxpLx1LVna2444cEHqNPhNjvWf9zqj4aWE43H9LpAsTmkkAlA3eL5ElBU3mA==",
+ 			"cpu": [
+ 				"arm64"
+ 			],
+ 			"dev": true,
+@@ -4565,16 +4688,26 @@
+ 		},
+ 		"node_modules/@polka/url": {
+ 			"version": "1.0.0-next.29",
+ 			"resolved": "https://registry.npmjs.org/@polka/url/-/url-1.0.0-next.29.tgz",
+ 			"integrity": "sha512-wwQAWhWSuHaag8c4q/KN/vCoeOJYshAIvMQwD4GpSb3OiZklFfvAgmj0VCBBImRpuF/aFgIRzllXlVX93Jevww==",
+ 			"dev": true,
+ 			"license": "MIT"
+ 		},
++		"node_modules/@protomaps/basemaps": {
++			"version": "5.7.2",
++			"resolved": "https://registry.npmjs.org/@protomaps/basemaps/-/basemaps-5.7.2.tgz",
++			"integrity": "sha512-K1Yk6bWdULulYg+R2QRVXx4NzJZan5YQhpejEG0c1/sXruJrfPIPZuakpf3jwAgVmjIRVQwAv+yRafDeN0aaUQ==",
++			"dev": true,
++			"license": "BSD-3-Clause",
++			"bin": {
++				"generate_style": "src/cli.ts"
++			}
++		},
+ 		"node_modules/@quansync/fs": {
+ 			"version": "1.0.0",
+ 			"resolved": "https://registry.npmjs.org/@quansync/fs/-/fs-1.0.0.tgz",
+ 			"integrity": "sha512-4TJ3DFtlf1L5LDMaM6CanJ/0lckGNtJcMjQ1NAV6zDmA0tEHKZtxNKin8EgPaVX1YzljbxckyT2tJrpQKAtngQ==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"quansync": "^1.0.0"
+@@ -5162,16 +5295,17 @@
+ 			}
+ 		},
+ 		"node_modules/@storybook/addon-vitest": {
+ 			"version": "10.5.6",
+ 			"resolved": "https://registry.npmjs.org/@storybook/addon-vitest/-/addon-vitest-10.5.6.tgz",
+ 			"integrity": "sha512-oxq7Qi4Vujc8Etoi1TZBurMs4RiKoGnvAOCXePOLglXSJMpy95gEb7iu/hvj8E21lV+vVtQYmFvj9Z7gJeMtdg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@storybook/global": "^5.0.0",
+ 				"@storybook/icons": "^2.0.2"
+ 			},
+ 			"funding": {
+ 				"type": "opencollective",
+ 				"url": "https://opencollective.com/storybook"
+ 			},
+@@ -5319,16 +5453,17 @@
+ 			}
+ 		},
+ 		"node_modules/@storybook/svelte": {
+ 			"version": "10.5.6",
+ 			"resolved": "https://registry.npmjs.org/@storybook/svelte/-/svelte-10.5.6.tgz",
+ 			"integrity": "sha512-dx95/i86Lvif3wJZvMIWa/FnnyRljdIbDYicdBitbqS3SBldX6EE9DhYEY/e3ELEbRHMhsIANKoP2rzxs5xjVw==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"ts-dedent": "^2.0.0",
+ 				"type-fest": "^5.6.0"
+ 			},
+ 			"funding": {
+ 				"type": "opencollective",
+ 				"url": "https://opencollective.com/storybook"
+ 			},
+@@ -5419,16 +5554,17 @@
+ 			}
+ 		},
+ 		"node_modules/@sveltejs/kit": {
+ 			"version": "2.70.2",
+ 			"resolved": "https://registry.npmjs.org/@sveltejs/kit/-/kit-2.70.2.tgz",
+ 			"integrity": "sha512-RzRoRpuR2KXqc5yMO0akQHDZeT4AslOlznGITURsqHaVbtyYP4Wn3eE3gxj9JcDyNYO0crkxhdwFHc+2vkVm6w==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@standard-schema/spec": "^1.0.0",
+ 				"@sveltejs/acorn-typescript": "^1.0.9",
+ 				"@types/cookie": "^0.6.0",
+ 				"acorn": "^8.16.0",
+ 				"cookie": "^0.6.0",
+ 				"devalue": "^5.8.1",
+ 				"esm-env": "^1.2.2",
+@@ -5471,16 +5607,17 @@
+ 			}
+ 		},
+ 		"node_modules/@sveltejs/vite-plugin-svelte": {
+ 			"version": "6.2.1",
+ 			"resolved": "https://registry.npmjs.org/@sveltejs/vite-plugin-svelte/-/vite-plugin-svelte-6.2.1.tgz",
+ 			"integrity": "sha512-YZs/OSKOQAQCnJvM/P+F1URotNnYNeU3P2s4oIpzm1uFaqUEqRxUB0g5ejMjEb5Gjb9/PiBI5Ktrq4rUUF8UVQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@sveltejs/vite-plugin-svelte-inspector": "^5.0.0",
+ 				"debug": "^4.4.1",
+ 				"deepmerge": "^4.3.1",
+ 				"magic-string": "^0.30.17",
+ 				"vitefu": "^1.1.1"
+ 			},
+ 			"engines": {
+@@ -5840,16 +5977,17 @@
+ 			"license": "MIT"
+ 		},
+ 		"node_modules/@testing-library/dom": {
+ 			"version": "10.4.1",
+ 			"resolved": "https://registry.npmjs.org/@testing-library/dom/-/dom-10.4.1.tgz",
+ 			"integrity": "sha512-o4PXJQidqJl82ckFaXUeoAW+XysPLauYI43Abki5hABd853iMhitooc6znOnczgbTYmEP6U6/y1ZyKAIsvMKGg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@babel/code-frame": "^7.10.4",
+ 				"@babel/runtime": "^7.12.5",
+ 				"@types/aria-query": "^5.0.1",
+ 				"aria-query": "5.3.0",
+ 				"dom-accessibility-api": "^0.5.9",
+ 				"lz-string": "^1.5.0",
+ 				"picocolors": "1.1.1",
+@@ -6385,16 +6523,17 @@
+ 			"license": "MIT"
+ 		},
+ 		"node_modules/@types/node": {
+ 			"version": "24.13.0",
+ 			"resolved": "https://registry.npmjs.org/@types/node/-/node-24.13.0.tgz",
+ 			"integrity": "sha512-5vtOqGQr4NJKeEzV441FcOi2MeG9UTWq9LqVLGneDdu4vlX17H8kQ2PA2UmNwCUGPVDj4oBjNhS7ReVEIWJJrg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"undici-types": "~7.18.0"
+ 			}
+ 		},
+ 		"node_modules/@types/react": {
+ 			"version": "19.2.17",
+ 			"resolved": "https://registry.npmjs.org/@types/react/-/react-19.2.17.tgz",
+ 			"integrity": "sha512-MXfmqaVPEVgkBT/aY0aGCkRWWtByiYQXo3xdQ8r5RzuFrPiRn8Gar2tQdXSUQ2GKV3bkXckek89V8wQBY2Q/Aw==",
+@@ -6466,16 +6605,17 @@
+ 			}
+ 		},
+ 		"node_modules/@typescript-eslint/parser": {
+ 			"version": "8.60.1",
+ 			"resolved": "https://registry.npmjs.org/@typescript-eslint/parser/-/parser-8.60.1.tgz",
+ 			"integrity": "sha512-A0M6ua6H252bVjPvvtSgl2QA4+ET9S5Mtkb2GDyTxIhH/C4qDItT7RQNO5PhMC6NXGYXOR9dIalcDDgBKT7oFA==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@typescript-eslint/scope-manager": "8.60.1",
+ 				"@typescript-eslint/types": "8.60.1",
+ 				"@typescript-eslint/typescript-estree": "8.60.1",
+ 				"@typescript-eslint/visitor-keys": "8.60.1",
+ 				"debug": "^4.4.3"
+ 			},
+ 			"engines": {
+@@ -6727,16 +6867,17 @@
+ 			}
+ 		},
+ 		"node_modules/@vite-pwa/assets-generator": {
+ 			"version": "1.0.2",
+ 			"resolved": "https://registry.npmjs.org/@vite-pwa/assets-generator/-/assets-generator-1.0.2.tgz",
+ 			"integrity": "sha512-MCbrb508JZHqe7bUibmZj/lyojdhLRnfkmyXnkrCM2zVrjTgL89U8UEfInpKTvPeTnxsw2hmyZxnhsdNR6yhwg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"cac": "^6.7.14",
+ 				"colorette": "^2.0.20",
+ 				"consola": "^3.4.2",
+ 				"sharp": "^0.33.5",
+ 				"sharp-ico": "^0.1.5",
+ 				"unconfig": "^7.3.1"
+ 			},
+@@ -6778,16 +6919,17 @@
+ 			}
+ 		},
+ 		"node_modules/@vitest/browser": {
+ 			"version": "4.1.10",
+ 			"resolved": "https://registry.npmjs.org/@vitest/browser/-/browser-4.1.10.tgz",
+ 			"integrity": "sha512-UDwuWGwXj646CBx/bQHOaJSX7np0I8JL/UKQYa1e4QrVHH8VdWtx8eaOuf8sy0ShwDgR6NjJAsp5eF6vjF6qng==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@blazediff/core": "1.9.1",
+ 				"@vitest/mocker": "4.1.10",
+ 				"@vitest/utils": "4.1.10",
+ 				"magic-string": "^0.30.21",
+ 				"pngjs": "^7.0.0",
+ 				"sirv": "^3.0.2",
+ 				"tinyrainbow": "^3.1.0",
+@@ -6801,16 +6943,17 @@
+ 			}
+ 		},
+ 		"node_modules/@vitest/browser-playwright": {
+ 			"version": "4.1.10",
+ 			"resolved": "https://registry.npmjs.org/@vitest/browser-playwright/-/browser-playwright-4.1.10.tgz",
+ 			"integrity": "sha512-nMoXGEiRpT7m3W7NsbvrM2aKNwiNHZf+zEpUCvMteGjZFvfT96Q9fh7QyB98dvDWXiKvrLxA7bJ1mCOOv+JQPw==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@vitest/browser": "4.1.10",
+ 				"@vitest/mocker": "4.1.10",
+ 				"tinyrainbow": "^3.1.0"
+ 			},
+ 			"funding": {
+ 				"url": "https://opencollective.com/vitest"
+ 			},
+@@ -6825,16 +6968,17 @@
+ 			}
+ 		},
+ 		"node_modules/@vitest/coverage-v8": {
+ 			"version": "4.1.10",
+ 			"resolved": "https://registry.npmjs.org/@vitest/coverage-v8/-/coverage-v8-4.1.10.tgz",
+ 			"integrity": "sha512-IM49HmthevbgAO4anp1hwtoT9wYe59w0LR00gr+eagHE+ZJ5lK4sLPeO0ubgoJcwLk6dehU3R24N+FbEEKDc8g==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@bcoe/v8-coverage": "^1.0.2",
+ 				"@vitest/utils": "4.1.10",
+ 				"ast-v8-to-istanbul": "^1.0.0",
+ 				"istanbul-lib-coverage": "^3.2.2",
+ 				"istanbul-lib-report": "^3.0.1",
+ 				"istanbul-reports": "^3.2.0",
+ 				"magicast": "^0.5.2",
+@@ -6964,16 +7108,17 @@
+ 			}
+ 		},
+ 		"node_modules/@vitest/runner": {
+ 			"version": "4.1.10",
+ 			"resolved": "https://registry.npmjs.org/@vitest/runner/-/runner-4.1.10.tgz",
+ 			"integrity": "sha512-IKI6kpIH+LmpROplyLwBBaCfMgOZOMsygVa6BARD6ahA04VRuJSa6OaVG7kRvSEMD870Vd91rSSw0eegtWyLGg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@vitest/utils": "4.1.10",
+ 				"pathe": "^2.0.3"
+ 			},
+ 			"funding": {
+ 				"url": "https://opencollective.com/vitest"
+ 			}
+ 		},
+@@ -7040,16 +7185,17 @@
+ 			}
+ 		},
+ 		"node_modules/acorn": {
+ 			"version": "8.16.0",
+ 			"resolved": "https://registry.npmjs.org/acorn/-/acorn-8.16.0.tgz",
+ 			"integrity": "sha512-UVJyE9MttOsBQIDKw1skb9nAwQuR5wuGD3+82K6JgJlm/Y+KI92oNsMNGZCYdDsVtRHSak0pcV5Dno5+4jh9sw==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"bin": {
+ 				"acorn": "bin/acorn"
+ 			},
+ 			"engines": {
+ 				"node": ">=0.4.0"
+ 			}
+ 		},
+ 		"node_modules/acorn-jsx": {
+@@ -7063,16 +7209,17 @@
+ 			}
+ 		},
+ 		"node_modules/ajv": {
+ 			"version": "8.20.0",
+ 			"resolved": "https://registry.npmjs.org/ajv/-/ajv-8.20.0.tgz",
+ 			"integrity": "sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"fast-deep-equal": "^3.1.3",
+ 				"fast-uri": "^3.0.1",
+ 				"json-schema-traverse": "^1.0.0",
+ 				"require-from-string": "^2.0.2"
+ 			},
+ 			"funding": {
+ 				"type": "github",
+@@ -7375,16 +7522,26 @@
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"safe-buffer": "5.1.2"
+ 			},
+ 			"engines": {
+ 				"node": ">= 0.8"
+ 			}
+ 		},
++		"node_modules/bidi-js": {
++			"version": "1.1.0",
++			"resolved": "https://registry.npmjs.org/bidi-js/-/bidi-js-1.1.0.tgz",
++			"integrity": "sha512-fX1Onk0tdVPC7obPWB5EbJ1z7NVhLq4m2xZLq2YXBkxzMXIGRpNMU88n0EPgWseKl12J7zXs7qrDxPK4sRs2fg==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"require-from-string": "^2.0.2"
++			}
++		},
+ 		"node_modules/bits-ui": {
+ 			"version": "2.18.1",
+ 			"resolved": "https://registry.npmjs.org/bits-ui/-/bits-ui-2.18.1.tgz",
+ 			"integrity": "sha512-KkemzKFH4T3gt3H+P86JcnAWExjByv/6vlwjm/BoCwTPHu03yiCdxbghdJLvFReQTe0acCAiRcKfmixxD6XvlA==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"@floating-ui/core": "^1.7.1",
+@@ -7470,16 +7627,17 @@
+ 					"url": "https://tidelift.com/funding/github/npm/browserslist"
+ 				},
+ 				{
+ 					"type": "github",
+ 					"url": "https://github.com/sponsors/ai"
+ 				}
+ 			],
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"baseline-browser-mapping": "^2.10.12",
+ 				"caniuse-lite": "^1.0.30001782",
+ 				"electron-to-chromium": "^1.5.328",
+ 				"node-releases": "^2.0.36",
+ 				"update-browserslist-db": "^1.2.3"
+ 			},
+ 			"bin": {
+@@ -7995,25 +8153,25 @@
+ 				"node": ">=4"
+ 			}
+ 		},
+ 		"node_modules/csstype": {
+ 			"version": "3.2.3",
+ 			"resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+ 			"integrity": "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==",
+ 			"dev": true,
+-			"license": "MIT",
+-			"peer": true
++			"license": "MIT"
+ 		},
+ 		"node_modules/cytoscape": {
+ 			"version": "3.34.0",
+ 			"resolved": "https://registry.npmjs.org/cytoscape/-/cytoscape-3.34.0.tgz",
+ 			"integrity": "sha512-62rNSrioXw93uliKFBwjukeQyeWwH2PqDrTac31r2P6464u3AUvTk0xS4LVvT251g7IgkFunrI48ZEZGjywSOg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"engines": {
+ 				"node": ">=0.10"
+ 			}
+ 		},
+ 		"node_modules/cytoscape-cose-bilkent": {
+ 			"version": "4.1.0",
+ 			"resolved": "https://registry.npmjs.org/cytoscape-cose-bilkent/-/cytoscape-cose-bilkent-4.1.0.tgz",
+ 			"integrity": "sha512-wgQlVIUJF13Quxiv5e1gstZ08rnZj2XaLHGoFMYXz7SkNfCDOOteKBE6SYRfA9WxxI/iBc3ajfDoc6hb/MRAHQ==",
+@@ -8451,16 +8609,17 @@
+ 			}
+ 		},
+ 		"node_modules/d3-selection": {
+ 			"version": "3.0.0",
+ 			"resolved": "https://registry.npmjs.org/d3-selection/-/d3-selection-3.0.0.tgz",
+ 			"integrity": "sha512-fmTRWbNMmsmWq6xJV8D19U/gw/bwrHfNXxrIN+HfZgnzqTHp9jOmKMhsTUjXOJnZOdZY9Q28y4yebKzqDKlxlQ==",
+ 			"dev": true,
+ 			"license": "ISC",
++			"peer": true,
+ 			"engines": {
+ 				"node": ">=12"
+ 			}
+ 		},
+ 		"node_modules/d3-shape": {
+ 			"version": "3.2.0",
+ 			"resolved": "https://registry.npmjs.org/d3-shape/-/d3-shape-3.2.0.tgz",
+ 			"integrity": "sha512-SaLBuwGm3MOViRq2ABk3eLoxwZELpH6zhl3FbAoJ7Vm1gofKx6El1Ib5z23NUEhF9AsGl7y+dzLe5Cw2AArGTA==",
+@@ -8909,16 +9068,23 @@
+ 				"call-bind-apply-helpers": "^1.0.1",
+ 				"es-errors": "^1.3.0",
+ 				"gopd": "^1.2.0"
+ 			},
+ 			"engines": {
+ 				"node": ">= 0.4"
+ 			}
+ 		},
++		"node_modules/earcut": {
++			"version": "3.2.4",
++			"resolved": "https://registry.npmjs.org/earcut/-/earcut-3.2.4.tgz",
++			"integrity": "sha512-FHc6yNpnTORB0tM5kmZ03iD2mDuNakDE2lvf4Hw1XkfxtEHIGVi01B/GqUSwx+NcC1WGjidAfpTXzeALtPtfpg==",
++			"dev": true,
++			"license": "ISC"
++		},
+ 		"node_modules/ee-first": {
+ 			"version": "1.1.1",
+ 			"resolved": "https://registry.npmjs.org/ee-first/-/ee-first-1.1.1.tgz",
+ 			"integrity": "sha512-WMwm9LhRUo+WUaRN+vRuETqG89IgZphVSNkdFgeb6sS/E4OrDIN7t48CAewSHXc6C8lefD8KKfr5vY61brQlow==",
+ 			"dev": true,
+ 			"license": "MIT"
+ 		},
+ 		"node_modules/ejs": {
+@@ -9137,16 +9303,17 @@
+ 		},
+ 		"node_modules/esbuild": {
+ 			"version": "0.28.1",
+ 			"resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz",
+ 			"integrity": "sha512-HrJrvZv5ayxBzPfwphOoNzkzOIIlifzk0KJrGK2c8R4+LKpMtpYLQeUdjnwjWv/LZlkH2laZk+4w78pi99D4Vw==",
+ 			"dev": true,
+ 			"hasInstallScript": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"bin": {
+ 				"esbuild": "bin/esbuild"
+ 			},
+ 			"engines": {
+ 				"node": ">=18"
+ 			},
+ 			"optionalDependencies": {
+ 				"@esbuild/aix-ppc64": "0.28.1",
+@@ -9208,16 +9375,17 @@
+ 			}
+ 		},
+ 		"node_modules/eslint": {
+ 			"version": "9.39.4",
+ 			"resolved": "https://registry.npmjs.org/eslint/-/eslint-9.39.4.tgz",
+ 			"integrity": "sha512-XoMjdBOwe/esVgEvLmNsD3IRHkm7fbKIUGvrleloJXUZgDHig2IPWNniv+GwjyJXzuNqVjlr5+4yVUZjycJwfQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@eslint-community/eslint-utils": "^4.8.0",
+ 				"@eslint-community/regexpp": "^4.12.1",
+ 				"@eslint/config-array": "^0.21.2",
+ 				"@eslint/config-helpers": "^0.4.2",
+ 				"@eslint/core": "^0.17.0",
+ 				"@eslint/eslintrc": "^3.3.5",
+ 				"@eslint/js": "9.39.4",
+@@ -9788,16 +9956,17 @@
+ 			}
+ 		},
+ 		"node_modules/express": {
+ 			"version": "5.2.1",
+ 			"resolved": "https://registry.npmjs.org/express/-/express-5.2.1.tgz",
+ 			"integrity": "sha512-hIS4idWWai69NezIdRt2xFVofaF4j+6INOpJlVOLDO8zXGpUVEVzIYk12UUi2JzjEzWL3IOAxcTubgz9Po0yXw==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"accepts": "^2.0.0",
+ 				"body-parser": "^2.2.1",
+ 				"content-disposition": "^1.0.0",
+ 				"content-type": "^1.0.5",
+ 				"cookie": "^0.7.1",
+ 				"cookie-signature": "^1.2.1",
+ 				"debug": "^4.4.0",
+@@ -10251,16 +10420,23 @@
+ 			},
+ 			"engines": {
+ 				"node": ">= 0.4"
+ 			},
+ 			"funding": {
+ 				"url": "https://github.com/sponsors/ljharb"
+ 			}
+ 		},
++		"node_modules/gl-matrix": {
++			"version": "3.4.4",
++			"resolved": "https://registry.npmjs.org/gl-matrix/-/gl-matrix-3.4.4.tgz",
++			"integrity": "sha512-latSnyDNt/8zYUB6VIJ6PCh2jBjJX6gnDsoCZ7LyW7GkqrD51EWwa9qCoGixj8YqBtETQK/xY7OmpTF8xz1DdQ==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/glob-parent": {
+ 			"version": "6.0.2",
+ 			"resolved": "https://registry.npmjs.org/glob-parent/-/glob-parent-6.0.2.tgz",
+ 			"integrity": "sha512-XxwI8EOhVQgWp6iDL+3b0r86f4d6AX6zSU55HfB4ydCEuXLXc5FcYeOu+nnGftS4TEju/11rt4KJPTMgbfmv4A==",
+ 			"dev": true,
+ 			"license": "ISC",
+ 			"dependencies": {
+ 				"is-glob": "^4.0.3"
+@@ -10674,16 +10850,17 @@
+ 			}
+ 		},
+ 		"node_modules/hono": {
+ 			"version": "4.13.0",
+ 			"resolved": "https://registry.npmjs.org/hono/-/hono-4.13.0.tgz",
+ 			"integrity": "sha512-jhunvfHWxd7J5EFfSgH4xsYJzSe/lfqbUCxiyyeaQasUsXeEHXtzVid+7EOGByc5JnFa23SSFL3Y2RV/z1T+eQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"engines": {
+ 				"node": ">=16.9.0"
+ 			}
+ 		},
+ 		"node_modules/html-encoding-sniffer": {
+ 			"version": "3.0.0",
+ 			"resolved": "https://registry.npmjs.org/html-encoding-sniffer/-/html-encoding-sniffer-3.0.0.tgz",
+ 			"integrity": "sha512-oWv4T4yJ52iKrufjnyZPkrN0CH3QnrUqdB6In1g5Fe1mia8GmF36gnfNySxoZtxD5+NmYw1EElVXiBk93UeskA==",
+@@ -11600,16 +11777,23 @@
+ 		},
+ 		"node_modules/json-stable-stringify-without-jsonify": {
+ 			"version": "1.0.1",
+ 			"resolved": "https://registry.npmjs.org/json-stable-stringify-without-jsonify/-/json-stable-stringify-without-jsonify-1.0.1.tgz",
+ 			"integrity": "sha512-Bdboy+l7tA3OGW6FjyFHWkP5LuByj1Tk33Ljyq0axyzdk9//JSi2u3fP1QSmd1KNwq6VOKYGlAu87CisVir6Pw==",
+ 			"dev": true,
+ 			"license": "MIT"
+ 		},
++		"node_modules/json-stringify-pretty-compact": {
++			"version": "4.0.0",
++			"resolved": "https://registry.npmjs.org/json-stringify-pretty-compact/-/json-stringify-pretty-compact-4.0.0.tgz",
++			"integrity": "sha512-3CNZ2DnrpByG9Nqj6Xo8vqbjT4F6N+tb4Gb28ESAZjYZ5yqvmc56J+/kuIwkaAMOyblTQhUW7PxMkUb8Q36N3Q==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/json5": {
+ 			"version": "2.2.3",
+ 			"resolved": "https://registry.npmjs.org/json5/-/json5-2.2.3.tgz",
+ 			"integrity": "sha512-XmOWe7eyHYH14cLdVPoyg+GOH3rYX++KpzrylJwSW98t3Nk+U8XOl8FWKOgwtzdb8lXGf6zYwDUzeHMWfxasyg==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"bin": {
+ 				"json5": "lib/cli.js"
+@@ -11670,16 +11854,23 @@
+ 			"resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
+ 			"integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">= 12"
+ 			}
+ 		},
++		"node_modules/kdbush": {
++			"version": "4.1.0",
++			"resolved": "https://registry.npmjs.org/kdbush/-/kdbush-4.1.0.tgz",
++			"integrity": "sha512-e9vurzrXJQrFX6ckpHP3bvj5l+9CnYzkxDNnNQ1h2QTqdWsUAJgXiKdGNcOa1EY85dU8KbQ+z/FdQdB7P+9yfQ==",
++			"dev": true,
++			"license": "ISC"
++		},
+ 		"node_modules/keyv": {
+ 			"version": "4.5.4",
+ 			"resolved": "https://registry.npmjs.org/keyv/-/keyv-4.5.4.tgz",
+ 			"integrity": "sha512-oxVHkHR/EJf2CNXnWxRLW6mg7JyCCUcG0DtEGmL2ctUo1PNTin1PUil+r/+4r5MpVgC/fn1kjsx7mjSujKqIpw==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"json-buffer": "3.0.1"
+@@ -12137,16 +12328,50 @@
+ 			},
+ 			"engines": {
+ 				"node": ">=10"
+ 			},
+ 			"funding": {
+ 				"url": "https://github.com/sponsors/sindresorhus"
+ 			}
+ 		},
++		"node_modules/maplibre-gl": {
++			"version": "6.11.2",
++			"resolved": "https://registry.npmjs.org/maplibre-gl/-/maplibre-gl-6.11.2.tgz",
++			"integrity": "sha512-Xh06pxoipjX/Ad1sUPGhiNh9go9naCNGZZ1IJm3sIeqK1kYGuMaMDSTIGDQ2igOLfVyukJU7kvEOA089VO7Z7g==",
++			"dev": true,
++			"license": "BSD-3-Clause",
++			"dependencies": {
++				"@mapbox/point-geometry": "^1.1.0",
++				"@mapbox/tiny-sdf": "^2.2.0",
++				"@mapbox/unitbezier": "^1.0.0",
++				"@mapbox/vector-tile": "^3.0.0",
++				"@maplibre/geojson-vt": "^6.1.1",
++				"@maplibre/maplibre-gl-style-spec": "^26.4.4",
++				"@maplibre/mlt": "^1.3.0",
++				"@maplibre/vt-pbf": "^4.3.2",
++				"@types/geojson": "^7946.0.16",
++				"bidi-js": "^1.1.0",
++				"earcut": "^3.2.3",
++				"gl-matrix": "^3.4.4",
++				"kdbush": "^4.1.0",
++				"murmurhash-js": "^1.0.0",
++				"pbf": "^5.1.2",
++				"potpack": "^2.1.0",
++				"quickselect": "^3.0.0",
++				"tinyqueue": "^3.0.0"
++			},
++			"engines": {
++				"node": ">=16.14.0",
++				"npm": ">=8.1.0"
++			},
++			"funding": {
++				"url": "https://github.com/maplibre/maplibre-gl-js?sponsor=1"
++			}
++		},
+ 		"node_modules/markdown-table": {
+ 			"version": "3.0.4",
+ 			"resolved": "https://registry.npmjs.org/markdown-table/-/markdown-table-3.0.4.tgz",
+ 			"integrity": "sha512-wiYz4+JrLyb/DqW2hkFJxP7Vd7JuTDm77fvbM8VfEQdmSMqcImWeeRbHwZjBjIFki/VaMK2BhFi7oUUZeM5bqw==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"funding": {
+ 				"type": "github",
+@@ -13387,16 +13612,23 @@
+ 		},
+ 		"node_modules/ms": {
+ 			"version": "2.1.3",
+ 			"resolved": "https://registry.npmjs.org/ms/-/ms-2.1.3.tgz",
+ 			"integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
+ 			"dev": true,
+ 			"license": "MIT"
+ 		},
++		"node_modules/murmurhash-js": {
++			"version": "1.0.0",
++			"resolved": "https://registry.npmjs.org/murmurhash-js/-/murmurhash-js-1.0.0.tgz",
++			"integrity": "sha512-TvmkNhkv8yct0SVBSy+o8wYzXjE4Zz3PCesbfs8HiCXXdcTuocApFv11UWlNFWKYsP2okqrhb7JNlSm9InBhIw==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/nanoid": {
+ 			"version": "3.3.17",
+ 			"resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.17.tgz",
+ 			"integrity": "sha512-xQLf0A3HOMlgHq0n247/LRuAOYmB7dXJ/DvAxGvsSBij45XtBSmQycu+F8ODbHwns/XyFZagyL1+J0Offw1E0g==",
+ 			"dev": true,
+ 			"funding": [
+ 				{
+ 					"type": "github",
+@@ -13820,16 +14052,29 @@
+ 			"resolved": "https://registry.npmjs.org/pathval/-/pathval-2.0.1.tgz",
+ 			"integrity": "sha512-//nshmD55c46FuFw26xV/xFAaB5HF9Xdap7HJBBnrKdAd6/GxDBaNA1870O79+9ueg61cZLSVc+OaFlfmObYVQ==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">= 14.16"
+ 			}
+ 		},
++		"node_modules/pbf": {
++			"version": "5.1.2",
++			"resolved": "https://registry.npmjs.org/pbf/-/pbf-5.1.2.tgz",
++			"integrity": "sha512-mnvGdvOrIvJOBGUEdGkrVXjN8E/VkIJCkf2eS1DH2yv82ORUlLttmDt0rWY38yYZmVwciZwBUvHM20qxBZf40w==",
++			"dev": true,
++			"license": "BSD-3-Clause",
++			"dependencies": {
++				"resolve-protobuf-schema": "^2.1.0"
++			},
++			"bin": {
++				"pbf": "bin/pbf"
++			}
++		},
+ 		"node_modules/pdfjs-dist": {
+ 			"version": "5.4.54",
+ 			"resolved": "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-5.4.54.tgz",
+ 			"integrity": "sha512-TBAiTfQw89gU/Z4LW98Vahzd2/LoCFprVGvGbTgFt+QCB1F+woyOPmNNVgLa6djX9Z9GGTnj7qE1UzpOVJiINw==",
+ 			"dev": true,
+ 			"license": "Apache-2.0",
+ 			"engines": {
+ 				"node": ">=20.16.0 || >=22.3.0"
+@@ -13876,16 +14121,17 @@
+ 			}
+ 		},
+ 		"node_modules/playwright": {
+ 			"version": "1.56.1",
+ 			"resolved": "https://registry.npmjs.org/playwright/-/playwright-1.56.1.tgz",
+ 			"integrity": "sha512-aFi5B0WovBHTEvpM3DzXTUaeN6eN0qWnTkKx4NQaH4Wvcmc153PdaY2UBdSYKaGYw+UyWXSVyxDUg5DoPEttjw==",
+ 			"dev": true,
+ 			"license": "Apache-2.0",
++			"peer": true,
+ 			"dependencies": {
+ 				"playwright-core": "1.56.1"
+ 			},
+ 			"bin": {
+ 				"playwright": "cli.js"
+ 			},
+ 			"engines": {
+ 				"node": ">=18"
+@@ -13902,16 +14148,26 @@
+ 			"license": "Apache-2.0",
+ 			"bin": {
+ 				"playwright-core": "cli.js"
+ 			},
+ 			"engines": {
+ 				"node": ">=18"
+ 			}
+ 		},
++		"node_modules/pmtiles": {
++			"version": "4.5.0",
++			"resolved": "https://registry.npmjs.org/pmtiles/-/pmtiles-4.5.0.tgz",
++			"integrity": "sha512-CBeD4SoUluFziGdy/8k7FOjQxQy486n+929W/tWophauvMICpkZ26vGBWhDt/6b1FZQWNaf4jFdT/5+q0Wii5w==",
++			"dev": true,
++			"license": "BSD-3-Clause",
++			"dependencies": {
++				"fflate": "^0.8.2"
++			}
++		},
+ 		"node_modules/pngjs": {
+ 			"version": "7.0.0",
+ 			"resolved": "https://registry.npmjs.org/pngjs/-/pngjs-7.0.0.tgz",
+ 			"integrity": "sha512-LKWqWJRhstyYo9pGvgor/ivk2w94eSjE3RGVuzLGlr3NmD8bf7RcYGze1mNdEHRP6TRP6rMuDHk5t44hnTRyow==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">=14.19.0"
+@@ -13974,16 +14230,17 @@
+ 					"url": "https://tidelift.com/funding/github/npm/postcss"
+ 				},
+ 				{
+ 					"type": "github",
+ 					"url": "https://github.com/sponsors/ai"
+ 				}
+ 			],
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"nanoid": "^3.3.16",
+ 				"picocolors": "^1.1.1",
+ 				"source-map-js": "^1.2.1"
+ 			},
+ 			"engines": {
+ 				"node": "^10 || ^12 || >=14"
+ 			}
+@@ -14091,48 +14348,57 @@
+ 			"dependencies": {
+ 				"cssesc": "^3.0.0",
+ 				"util-deprecate": "^1.0.2"
+ 			},
+ 			"engines": {
+ 				"node": ">=4"
+ 			}
+ 		},
++		"node_modules/potpack": {
++			"version": "2.1.0",
++			"resolved": "https://registry.npmjs.org/potpack/-/potpack-2.1.0.tgz",
++			"integrity": "sha512-pcaShQc1Shq0y+E7GqJqvZj8DTthWV1KeHGdi0Z6IAin2Oi3JnLCOfwnCo84qc+HAp52wT9nK9H7FAJp5a44GQ==",
++			"dev": true,
++			"license": "ISC"
++		},
+ 		"node_modules/prelude-ls": {
+ 			"version": "1.2.1",
+ 			"resolved": "https://registry.npmjs.org/prelude-ls/-/prelude-ls-1.2.1.tgz",
+ 			"integrity": "sha512-vkcDPrRZo1QZLbn5RLGPpg/WmIQ65qoWWhcGKf/b5eplkkarX0m9z8ppCat4mlOqUsWpyNuYgO3VRyrYHSzX5g==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">= 0.8.0"
+ 			}
+ 		},
+ 		"node_modules/prettier": {
+ 			"version": "3.8.3",
+ 			"resolved": "https://registry.npmjs.org/prettier/-/prettier-3.8.3.tgz",
+ 			"integrity": "sha512-7igPTM53cGHMW8xWuVTydi2KO233VFiTNyF5hLJqpilHfmn8C8gPf+PS7dUT64YcXFbiMGZxS9pCSxL/Dxm/Jw==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"bin": {
+ 				"prettier": "bin/prettier.cjs"
+ 			},
+ 			"engines": {
+ 				"node": ">=14"
+ 			},
+ 			"funding": {
+ 				"url": "https://github.com/prettier/prettier?sponsor=1"
+ 			}
+ 		},
+ 		"node_modules/prettier-plugin-svelte": {
+ 			"version": "4.1.0",
+ 			"resolved": "https://registry.npmjs.org/prettier-plugin-svelte/-/prettier-plugin-svelte-4.1.0.tgz",
+ 			"integrity": "sha512-YZkhA2Q9oOerFFG9tq+2f98WYT7Z2JgrybJrAyrB78jpsH9i/DdgplXemehuFPgsldetFNCcR/yCcYlDjPy94Q==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"engines": {
+ 				"node": ">=20"
+ 			},
+ 			"peerDependencies": {
+ 				"prettier": "^3.0.0",
+ 				"svelte": "^5.0.0"
+ 			}
+ 		},
+@@ -14279,16 +14545,23 @@
+ 			"integrity": "sha512-IAtzIB6sUiWaJYrX9smp3V46pBGbBeLFRGdh25kg1334VcBlD8HzhPeNIWQH9zhGmo2itIe25EHt9dQP7G5hmg==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"funding": {
+ 				"type": "github",
+ 				"url": "https://github.com/sponsors/wooorm"
+ 			}
+ 		},
++		"node_modules/protocol-buffers-schema": {
++			"version": "3.6.1",
++			"resolved": "https://registry.npmjs.org/protocol-buffers-schema/-/protocol-buffers-schema-3.6.1.tgz",
++			"integrity": "sha512-VG2K63Igkiv9p76tk1lilczEK1cT+kCjKtkdhw1dQZV3k3IXJbd3o6Ho8b9zJZaHSnT2hKe4I+ObmX9w6m5SmQ==",
++			"dev": true,
++			"license": "MIT"
++		},
+ 		"node_modules/proxy-addr": {
+ 			"version": "2.0.7",
+ 			"resolved": "https://registry.npmjs.org/proxy-addr/-/proxy-addr-2.0.7.tgz",
+ 			"integrity": "sha512-llQsMLSUDUPT44jdrU/O37qlnifitDP+ZwrmmZcoSKyLKvtZxpyV0n2/bD/N4tBAAZ/gJEdZU7KMraoK1+XYAg==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"forwarded": "0.2.0",
+@@ -14336,16 +14609,23 @@
+ 				},
+ 				{
+ 					"type": "individual",
+ 					"url": "https://github.com/sponsors/sxzz"
+ 				}
+ 			],
+ 			"license": "MIT"
+ 		},
++		"node_modules/quickselect": {
++			"version": "3.0.0",
++			"resolved": "https://registry.npmjs.org/quickselect/-/quickselect-3.0.0.tgz",
++			"integrity": "sha512-XdjUArbK4Bm5fLLvlm5KpTFOiOThgfWWI4axAZDWg4E/0mKdZyI9tNEfds27qCi1ze/vwTR16kvmmGhRra3c2g==",
++			"dev": true,
++			"license": "ISC"
++		},
+ 		"node_modules/range-parser": {
+ 			"version": "1.2.1",
+ 			"resolved": "https://registry.npmjs.org/range-parser/-/range-parser-1.2.1.tgz",
+ 			"integrity": "sha512-Hrgsx+orqoygnmhFbKaHE6c296J+HTAQXoxEF6gNupROmmGJRoyzfG3ccAveqCBrwr/2yxQ5BVd/GTl5agOwSg==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">= 0.6"
+@@ -14368,26 +14648,28 @@
+ 			}
+ 		},
+ 		"node_modules/react": {
+ 			"version": "19.2.7",
+ 			"resolved": "https://registry.npmjs.org/react/-/react-19.2.7.tgz",
+ 			"integrity": "sha512-HNe9WslTbXmFK8o8cmwgAeJFSBvt1bPdHCVKtaaV+WlAN36mpT4hcRpwbf3fY56ar2oIXzsBpOAiIRHAdY0OlQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"engines": {
+ 				"node": ">=0.10.0"
+ 			}
+ 		},
+ 		"node_modules/react-dom": {
+ 			"version": "19.2.7",
+ 			"resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.7.tgz",
+ 			"integrity": "sha512-t0BRVXvbiE/o20Hfw669rLbMCDWtYZLvmJigy2f0MxsXF+71pxhR3xOkspmsO8h3ZlNzyibAmtCa3l4lYKk6gQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"scheduler": "^0.27.0"
+ 			},
+ 			"peerDependencies": {
+ 				"react": "^19.2.7"
+ 			}
+ 		},
+ 		"node_modules/react-is": {
+@@ -14780,29 +15062,40 @@
+ 			"resolved": "https://registry.npmjs.org/resolve-from/-/resolve-from-4.0.0.tgz",
+ 			"integrity": "sha512-pb/MYmXstAkysRFx8piNI1tGFNQIFA3vkE3Gq4EuA1dF6gHp/+vgZqsCGJapvy8N3Q+4o7FwvquPJcnZ7RYy4g==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">=4"
+ 			}
+ 		},
++		"node_modules/resolve-protobuf-schema": {
++			"version": "2.1.0",
++			"resolved": "https://registry.npmjs.org/resolve-protobuf-schema/-/resolve-protobuf-schema-2.1.0.tgz",
++			"integrity": "sha512-kI5ffTiZWmJaS/huM8wZfEMer1eRd7oJQhDuxeCLe3t7N7mX3z94CN0xPxBQxFYQTSNz9T0i+v6inKqSdK8xrQ==",
++			"dev": true,
++			"license": "MIT",
++			"dependencies": {
++				"protocol-buffers-schema": "^3.3.1"
++			}
++		},
+ 		"node_modules/robust-predicates": {
+ 			"version": "3.0.3",
+ 			"resolved": "https://registry.npmjs.org/robust-predicates/-/robust-predicates-3.0.3.tgz",
+ 			"integrity": "sha512-NS3levdsRIUOmiJ8FZWCP7LG3QpJyrs/TE0Zpf1yvZu8cAJJ6QMW92H1c7kWpdIHo8RvmLxN/o2JXTKHp74lUA==",
+ 			"dev": true,
+ 			"license": "Unlicense"
+ 		},
+ 		"node_modules/rollup": {
+ 			"version": "4.61.1",
+ 			"resolved": "https://registry.npmjs.org/rollup/-/rollup-4.61.1.tgz",
+ 			"integrity": "sha512-I4KW6iuRpuu2uHBLraZ1wNZe0DP7lnRha+VJ9tNaYVaVgKhW0aI3h4RYnoRPeql0flHm/Co55b7snEDcOfOJrA==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@types/estree": "1.0.9"
+ 			},
+ 			"bin": {
+ 				"rollup": "dist/bin/rollup"
+ 			},
+ 			"engines": {
+ 				"node": ">=18.0.0",
+@@ -14995,16 +15288,17 @@
+ 			"license": "MIT"
+ 		},
+ 		"node_modules/sass": {
+ 			"version": "1.100.0",
+ 			"resolved": "https://registry.npmjs.org/sass/-/sass-1.100.0.tgz",
+ 			"integrity": "sha512-B5j0rYMlinhhOo9tjQebMVVn0TfyXAF+wB3b2ggZUuJ/is/Y+7+JGjirAMxHZ9Z3hIP98NPfamlAkBHa1lAaXQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"chokidar": "^5.0.0",
+ 				"immutable": "^5.1.5",
+ 				"source-map-js": ">=0.6.2 <2.0.0"
+ 			},
+ 			"bin": {
+ 				"sass": "sass.js"
+ 			},
+@@ -15463,16 +15757,17 @@
+ 			}
+ 		},
+ 		"node_modules/storybook": {
+ 			"version": "10.5.6",
+ 			"resolved": "https://registry.npmjs.org/storybook/-/storybook-10.5.6.tgz",
+ 			"integrity": "sha512-VhYwqxPySa24CVXKoWD6gCZXx9//DTmo43YpusGuAoHDYj5Osjt8wuBRQVeGoaLUWnHiPWv8S+GYHrJEaBM6Rg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@storybook/global": "^5.0.0",
+ 				"@storybook/icons": "^2.0.2",
+ 				"@testing-library/dom": "^10.4.1",
+ 				"@testing-library/jest-dom": "6.9.1",
+ 				"@testing-library/user-event": "^14.6.1",
+ 				"@vitest/expect": "3.2.4",
+ 				"@vitest/spy": "3.2.4",
+@@ -15750,16 +16045,17 @@
+ 			}
+ 		},
+ 		"node_modules/svelte": {
+ 			"version": "5.56.1",
+ 			"resolved": "https://registry.npmjs.org/svelte/-/svelte-5.56.1.tgz",
+ 			"integrity": "sha512-eArsJmvl3xZVuTYD852PzIEdg2wgDdIZ1NEsIPbzAukHwi284B18No4nK2rCO9AwsWUDza4Cjvmoa4HaojTl5g==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@jridgewell/remapping": "^2.3.4",
+ 				"@jridgewell/sourcemap-codec": "^1.5.0",
+ 				"@sveltejs/acorn-typescript": "^1.0.10",
+ 				"@types/estree": "^1.0.5",
+ 				"@types/trusted-types": "^2.0.7",
+ 				"acorn": "^8.12.1",
+ 				"aria-query": "5.3.1",
+@@ -16037,16 +16333,17 @@
+ 			}
+ 		},
+ 		"node_modules/tailwind-merge": {
+ 			"version": "3.6.0",
+ 			"resolved": "https://registry.npmjs.org/tailwind-merge/-/tailwind-merge-3.6.0.tgz",
+ 			"integrity": "sha512-uxL7qAVQriqRQPAyK3pj66VqskWqoZ37PW94jwOTwNfq/z9oyu1V+eqrZqtR2+fCiXdYOZe/Modt8GtvqNzu+w==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"funding": {
+ 				"type": "github",
+ 				"url": "https://github.com/sponsors/dcastil"
+ 			}
+ 		},
+ 		"node_modules/tailwind-variants": {
+ 			"version": "3.3.1",
+ 			"resolved": "https://registry.npmjs.org/tailwind-variants/-/tailwind-variants-3.3.1.tgz",
+@@ -16070,17 +16367,18 @@
+ 				}
+ 			}
+ 		},
+ 		"node_modules/tailwindcss": {
+ 			"version": "4.3.0",
+ 			"resolved": "https://registry.npmjs.org/tailwindcss/-/tailwindcss-4.3.0.tgz",
+ 			"integrity": "sha512-y6nxMGB1nMW9R6k96e5gdIFzcfL/gTJRNaqGes1YvkLnPVXzWgbqFF2yLC0T8G774n24cx3Pe8XrKoniCOAH+Q==",
+ 			"dev": true,
+-			"license": "MIT"
++			"license": "MIT",
++			"peer": true
+ 		},
+ 		"node_modules/tapable": {
+ 			"version": "2.3.3",
+ 			"resolved": "https://registry.npmjs.org/tapable/-/tapable-2.3.3.tgz",
+ 			"integrity": "sha512-uxc/zpqFg6x7C8vOE7lh6Lbda8eEL9zmVm/PLeTPBRhh1xCgdWaQ+J1CUieGpIfm2HdtsUpRv+HshiasBMcc6A==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+@@ -16222,16 +16520,23 @@
+ 			},
+ 			"engines": {
+ 				"node": ">=12.0.0"
+ 			},
+ 			"funding": {
+ 				"url": "https://github.com/sponsors/SuperchupuDev"
+ 			}
+ 		},
++		"node_modules/tinyqueue": {
++			"version": "3.0.0",
++			"resolved": "https://registry.npmjs.org/tinyqueue/-/tinyqueue-3.0.0.tgz",
++			"integrity": "sha512-gRa9gwYU3ECmQYv3lslts5hxuIa90veaEcxDYuu3QGOIAEM2mOZkVHp48ANJuu1CURtRdHKUBY5Lm1tHV+sD4g==",
++			"dev": true,
++			"license": "ISC"
++		},
+ 		"node_modules/tinyrainbow": {
+ 			"version": "3.1.1",
+ 			"resolved": "https://registry.npmjs.org/tinyrainbow/-/tinyrainbow-3.1.1.tgz",
+ 			"integrity": "sha512-yau8yJdTt989Mm0Bd/236QnzEiPf2xLLTqUZRUJOo/3CB078LSwzei343DgtJVmfJKJE3TMINY1u42SQsP6mXw==",
+ 			"dev": true,
+ 			"license": "MIT",
+ 			"engines": {
+ 				"node": ">=14.0.0"
+@@ -16248,16 +16553,17 @@
+ 			}
+ 		},
+ 		"node_modules/tmcp": {
+ 			"version": "1.19.4",
+ 			"resolved": "https://registry.npmjs.org/tmcp/-/tmcp-1.19.4.tgz",
+ 			"integrity": "sha512-fMoUJ3Gef9iA0yKZNeW2SQCCKTluCwghUyOz/qxPS8XxrQk6Jlw4lgql3S+s6L//FteLeSJ7erKxMWl727mZoQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@standard-schema/spec": "^1.0.0",
+ 				"json-rpc-2.0": "^1.7.1",
+ 				"sqids": "^0.3.0",
+ 				"uri-template-matcher": "^1.1.1",
+ 				"valibot": "^1.1.0"
+ 			}
+ 		},
+@@ -16498,16 +16804,17 @@
+ 			}
+ 		},
+ 		"node_modules/typescript": {
+ 			"version": "5.9.3",
+ 			"resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
+ 			"integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+ 			"dev": true,
+ 			"license": "Apache-2.0",
++			"peer": true,
+ 			"bin": {
+ 				"tsc": "bin/tsc",
+ 				"tsserver": "bin/tsserver"
+ 			},
+ 			"engines": {
+ 				"node": ">=14.17"
+ 			}
+ 		},
+@@ -16974,16 +17281,17 @@
+ 			}
+ 		},
+ 		"node_modules/valibot": {
+ 			"version": "1.4.2",
+ 			"resolved": "https://registry.npmjs.org/valibot/-/valibot-1.4.2.tgz",
+ 			"integrity": "sha512-gjdCvJ6d3RyHAneqxMYMW9QMCwYMb3jpOO0IyHZV1bnRHFBHrX3VkIILt5XYR0WhwHiH7Mty8ovuPZ/O3gamrg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"peerDependencies": {
+ 				"typescript": ">=5"
+ 			},
+ 			"peerDependenciesMeta": {
+ 				"typescript": {
+ 					"optional": true
+ 				}
+ 			}
+@@ -17087,16 +17395,17 @@
+ 			}
+ 		},
+ 		"node_modules/vite": {
+ 			"version": "7.3.6",
+ 			"resolved": "https://registry.npmjs.org/vite/-/vite-7.3.6.tgz",
+ 			"integrity": "sha512-4XP60spRGjSZFf1qYH+dJIkK2znL3zQfl9KkOV9MkkRR/3Dls0dxaBsQPTloEc5BLXWPL9vsOxopxyKoMmDueg==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"esbuild": "^0.27.0 || ^0.28.0",
+ 				"fdir": "^6.5.0",
+ 				"picomatch": "^4.0.3",
+ 				"postcss": "^8.5.6",
+ 				"rollup": "^4.43.0",
+ 				"tinyglobby": "^0.2.15"
+ 			},
+@@ -17255,16 +17564,17 @@
+ 			}
+ 		},
+ 		"node_modules/vitest": {
+ 			"version": "4.1.10",
+ 			"resolved": "https://registry.npmjs.org/vitest/-/vitest-4.1.10.tgz",
+ 			"integrity": "sha512-R9jUTe5S4Qb0HCd4TNqpC7oGcrMssMRGXLW80ubjWsW9VH5GF8y1Y0SFLY9AbqSk6nt0PnOx4H4WNJYZ13GUPw==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"dependencies": {
+ 				"@vitest/expect": "4.1.10",
+ 				"@vitest/mocker": "4.1.10",
+ 				"@vitest/pretty-format": "4.1.10",
+ 				"@vitest/runner": "4.1.10",
+ 				"@vitest/snapshot": "4.1.10",
+ 				"@vitest/spy": "4.1.10",
+ 				"@vitest/utils": "4.1.10",
+@@ -18009,16 +18319,17 @@
+ 			"license": "MIT"
+ 		},
+ 		"node_modules/zod": {
+ 			"version": "4.4.3",
+ 			"resolved": "https://registry.npmjs.org/zod/-/zod-4.4.3.tgz",
+ 			"integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==",
+ 			"dev": true,
+ 			"license": "MIT",
++			"peer": true,
+ 			"funding": {
+ 				"url": "https://github.com/sponsors/colinhacks"
+ 			}
+ 		},
+ 		"node_modules/zod-to-json-schema": {
+ 			"version": "3.25.2",
+ 			"resolved": "https://registry.npmjs.org/zod-to-json-schema/-/zod-to-json-schema-3.25.2.tgz",
+ 			"integrity": "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA==",
+diff --git a/tools/ui/package.json b/tools/ui/package.json
+index 401760474..9a27a5b23 100644
+--- a/tools/ui/package.json
++++ b/tools/ui/package.json
+@@ -30,16 +30,17 @@
+ 	"devDependencies": {
+ 		"@chromatic-com/storybook": "5.2.1",
+ 		"@eslint/compat": "1.4.1",
+ 		"@eslint/js": "9.39.2",
+ 		"@internationalized/date": "3.12.2",
+ 		"@lucide/svelte": "1.25.0",
+ 		"@modelcontextprotocol/sdk": "1.30.0",
+ 		"@playwright/test": "1.56.1",
++		"@protomaps/basemaps": "5.7.2",
+ 		"@storybook/addon-a11y": "10.5.6",
+ 		"@storybook/addon-docs": "10.5.6",
+ 		"@storybook/addon-mcp": "0.7.0",
+ 		"@storybook/addon-svelte-csf": "5.1.2",
+ 		"@storybook/addon-vitest": "10.5.6",
+ 		"@storybook/sveltekit": "10.5.6",
+ 		"@sveltejs/adapter-static": "3.0.10",
+ 		"@sveltejs/kit": "2.70.2",
+@@ -62,22 +63,24 @@
+ 		"eslint-plugin-perfectionist": "^5.10.1",
+ 		"eslint-plugin-simple-import-sort": "^14.0.0",
+ 		"eslint-plugin-storybook": "10.5.6",
+ 		"eslint-plugin-svelte": "3.19.0",
+ 		"fflate": "0.8.3",
+ 		"globals": "16.5.0",
+ 		"highlight.js": "11.11.1",
+ 		"http-server": "14.1.1",
++		"maplibre-gl": "6.11.2",
+ 		"mdast": "3.0.0",
+ 		"mdsvex": "0.12.7",
+ 		"mermaid": "11.15.0",
+ 		"mode-watcher": "1.1.0",
+ 		"pdfjs-dist": "5.4.54",
+ 		"playwright": "1.56.1",
++		"pmtiles": "4.5.0",
+ 		"prettier": "3.8.3",
+ 		"prettier-plugin-svelte": "4.1.0",
+ 		"prettier-plugin-tailwindcss": "0.8.0",
+ 		"rehype-highlight": "7.0.2",
+ 		"rehype-katex": "7.0.1",
+ 		"rehype-stringify": "10.0.1",
+ 		"remark": "15.0.1",
+ 		"remark-breaks": "4.0.0",
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistant.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistant.svelte
+index dac55caff..5fa2dc082 100644
+--- a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistant.svelte
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ChatMessageAssistant.svelte
+@@ -1,9 +1,10 @@
+ <script lang="ts">
++	import ToshPanel from './ToshPanel.svelte';
+ 	import {
+ 		ChatMessageActionIcons,
+ 		ChatMessageAgenticContent,
+ 		ChatMessageAssistantModel,
+ 		ChatMessageAssistantProcessingInfo,
+ 		ChatMessageAssistantRawOutput,
+ 		ChatMessageAssistantStatistics,
+ 		ChatMessageEditForm
+@@ -149,16 +150,18 @@
+ 		{:else}
+ 			<ChatMessageAgenticContent
+ 				{isLastAssistantMessage}
+ 				isStreaming={chatStore.isStreaming()}
+ 				{message}
+ 				{toolMessages}
+ 			/>
+ 		{/if}
++
++		<ToshPanel {message} />
+ 	{/if}
+ 
+ 	{#if showProcessingInfoBottom}
+ 		<ChatMessageAssistantProcessingInfo {modelLoadingText} position="bottom" {processingState} />
+ 	{/if}
+ 
+ 	{#if displayedModel}
+ 		<div class="info my-6 grid gap-4 tabular-nums">
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshMap.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshMap.svelte
+new file mode 100644
+index 000000000..3cbf45a3a
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshMap.svelte
+@@ -0,0 +1,221 @@
++<script lang="ts">
++	import 'maplibre-gl/dist/maplibre-gl.css';
++	import ToshResize from './ToshResize.svelte';
++	import { download } from '$lib/tosh/download';
++	import { baseStyle, bounds, bundle, geojsonFiles, ground } from '$lib/tosh/map';
++	import { serverStore } from '$lib/stores/server.svelte';
++	import type { ToshMapLayer } from '$lib/types';
++	import type { Map as MapLibreMap } from 'maplibre-gl';
++	import { onDestroy, onMount, tick } from 'svelte';
++
++	interface Props {
++		layers: ToshMapLayer[];
++	}
++
++	let { layers }: Props = $props();
++
++	const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
++
++	let element: HTMLDivElement;
++	let map: MapLibreMap | null = null;
++	let destroyed = false;
++	let enlarged = $state(false);
++
++	async function resize() {
++		enlarged = !enlarged;
++		await tick();
++		map?.resize();
++	}
++
++	function escape(value: unknown): string {
++		return String(value ?? '').replace(
++			/[<>&"]/g,
++			(c) => ({ '"': '&quot;', '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c] ?? c
++		);
++	}
++
++	/** The attributes of a feature in the layer's own order, with the names a GIS shows for them. */
++	function popup(properties: Record<string, unknown>, layer: ToshMapLayer): string {
++		const names = layer.fields?.length
++			? layer.fields
++			: Object.keys(properties).map((name) => ({ alias: name, name }));
++		const rows = names
++			.filter(
++				(f) =>
++					properties[f.name] !== null &&
++					properties[f.name] !== undefined &&
++					properties[f.name] !== ''
++			)
++			.slice(0, 40)
++			.map(
++				(f) =>
++					`<tr><th style="text-align:left;padding-right:8px">${escape(f.alias ?? f.name)}</th><td>${escape(properties[f.name])}</td></tr>`
++			);
++
++		return `<div style="max-height:220px;overflow:auto;font-size:12px;color:#111"><b>${escape(layer.title)}</b><table>${rows.join('')}</table></div>`;
++	}
++
++	// MapLibre touches window when imported, so it loads in the browser only.
++	onMount(async () => {
++		const maplibregl = await import('maplibre-gl');
++		// the worker comes out of the build as a file of its own, which MapLibre cannot find on its own
++		const worker = (await import('maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url')).default;
++
++		maplibregl.setWorkerUrl(worker);
++		const dark = document.documentElement.classList.contains('dark');
++		const style = await baseStyle(maplibregl, serverStore.uiSettings ?? {}, dark);
++
++		if (destroyed) return;
++
++		const created = new maplibregl.Map({
++			attributionControl: { compact: true },
++			container: element,
++			scrollZoom: false,
++			style
++		});
++		map = created;
++		created.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
++
++		// without internet and without a region the base map cannot load: the layers still show on a plain ground
++		let fellBack = false;
++
++		created.on('error', () => {
++			if (fellBack || created.isStyleLoaded()) return;
++
++			fellBack = true;
++			created.setStyle(ground(dark));
++		});
++
++		created.on('style.load', () => {
++			layers.forEach((layer, index) => {
++				const id = `tosh-${index}`;
++				const color = COLORS[index % COLORS.length];
++				const polygons = ['in', ['geometry-type'], ['literal', ['Polygon', 'MultiPolygon']]];
++				const lines = [
++					'in',
++					['geometry-type'],
++					['literal', ['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']]
++				];
++				const points = ['in', ['geometry-type'], ['literal', ['Point', 'MultiPoint']]];
++
++				if (created.getSource(id)) return;
++
++				created.addSource(id, {
++					data: {
++						features: layer.features,
++						type: 'FeatureCollection'
++					} as GeoJSON.FeatureCollection,
++					type: 'geojson'
++				});
++				created.addLayer({
++					filter: polygons as never,
++					id: `${id}-fill`,
++					paint: { 'fill-color': color, 'fill-opacity': 0.15 },
++					source: id,
++					type: 'fill'
++				});
++				created.addLayer({
++					filter: lines as never,
++					id: `${id}-line`,
++					paint: {
++						'line-color': color,
++						'line-width': 2,
++						...(layer.drawn ? { 'line-dasharray': [3, 2] } : {})
++					},
++					source: id,
++					type: 'line'
++				});
++				created.addLayer({
++					filter: points as never,
++					id: `${id}-point`,
++					paint: {
++						'circle-color': color,
++						'circle-opacity': 0.85,
++						'circle-radius': 5,
++						'circle-stroke-color': '#ffffff',
++						'circle-stroke-width': 1
++					},
++					source: id,
++					type: 'circle'
++				});
++
++				for (const part of ['fill', 'line', 'point']) {
++					created.on('click', `${id}-${part}`, (event) => {
++						const feature = event.features?.[0];
++
++						if (!feature) return;
++
++						new maplibregl.Popup({ maxWidth: '320px' })
++							.setLngLat(event.lngLat)
++							.setHTML(popup((feature.properties ?? {}) as Record<string, unknown>, layer))
++							.addTo(created);
++					});
++					created.on(
++						'mouseenter',
++						`${id}-${part}`,
++						() => (created.getCanvas().style.cursor = 'pointer')
++					);
++					created.on('mouseleave', `${id}-${part}`, () => (created.getCanvas().style.cursor = ''));
++				}
++			});
++		});
++
++		const box = bounds(layers);
++
++		if (box) created.fitBounds(box, { duration: 0, maxZoom: 17, padding: 20 });
++		else created.jumpTo({ center: [0, 0], zoom: 1 });
++	});
++
++	onDestroy(() => {
++		destroyed = true;
++		map?.remove();
++	});
++
++	function exportGeojson() {
++		const file = bundle(geojsonFiles(layers));
++
++		if (file) download(file.name, file.data, file.type);
++	}
++</script>
++
++<div class="grid gap-1.5">
++	<div class="w-full overflow-hidden rounded-lg {enlarged ? 'h-[460px]' : 'h-56'}">
++		<div bind:this={element} class="h-full w-full"></div>
++	</div>
++
++	<div class="flex flex-wrap items-start justify-between gap-2 text-[11px] text-muted-foreground">
++		<span class="flex flex-wrap gap-3">
++			{#each layers as layer, index (index)}
++				<span class="inline-flex items-center gap-1">
++					<span
++						class="inline-block h-2 w-2 rounded-full"
++						style="background:{COLORS[index % COLORS.length]}"
++					></span>
++
++					{#if layer.link?.url && /^https?:\/\//.test(layer.link.url)}
++						<a
++							class="underline-offset-2 hover:underline"
++							href={layer.link.url}
++							rel="noopener noreferrer"
++							target="_blank">{layer.title ?? layer.link.title ?? 'Layer'}</a
++						>
++					{:else}
++						{layer.title ?? 'Layer'}
++					{/if}{layer.complete === false ? ' (partial)' : ''}{layer.drawn ? ' (approximate)' : ''}
++					{#if layer.subtitle}<span class="opacity-75">{layer.subtitle}</span>{/if}
++				</span>
++			{/each}
++		</span>
++
++		<span class="flex items-center gap-3">
++			<ToshResize {enlarged} onclick={resize} />
++
++			<button
++				class="hover:text-foreground"
++				onclick={exportGeojson}
++				title="One .geojson file per layer and kind of geometry, as GIS import tools take them"
++				>GeoJSON</button
++			>
++		</span>
++	</div>
++</div>
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshPanel.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshPanel.svelte
+new file mode 100644
+index 000000000..7977dfe56
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshPanel.svelte
+@@ -0,0 +1,110 @@
++<script lang="ts">
++	import ToshMap from './ToshMap.svelte';
++	import ToshSketches from './ToshSketches.svelte';
++	import Waypoints from '@lucide/svelte/icons/waypoints';
++	import { CollapsibleContentBlock } from '$lib/components/app';
++	import { DatabaseService } from '$lib/services';
++	import { conversationsStore } from '$lib/stores';
++	import { fetchMap } from '$lib/tosh/map';
++	import type { DatabaseMessage, ToshCall, ToshMapLayer } from '$lib/types';
++
++	interface Props {
++		message: DatabaseMessage;
++	}
++
++	let { message }: Props = $props();
++
++	let stepsOpen = $state(false);
++	let loading = $state(false);
++	let failed = $state(false);
++
++	let tosh = $derived(message.tosh);
++	let steps = $derived(tosh?.steps ?? []);
++
++	// an agent reports a call's state, or only its status
++	function stepFailed(step: ToshCall): boolean {
++		return step.state ? step.state !== 'completed' : !!step.status && step.status !== 'ok';
++	}
++
++	function question(): string {
++		const parent = conversationsStore.activeMessages.find((m) => m.id === message.parent);
++
++		return parent?.content ?? '';
++	}
++
++	async function loadMap() {
++		if (!tosh?.mapRequest || loading) return;
++
++		loading = true;
++		failed = false;
++		const layers: ToshMapLayer[] | null = await fetchMap(
++			$state.snapshot(tosh.mapRequest),
++			question()
++		);
++
++		loading = false;
++
++		if (!layers) {
++			failed = true;
++
++			return;
++		}
++
++		const updated = { ...$state.snapshot(tosh), map: { layers } };
++
++		conversationsStore.updateMessageAtIndex(conversationsStore.findMessageIndex(message.id), {
++			tosh: updated
++		});
++		await DatabaseService.updateMessage(message.id, { tosh: updated });
++	}
++
++	$effect(() => {
++		if (tosh?.mapRequest?.show && !tosh.map && !loading && !failed) loadMap();
++	});
++</script>
++
++{#if tosh}
++	<div class="mt-3 grid gap-3">
++		{#if steps.length}
++			<CollapsibleContentBlock
++				icon={Waypoints}
++				onToggle={() => (stepsOpen = !stepsOpen)}
++				open={stepsOpen}
++				subtitle={steps[steps.length - 1]?.summary ?? ''}
++				title={`Agent steps (${steps.length})`}
++			>
++				<ol class="grid gap-1.5 text-xs text-muted-foreground">
++					{#each steps as step, index (step.id ?? index)}
++						<li class="flex gap-2">
++							<span class="tabular-nums">{index + 1}.</span>
++
++							<span class={stepFailed(step) ? 'text-destructive' : ''}>
++								{step.summary || step.tool}
++							</span>
++						</li>
++					{/each}
++				</ol>
++			</CollapsibleContentBlock>
++		{/if}
++
++		{#if tosh.sketches?.length}
++			<ToshSketches sketches={tosh.sketches} />
++		{/if}
++
++		{#if tosh.map}
++			<ToshMap layers={tosh.map.layers} />
++		{:else if tosh.mapRequest}
++			<button
++				class="w-fit text-xs text-primary underline-offset-2 hover:underline disabled:opacity-50"
++				disabled={loading}
++				onclick={loadMap}
++			>
++				{loading
++					? 'Loading the map…'
++					: failed
++						? 'The map could not be loaded. Retry'
++						: 'Show on a map'}
++			</button>
++		{/if}
++	</div>
++{/if}
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshResize.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshResize.svelte
+new file mode 100644
+index 000000000..f58a6b59d
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshResize.svelte
+@@ -0,0 +1,23 @@
++<script lang="ts">
++	import Maximize2 from '@lucide/svelte/icons/maximize-2';
++	import Minimize2 from '@lucide/svelte/icons/minimize-2';
++
++	interface Props {
++		enlarged: boolean;
++		onclick: () => void;
++	}
++
++	let { enlarged, onclick }: Props = $props();
++</script>
++
++<button
++	class="text-muted-foreground hover:text-foreground"
++	{onclick}
++	title={enlarged ? 'Make smaller' : 'Enlarge'}
++>
++	{#if enlarged}
++		<Minimize2 class="h-3.5 w-3.5" />
++	{:else}
++		<Maximize2 class="h-3.5 w-3.5" />
++	{/if}
++</button>
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshSketch.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshSketch.svelte
+new file mode 100644
+index 000000000..891c7270c
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshSketch.svelte
+@@ -0,0 +1,80 @@
++<script lang="ts">
++	import ToshResize from './ToshResize.svelte';
++	import { download, fileStem } from '$lib/tosh/download';
++	import { csv, dxf, figure, gap, isOpen, notice, png, svg } from '$lib/tosh/sketch';
++	import { shapefile } from '$lib/tosh/shapefile';
++	import type { ToshSketch } from '$lib/types';
++
++	interface Props {
++		sketch: ToshSketch;
++		enlarged: boolean;
++		onResize: () => void;
++	}
++
++	let { enlarged, onResize, sketch }: Props = $props();
++
++	// drawn at about the size it shows, so its numbers keep their size
++	let drawing = $derived(
++		svg(sketch, enlarged ? 640 : 320, enlarged ? 360 : 220, {
++			line: '#3b82f6',
++			text: 'currentColor'
++		})
++	);
++	let stem = $derived(fileStem(sketch.title, 'sketch'));
++
++	async function savePng() {
++		const blob = await png(sketch);
++
++		if (blob) download(`${stem}.png`, blob, 'image/png');
++	}
++</script>
++
++<div class="grid gap-1.5">
++	<div class="flex items-center justify-between gap-2">
++		<div class="text-xs font-medium {enlarged ? '' : 'truncate'}">{sketch.title ?? ''}</div>
++
++		<ToshResize {enlarged} onclick={onResize} />
++	</div>
++
++	<div
++		class="overflow-hidden rounded-lg bg-muted/40 text-foreground [&_svg]:h-full [&_svg]:w-full {enlarged
++			? 'h-96'
++			: 'h-44'}"
++		title="Sketch from the answer's data: point 1 is the start and each leg runs to the next number."
++	>
++		<!-- eslint-disable-next-line svelte/no-at-html-tags -->
++		{@html drawing}
++	</div>
++
++	<div class="flex flex-wrap items-start justify-between gap-2 text-[11px] text-muted-foreground">
++		<span>
++			{sketch.plane && sketch.origin
++				? `Sketch in ${sketch.plane}`
++				: 'Sketch, not placed on a map'}{#if isOpen(sketch)}{` · in red, what it lacks to close: ${figure(
++					gap(sketch)
++				)} ${sketch.unit}`}{/if}{#if notice(sketch)}{` · ${notice(sketch)}`}{/if}
++		</span>
++
++		<span class="flex gap-3">
++			<button class="hover:text-foreground" onclick={savePng}>PNG</button>
++
++			<button
++				class="hover:text-foreground"
++				onclick={() => download(`${stem}.dxf`, dxf(sketch), 'application/dxf')}
++				title="For CAD and GIS applications, from point 1">DXF</button
++			>
++
++			<button
++				class="hover:text-foreground"
++				onclick={() => download(`${stem}.csv`, csv(sketch), 'text/csv')}>Corners CSV</button
++			>
++
++			<button
++				class="hover:text-foreground"
++				onclick={() => download(`${stem}.zip`, shapefile(sketch, stem), 'application/zip')}
++				title="Shapefile in a ZIP, with its coordinate system when the figure has one"
++				>Shapefile</button
++			>
++		</span>
++	</div>
++</div>
+diff --git a/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshSketches.svelte b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshSketches.svelte
+new file mode 100644
+index 000000000..7690999bd
+--- /dev/null
++++ b/tools/ui/src/lib/components/app/chat/ChatMessages/ChatMessage/ChatMessageAssistant/ToshSketches.svelte
+@@ -0,0 +1,31 @@
++<script lang="ts">
++	import ToshSketch from './ToshSketch.svelte';
++	import type { ToshSketch as Sketch } from '$lib/types';
++
++	interface Props {
++		sketches: Sketch[];
++	}
++
++	let { sketches }: Props = $props();
++
++	// small and several to a row; one at a time enlarged above the rest
++	let enlarged = $state<number | null>(null);
++</script>
++
++<div class="grid gap-3">
++	{#if enlarged !== null && sketches[enlarged]}
++		<ToshSketch enlarged onResize={() => (enlarged = null)} sketch={sketches[enlarged]} />
++	{/if}
++
++	<div
++		class={sketches.length > 1
++			? 'grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3'
++			: 'grid'}
++	>
++		{#each sketches as sketch, index (index)}
++			{#if index !== enlarged}
++				<ToshSketch enlarged={false} onResize={() => (enlarged = index)} {sketch} />
++			{/if}
++		{/each}
++	</div>
++</div>
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index b008b16db..569a3e910 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -29,17 +29,21 @@ import {
+ 	AttachmentType,
+ 	ContentPartType,
+ 	MessageRole,
+ 	ReasoningFormat,
+ 	StreamConnectionState
+ } from '$lib/enums';
+ import { modelsStore } from '$lib/stores/models/index.svelte';
+ import { settingsStore } from '$lib/stores/settings/index.svelte';
+-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
++import type {
++	DatabaseMessageExtraMcpPrompt,
++	DatabaseMessageExtraMcpResource,
++	ToshChunk
++} from '$lib/types';
+ import type {
+ 	ApiChatCompletionToolCall,
+ 	ApiChatMessageContentPart,
+ 	ApiChatMessageData,
+ 	ApiStreamSession
+ } from '$lib/types/api';
+ import { isAbortError } from '$lib/utils/abort';
+ import { ApiError } from '$lib/utils/api-fetch';
+@@ -387,17 +391,18 @@ export class ChatService {
+ 			await ChatService.sendMessage(
+ 				[message],
+ 				{
+ 					custom: { chat_template_kwargs: { enable_thinking: false } },
+ 					model: model || undefined,
+ 					onChunk: (chunk: string) => {
+ 						titleResponse += chunk;
+ 					},
+-					stream: true
++					stream: true,
++					toshAgent: 'off'
+ 				},
+ 				undefined,
+ 				signal
+ 			);
+ 		} catch {
+ 			return '';
+ 		}
+ 
+@@ -438,17 +443,18 @@ export class ChatService {
+ 		onReasoningChunk?: (chunk: string) => void,
+ 		onToolCallChunk?: (chunk: string) => void,
+ 		onModel?: (model: string) => void,
+ 		onCompletionId?: (id: string) => void,
+ 		onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void,
+ 		conversationId?: string,
+ 		abortSignal?: AbortSignal,
+ 		onConnectionState?: (state: StreamConnectionState) => void,
+-		streamModel?: string | null
++		streamModel?: string | null,
++		onTosh?: (tosh: ToshChunk) => void
+ 	): Promise<void> {
+ 		let reader = response.body?.getReader();
+ 
+ 		if (!reader) {
+ 			throw new Error('No response body');
+ 		}
+ 
+ 		// bytesParsed is the absolute server side buffer offset of the next byte to parse
+@@ -619,16 +625,24 @@ export class ChatService {
+ 							if (data === SSE_DONE_MARKER) {
+ 								streamFinished = true;
+ 
+ 								continue;
+ 							}
+ 
+ 							try {
+ 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
++
++								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
++								if (parsed.tosh && typeof parsed.tosh === 'object') {
++									if (parsed.tosh.event?.type === 'retract') aggregatedContent = '';
++
++									if (!abortSignal?.aborted) onTosh?.(parsed.tosh);
++								}
++
+ 								const choice = parsed.choices?.[0];
+ 								const content = choice?.delta?.content;
+ 								const reasoningContent = choice?.delta?.reasoning_content;
+ 								const toolCalls = choice?.delta?.tool_calls;
+ 								const timings = parsed.timings;
+ 								const promptProgress = parsed.prompt_progress;
+ 								const chunkModel = ChatService.extractModelName(parsed);
+ 
+@@ -1047,31 +1061,33 @@ export class ChatService {
+ 			onComplete,
+ 			onCompletionId,
+ 			onConnectionState,
+ 			onError,
+ 			onModel,
+ 			onReasoningChunk,
+ 			onTimings,
+ 			onToolCallChunk,
++			onTosh,
+ 			presence_penalty,
+ 			reasoningEffort,
+ 			// Penalty parameters
+ 			repeat_last_n,
+ 			repeat_penalty,
+ 			// Other parameters
+ 			samplers,
+ 			stream,
+ 			// Generation parameters
+ 			temperature,
+ 			timings_per_token,
+ 			// Tools for function calling
+ 			tools,
+ 			top_k,
+ 			top_p,
++			toshAgent,
+ 			typ_p,
+ 			xtc_probability,
+ 			xtc_threshold
+ 		} = options;
+ 		const normalizedMessages: ApiChatMessageData[] =
+ 			await ChatService.normalizeMessagesForApi(messages);
+ 
+ 		// Filter out image attachments if the model doesn't support vision
+@@ -1215,16 +1231,18 @@ export class ChatService {
+ 			} catch (error) {
+ 				console.warn('Failed to parse custom parameters:', error);
+ 			}
+ 		}
+ 
+ 		try {
+ 			const headers: Record<string, string> = { ...getJsonHeaders() };
+ 
++			if (toshAgent) headers['X-Tosh-Agent'] = toshAgent;
++
+ 			// tag streaming requests with the conversation id, this single header is the opt in for the
+ 			// server side replay buffer and powers discoverActiveStream on tab reopen. with an explicit
+ 			// model the ::model suffix keeps the per model session distinct
+ 			if (stream && conversationId) {
+ 				headers[HEADERS.X_CONVERSATION_ID_HEADER] = streamIdentity(conversationId, options.model);
+ 				// persist the pending stream before the fetch: a reload during the model load or
+ 				// the prompt processing must still find its way back to the session once it exists
+ 				ChatService.saveStreamState(conversationId, 0, options.model ?? null);
+@@ -1262,17 +1280,18 @@ export class ChatService {
+ 					onReasoningChunk,
+ 					onToolCallChunk,
+ 					onModel,
+ 					onCompletionId,
+ 					onTimings,
+ 					conversationId,
+ 					signal,
+ 					onConnectionState,
+-					options.model
++					options.model,
++					onTosh
+ 				);
+ 
+ 				return;
+ 			} else {
+ 				return ChatService.handleNonStreamResponse(
+ 					response,
+ 					onComplete,
+ 					onError,
+diff --git a/tools/ui/src/lib/stores/agentic/index.svelte.ts b/tools/ui/src/lib/stores/agentic/index.svelte.ts
+index 121ee7739..9defecd6d 100644
+--- a/tools/ui/src/lib/stores/agentic/index.svelte.ts
++++ b/tools/ui/src/lib/stores/agentic/index.svelte.ts
+@@ -32,16 +32,17 @@ import { ChatService } from '$lib/services';
+ import { ReadMediaService } from '$lib/services/read-media.service';
+ import { SandboxService } from '$lib/services/sandbox.service';
+ import { ToolsService } from '$lib/services/tools.service';
+ // direct imports between stores, not via the barrel, to avoid circular deps
+ import { AgenticGates } from '$lib/stores/agentic/gates.svelte';
+ import { conversationsStore } from '$lib/stores/conversations/index.svelte';
+ import { mcpStore } from '$lib/stores/mcp/index.svelte';
+ import { modelsStore } from '$lib/stores/models/index.svelte';
++import { serverStore } from '$lib/stores/server.svelte';
+ import { settingsStore } from '$lib/stores/settings/index.svelte';
+ import { toolsStore } from '$lib/stores/tools.svelte';
+ import type {
+ 	AgenticConfig,
+ 	AgenticFlowParams,
+ 	AgenticFlowResult,
+ 	AgenticSession,
+ 	MCPToolCall,
+@@ -197,21 +198,23 @@ class AgenticStore {
+ 			if (session.isRunning) active.push({ conversationId, session });
+ 		}
+ 
+ 		return active;
+ 	}
+ 
+ 	getConfig(settings: SettingsConfigType): AgenticConfig {
+ 		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
++		const ownTools = mcpStore.hasEnabledServers() || toolsStore.customTools.length > 0;
++
++		// a server with a Tosh agent runs its tools itself for requests that bring none, unless the user added theirs
++		if (serverStore.props?.tosh_agent && !ownTools) return { enabled: false, maxTurns };
++
+ 		const hasTools =
+-			mcpStore.hasEnabledServers() ||
+-			toolsStore.serverTools.length > 0 ||
+-			toolsStore.browserTools.length > 0 ||
+-			toolsStore.customTools.length > 0;
++			ownTools || toolsStore.serverTools.length > 0 || toolsStore.browserTools.length > 0;
+ 
+ 		return {
+ 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
+ 			maxTurns
+ 		};
+ 	}
+ 
+ 	getCurrentTurn(conversationId: string): number {
+diff --git a/tools/ui/src/lib/stores/chat/index.svelte.ts b/tools/ui/src/lib/stores/chat/index.svelte.ts
+index 4bdcc6845..c0f8c8353 100644
+--- a/tools/ui/src/lib/stores/chat/index.svelte.ts
++++ b/tools/ui/src/lib/stores/chat/index.svelte.ts
+@@ -33,17 +33,19 @@ import { settingsStore } from '$lib/stores/settings/index.svelte';
+ import { toolsStore } from '$lib/stores/tools.svelte';
+ import type {
+ 	ApiChatMessageData,
+ 	ChatMessagePromptProgress,
+ 	ChatMessageTimings,
+ 	ChatStreamCallbacks,
+ 	DatabaseMessage,
+ 	DatabaseMessageExtra,
+-	ErrorDialogState
++	ErrorDialogState,
++	ToshChunk,
++	ToshMessageData
+ } from '$lib/types';
+ import {
+ 	findMessageById,
+ 	formatCwdMessage,
+ 	getConversationModel,
+ 	isAbortError,
+ 	normalizeModelName
+ } from '$lib/utils';
+@@ -874,16 +876,47 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 			});
+ 		};
+ 		const updateStreamingUI = () => {
+ 			this.setChatStreaming(convId, streamedContent, currentMessageId, effectiveModel);
+ 			const idx = conversationsStore.findMessageIndex(currentMessageId);
+ 
+ 			conversationsStore.updateMessageAtIndex(idx, { content: streamedContent });
+ 		};
++
++		// what the server's Tosh agent reports: its steps while it works, its figures or a map request at the end
++		let tosh: ToshMessageData = {};
++
++		const recordTosh = (chunk: ToshChunk): void => {
++			const event = chunk.event;
++
++			if (event?.type === 'retract') {
++				streamedContent = '';
++				updateStreamingUI();
++
++				return;
++			}
++
++			if (event?.type === 'tool_call' && event.call) {
++				tosh = { ...tosh, steps: [...(tosh.steps ?? []), event.call] };
++			} else if (!event) {
++				tosh = {
++					...tosh,
++					...(chunk.sketches?.length ? { sketches: chunk.sketches } : {}),
++					...(chunk.map_request ? { mapRequest: chunk.map_request } : {})
++				};
++			} else {
++				return;
++			}
++
++			conversationsStore.updateMessageAtIndex(
++				conversationsStore.findMessageIndex(currentMessageId),
++				{ tosh }
++			);
++		};
+ 		const cleanupStreamingState = () => {
+ 			this.setChatLoading(convId, false);
+ 			this.clearChatStreaming(convId, currentMessageId);
+ 			this.processing.setState(convId, null);
+ 		};
+ 
+ 		this.processing.setActiveConversation(convId);
+ 		const abortController = this.getOrCreateAbortController(convId);
+@@ -1174,16 +1207,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 					const reasoning = streamedReasoningContent || reasoningContent;
+ 					const updateData: Record<string, unknown> = {
+ 						content,
+ 						reasoningContent: reasoning || undefined,
+ 						timings,
+ 						toolCalls: toolCalls || ''
+ 					};
+ 
++					if (Object.keys(tosh).length) updateData.tosh = tosh;
++
+ 					if (resolvedModel && !modelPersisted) updateData.model = resolvedModel;
+ 
+ 					await DatabaseService.updateMessage(currentMessageId, updateData);
+ 					const idx = conversationsStore.findMessageIndex(currentMessageId);
+ 					const uiUpdate: Partial<DatabaseMessage> = {
+ 						content,
+ 						reasoningContent: reasoning || undefined,
+ 						toolCalls: toolCalls || ''
+@@ -1219,16 +1254,17 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
+ 					if (convId === conversationsStore.activeConversation?.id) {
+ 						this.streamConnectionState = state;
+ 					}
+ 				},
+ 				onError: streamCallbacks.onError,
+ 				onModel: streamCallbacks.onModel,
+ 				onReasoningChunk: streamCallbacks.onReasoningChunk,
+ 				onTimings: streamCallbacks.onTimings,
++				onTosh: recordTosh,
+ 				stream: true
+ 			},
+ 			convId,
+ 			abortController.signal
+ 		);
+ 	}
+ 
+ 	syncLoadingStateForChat(convId: string): void {
+diff --git a/tools/ui/src/lib/tosh/download.ts b/tools/ui/src/lib/tosh/download.ts
+new file mode 100644
+index 000000000..213864fec
+--- /dev/null
++++ b/tools/ui/src/lib/tosh/download.ts
+@@ -0,0 +1,18 @@
++export function download(name: string, data: BlobPart, type: string): void {
++	const url = URL.createObjectURL(new Blob([data], { type }));
++	const link = document.createElement('a');
++
++	link.href = url;
++	link.download = name;
++	document.body.appendChild(link);
++	link.click();
++	link.remove();
++	setTimeout(() => URL.revokeObjectURL(url), 1000);
++}
++
++/** A name for a file from a title, without characters a file system refuses. */
++export function fileStem(title: string | undefined, fallback: string): string {
++	const cleaned = (title ?? '').replace(/[/:\\]/g, '-').trim();
++
++	return (cleaned || fallback).slice(0, 80);
++}
+diff --git a/tools/ui/src/lib/tosh/map.ts b/tools/ui/src/lib/tosh/map.ts
+new file mode 100644
+index 000000000..b654ecffa
+--- /dev/null
++++ b/tools/ui/src/lib/tosh/map.ts
+@@ -0,0 +1,232 @@
++import { fileStem } from './download';
++import { API_CHAT } from '$lib/constants';
++import type { ToshMapLayer, ToshMapRequest } from '$lib/types';
++import type { LngLatBoundsLike, StyleSpecification } from 'maplibre-gl';
++import { getJsonHeaders } from '$lib/utils/api-headers';
++import { strToU8, zipSync } from 'fflate';
++
++/** The features of an answer's map, fetched from the agent with the calls it kept; the model is not involved. */
++export async function fetchMap(
++	request: ToshMapRequest,
++	question: string
++): Promise<ToshMapLayer[] | null> {
++	try {
++		const response = await fetch(API_CHAT.COMPLETIONS, {
++			body: JSON.stringify({
++				messages: [{ content: question, role: 'user' }],
++				stream: false,
++				tosh: { map_request: request }
++			}),
++			headers: { ...getJsonHeaders(), 'X-Tosh-Agent': 'on' },
++			method: 'POST'
++		});
++
++		if (!response.ok) return null;
++
++		const layers = (await response.json())?.tosh?.map?.layers;
++
++		return Array.isArray(layers) && layers.length ? layers : null;
++	} catch {
++		return null;
++	}
++}
++
++const KINDS: [string, string[]][] = [
++	['polygons', ['Polygon', 'MultiPolygon']],
++	['lines', ['LineString', 'MultiLineString']],
++	['points', ['Point']],
++	['multipoints', ['MultiPoint']]
++];
++
++/** One GeoJSON file per layer and kind of geometry, as GIS import tools take one kind per run. */
++export function geojsonFiles(layers: ToshMapLayer[]): [string, string][] {
++	const files: [string, string][] = [];
++	const taken = new Set<string>();
++
++	layers.forEach((layer, index) => {
++		const title = layer.title ?? 'map';
++		const features = (layer.features ?? []) as {
++			geometry?: { type?: string };
++			properties?: object;
++		}[];
++		const groups = KINDS.map(([, types]) =>
++			features.filter((f) => types.includes(f.geometry?.type ?? ''))
++		);
++		const used = groups.filter((g) => g.length).length;
++
++		groups.forEach((group, k) => {
++			if (!group.length) return;
++
++			const collection = {
++				features: group.map((f) => ({
++					...f,
++					properties: { ...(f.properties ?? {}), layer: title }
++				})),
++				type: 'FeatureCollection'
++			};
++
++			let stem = fileStem(title, 'map') + (used > 1 ? ` - ${KINDS[k][0]}` : '');
++
++			if (taken.has(stem)) stem += ` ${index + 1}`;
++
++			taken.add(stem);
++			files.push([`${stem}.geojson`, JSON.stringify(collection, null, 2)]);
++		});
++	});
++
++	return files;
++}
++
++/** The files as one download: the file itself when there is one, else a ZIP of them all. */
++export function bundle(
++	files: [string, string][]
++): { name: string; data: BlobPart; type: string } | null {
++	if (!files.length) return null;
++
++	if (files.length === 1)
++		return { data: files[0][1], name: files[0][0], type: 'application/geo+json' };
++
++	const zipped = zipSync(Object.fromEntries(files.map(([name, text]) => [name, strToU8(text)])));
++
++	return { data: zipped, name: 'map.zip', type: 'application/zip' };
++}
++
++const OPEN_FREE_MAP = 'https://tiles.openfreemap.org/styles/liberty';
++const PROTOMAPS_ATTRIBUTION =
++	'<a href="https://protomaps.com">Protomaps</a> © <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>';
++
++let pmtilesProtocol = false;
++
++/** A plain ground, for a map with no base map or one that could not load. */
++export function ground(dark: boolean): StyleSpecification {
++	return {
++		layers: [
++			{
++				id: 'ground',
++				paint: { 'background-color': dark ? '#1f2937' : '#f3f4f6' },
++				type: 'background'
++			}
++		],
++		sources: {},
++		version: 8
++	};
++}
++
++/**
++ * The base map the server names in its ui settings: its PMTiles regions, drawn with the Protomaps style and the
++ * fonts and sprites next to them, which need no internet (without labels when mapLabels is false, for a folder that
++ * lacks them); a style of its own, or none for a plain ground; or OpenFreeMap online. An entry ending in .json is
++ * an index the server keeps, {"regions": [files next to it], "labels": bool}, read each time a map opens so regions
++ * added while it runs show without a restart.
++ */
++export async function baseStyle(
++	maplibregl: typeof import('maplibre-gl'),
++	settings: Record<string, string | number | boolean>,
++	dark: boolean
++): Promise<string | StyleSpecification> {
++	const listed = String(settings.mapRegions ?? '')
++		.split(',')
++		.map((r) => r.trim())
++		.filter(Boolean);
++	const regions: string[] = [];
++	let labels = settings.mapLabels !== false;
++
++	for (const entry of listed) {
++		const url = new URL(entry, location.href);
++
++		if (!/\.json$/i.test(url.pathname)) {
++			regions.push(url.href);
++			continue;
++		}
++
++		try {
++			const index = await (await fetch(url, { cache: 'no-store' })).json();
++
++			for (const file of index.regions ?? []) regions.push(new URL(String(file), url).href);
++			if (index.labels === false) labels = false;
++		} catch {
++			// an index that cannot be read adds no region
++		}
++	}
++
++	if (!regions.length) {
++		if (settings.mapStyle === 'none') return ground(dark);
++
++		return String(settings.mapStyle || OPEN_FREE_MAP);
++	}
++
++	const { Protocol } = await import('pmtiles');
++	const { layers, namedFlavor } = await import('@protomaps/basemaps');
++
++	if (!pmtilesProtocol) {
++		maplibregl.addProtocol('pmtiles', new Protocol().tile);
++		pmtilesProtocol = true;
++	}
++
++	const assets = new URL(String(settings.mapAssets || '/tiles/assets'), location.href).href.replace(
++		/\/$/,
++		''
++	);
++	const flavor = dark ? 'dark' : 'light';
++	const lang = (navigator.language || 'en').slice(0, 2);
++	const sources: StyleSpecification['sources'] = {};
++	const drawn: StyleSpecification['layers'] = [];
++
++	regions.forEach((region, index) => {
++		const name = `region${index}`;
++
++		sources[name] = {
++			attribution: PROTOMAPS_ATTRIBUTION,
++			type: 'vector',
++			url: 'pmtiles://' + region
++		};
++		// one ground for all the regions, under every one of them
++		for (const layer of layers(name, namedFlavor(flavor), { lang })) {
++			if (index > 0 && layer.type === 'background') continue;
++			if (!labels && layer.type === 'symbol') continue;
++			drawn.push({ ...layer, id: `${name}-${layer.id}` } as StyleSpecification['layers'][number]);
++		}
++	});
++
++	if (!labels) return { layers: drawn, sources, version: 8 };
++
++	return {
++		glyphs: `${assets}/fonts/{fontstack}/{range}.pbf`,
++		layers: drawn,
++		sources,
++		sprite: `${assets}/sprites/v4/${flavor}`,
++		version: 8
++	};
++}
++
++/** The box around every feature of the layers, or null when they hold none. */
++export function bounds(layers: ToshMapLayer[]): LngLatBoundsLike | null {
++	let west = Infinity,
++		south = Infinity,
++		east = -Infinity,
++		north = -Infinity;
++
++	const visit = (value: unknown) => {
++		if (!Array.isArray(value)) return;
++
++		if (typeof value[0] === 'number' && typeof value[1] === 'number') {
++			west = Math.min(west, value[0]);
++			east = Math.max(east, value[0]);
++			south = Math.min(south, value[1]);
++			north = Math.max(north, value[1]);
++		} else value.forEach(visit);
++	};
++
++	for (const layer of layers) {
++		for (const feature of (layer.features ?? []) as { geometry?: { coordinates?: unknown } }[]) {
++			visit(feature.geometry?.coordinates);
++		}
++	}
++
++	return west === Infinity
++		? null
++		: [
++				[west, south],
++				[east, north]
++			];
++}
+diff --git a/tools/ui/src/lib/tosh/shapefile.ts b/tools/ui/src/lib/tosh/shapefile.ts
+new file mode 100644
+index 000000000..a1f6515be
+--- /dev/null
++++ b/tools/ui/src/lib/tosh/shapefile.ts
+@@ -0,0 +1,226 @@
++import type { ToshSketch } from '$lib/types';
++import { notice, placed } from '$lib/tosh/sketch';
++
++const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
++	let c = n;
++
++	for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
++
++	return c >>> 0;
++});
++
++export function crc32(data: Uint8Array): number {
++	let c = 0xffffffff;
++
++	for (const byte of data) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
++
++	return (c ^ 0xffffffff) >>> 0;
++}
++
++class Bytes {
++	private parts: number[] = [];
++
++	get length(): number {
++		return this.parts.length;
++	}
++
++	u8(...values: number[]): this {
++		this.parts.push(...values.map((v) => v & 0xff));
++
++		return this;
++	}
++
++	le16(value: number): this {
++		return this.u8(value, value >>> 8);
++	}
++
++	le32(value: number): this {
++		return this.u8(value, value >>> 8, value >>> 16, value >>> 24);
++	}
++
++	be32(value: number): this {
++		return this.u8(value >>> 24, value >>> 16, value >>> 8, value);
++	}
++
++	double(value: number): this {
++		const view = new DataView(new ArrayBuffer(8));
++
++		view.setFloat64(0, value, true);
++
++		return this.u8(...new Uint8Array(view.buffer));
++	}
++
++	bytes(data: Uint8Array | Bytes): this {
++		const values = data instanceof Bytes ? data.parts : Array.from(data);
++
++		for (const v of values) this.parts.push(v);
++
++		return this;
++	}
++
++	array(): Uint8Array<ArrayBuffer> {
++		return Uint8Array.from(this.parts);
++	}
++}
++
++/** A ZIP of files stored without compression, which every unzip tool reads. */
++export function storedZip(files: { name: string; data: Uint8Array }[]): Uint8Array<ArrayBuffer> {
++	const out = new Bytes();
++	const directory = new Bytes();
++
++	for (const file of files) {
++		const name = new TextEncoder().encode(file.name);
++		const offset = out.length;
++		// UTF-8 names, and 1 January 1980 as the date
++		const shared = new Bytes()
++			.le16(20)
++			.le16(0x0800)
++			.le16(0)
++			.le16(0)
++			.le16(0x21)
++			.le32(crc32(file.data))
++			.le32(file.data.length)
++			.le32(file.data.length)
++			.le16(name.length)
++			.le16(0);
++
++		out.le32(0x04034b50).bytes(shared).bytes(name).bytes(file.data);
++		directory
++			.le32(0x02014b50)
++			.le16(20)
++			.bytes(shared)
++			.le16(0)
++			.le16(0)
++			.le16(0)
++			.le32(0)
++			.le32(offset)
++			.bytes(name);
++	}
++
++	const start = out.length;
++
++	out
++		.bytes(directory)
++		.le32(0x06054b50)
++		.le16(0)
++		.le16(0)
++		.le16(files.length)
++		.le16(files.length)
++		.le32(directory.length)
++		.le32(start)
++		.le16(0);
++
++	return out.array();
++}
++
++/** A dBase table of one record with a text field per value, cut at a character boundary to fit. */
++function table(fields: [string, string][]): Uint8Array {
++	const width = 254;
++	const today = new Date();
++	const out = new Bytes()
++		.u8(0x03, today.getFullYear() - 1900, today.getMonth() + 1, today.getDate())
++		.le32(1)
++		.le16(32 + 32 * fields.length + 1)
++		.le16(1 + width * fields.length)
++		.bytes(new Uint8Array(20));
++
++	for (const [name] of fields) {
++		const encoded = new TextEncoder().encode(name).slice(0, 10);
++
++		out
++			.bytes(encoded)
++			.bytes(new Uint8Array(11 - encoded.length))
++			.u8('C'.charCodeAt(0), 0, 0, 0, 0, width, 0)
++			.bytes(new Uint8Array(14));
++	}
++
++	out.u8(0x0d, 0x20);
++
++	for (const [, value] of fields) {
++		const kept: number[] = [];
++
++		for (const character of value) {
++			const next = new TextEncoder().encode(character);
++
++			if (kept.length + next.length > width) break;
++
++			kept.push(...next);
++		}
++
++		out.u8(...kept).bytes(new Uint8Array(width - kept.length).fill(0x20));
++	}
++
++	return out.u8(0x1a).array();
++}
++
++/**
++ * The figure as a shapefile in a ZIP: a polygon when it should close, else a line, at its coordinates and with its
++ * coordinate system as the .prj when it has them, and its title and notice as attributes.
++ */
++export function shapefile(sketch: ToshSketch, stem: string): Uint8Array<ArrayBuffer> {
++	const path = sketch.points.map((p) => placed(sketch, p));
++
++	if (sketch.closed) {
++		const first = path[0];
++		const last = path[path.length - 1];
++
++		if (first[0] !== last[0] || first[1] !== last[1]) path.push(first);
++
++		// an outer ring runs clockwise
++		let doubled = 0;
++
++		for (let i = 0; i + 1 < path.length; i++) {
++			doubled += path[i][0] * path[i + 1][1] - path[i + 1][0] * path[i][1];
++		}
++
++		if (doubled > 0) path.reverse();
++	}
++
++	const xs = path.map((p) => p[0]);
++	const ys = path.map((p) => p[1]);
++	const box = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
++	const type = sketch.closed ? 5 : 3;
++	const record = new Bytes().le32(type);
++
++	box.forEach((v) => record.double(v));
++	record.le32(1).le32(path.length).le32(0);
++	path.forEach((p) => record.double(p[0]).double(p[1]));
++
++	const header = (bytes: number) => {
++		const out = new Bytes().be32(9994);
++
++		for (let i = 0; i < 5; i++) out.be32(0);
++
++		out
++			.be32(bytes / 2)
++			.le32(1000)
++			.le32(type);
++		[...box, 0, 0, 0, 0].forEach((v) => out.double(v));
++
++		return out;
++	};
++	const shp = header(100 + 8 + record.length)
++		.be32(1)
++		.be32(record.length / 2)
++		.bytes(record);
++	const shx = header(100 + 8)
++		.be32(50)
++		.be32(record.length / 2);
++	const note = notice(sketch);
++	const fields: [string, string][] = [['NAME', sketch.title ?? '']];
++
++	if (note) fields.push(['NOTE', note]);
++
++	const files = [
++		{ name: `${stem}.shp`, data: shp.array() },
++		{ name: `${stem}.shx`, data: shx.array() },
++		{ name: `${stem}.dbf`, data: table(fields) },
++		{ name: `${stem}.cpg`, data: new TextEncoder().encode('UTF-8') }
++	];
++
++	if (sketch.prj && sketch.origin) {
++		files.push({ name: `${stem}.prj`, data: new TextEncoder().encode(sketch.prj) });
++	}
++
++	return storedZip(files);
++}
+diff --git a/tools/ui/src/lib/tosh/sketch.ts b/tools/ui/src/lib/tosh/sketch.ts
+new file mode 100644
+index 000000000..71f833bfa
+--- /dev/null
++++ b/tools/ui/src/lib/tosh/sketch.ts
+@@ -0,0 +1,326 @@
++import type { ToshSketch } from '$lib/types';
++
++/** How far the last point ends from the first, in the sketch's unit. */
++export function gap(sketch: ToshSketch): number {
++	const first = sketch.points[0];
++	const last = sketch.points[sketch.points.length - 1];
++
++	return Math.hypot(last[0] - first[0], last[1] - first[1]);
++}
++
++export function span(sketch: ToshSketch): number {
++	const xs = sketch.points.map((p) => p[0]);
++	const ys = sketch.points.map((p) => p[1]);
++
++	return Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
++}
++
++export function notice(sketch: ToshSketch): string | null {
++	return sketch.notice?.trim() || null;
++}
++
++export function isOpen(sketch: ToshSketch): boolean {
++	return sketch.closed && gap(sketch) > span(sketch) * 1e-4;
++}
++
++/** The points to number: the corners, without the last one of a closed figure, which is its first again. */
++/** A point where an export writes it: at the figure's coordinates when it has an origin, else from its first point. */
++export function placed(sketch: ToshSketch, point: number[]): number[] {
++	const origin = sketch.origin?.length === 2 ? sketch.origin : null;
++
++	return origin ? [point[0] + origin[0], point[1] + origin[1]] : point;
++}
++
++export function corners(sketch: ToshSketch): number[][] {
++	const all = sketch.corners ?? sketch.points;
++
++	return sketch.closed ? all.slice(0, -1) : all;
++}
++
++/** A round length near a quarter of the figure, for the scale bar. */
++export function scaleLength(sketch: ToshSketch): number {
++	const target = Math.max(span(sketch) / 4, 1e-9);
++	const power = 10 ** Math.floor(Math.log10(target));
++
++	return (
++		[1, 2, 5, 10]
++			.map((m) => m * power)
++			.filter((v) => v <= target)
++			.pop() ?? power
++	);
++}
++
++export function figure(value: number): string {
++	return value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
++}
++
++/** The figure as an SVG drawing of the given size: north up, numbered corners, the gap left open in red. */
++export function svg(
++	sketch: ToshSketch,
++	width: number,
++	height: number,
++	colors: { line: string; text: string }
++): string {
++	const marked = sketch.corners ?? sketch.points;
++	const all = [...sketch.points, ...marked];
++	const xs = all.map((p) => p[0]);
++	const ys = all.map((p) => p[1]);
++	const [minX, maxX, minY, maxY] = [
++		Math.min(...xs),
++		Math.max(...xs),
++		Math.min(...ys),
++		Math.max(...ys)
++	];
++	const inset = 34;
++	const scale = Math.min(
++		(width - 2 * inset) / Math.max(maxX - minX, 1e-9),
++		(height - 2 * inset) / Math.max(maxY - minY, 1e-9)
++	);
++	const offsetX = (width - (maxX - minX) * scale) / 2;
++	const offsetY = (height - (maxY - minY) * scale) / 2;
++	const place = (p: number[]) => [
++		offsetX + (p[0] - minX) * scale,
++		height - offsetY - (p[1] - minY) * scale
++	];
++	const path = sketch.points.map(
++		(p, i) => `${i ? 'L' : 'M'}${place(p)[0].toFixed(1)},${place(p)[1].toFixed(1)}`
++	);
++	const parts = [
++		`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" font-family="system-ui, sans-serif">`,
++		`<path d="${path.join('')}" fill="none" stroke="${colors.line}" stroke-width="2"/>`
++	];
++
++	if (isOpen(sketch)) {
++		const [x1, y1] = place(sketch.points[sketch.points.length - 1]);
++		const [x2, y2] = place(sketch.points[0]);
++
++		parts.push(
++			`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="#d33" stroke-width="2" stroke-dasharray="5 4"/>`,
++			`<circle cx="${x1}" cy="${y1}" r="4.5" fill="#d33"/>`
++		);
++	}
++
++	const labelled: number[][] = [];
++
++	corners(sketch).forEach((corner, index) => {
++		const [x, y] = place(corner);
++
++		parts.push(`<circle cx="${x}" cy="${y}" r="3.5" fill="${colors.line}"/>`);
++
++		if (index === 0) {
++			parts.push(
++				`<circle cx="${x}" cy="${y}" r="7.5" fill="none" stroke="${colors.text}" stroke-width="1.5"/>`
++			);
++		}
++
++		// a number that would cover another is left out; the figure enlarged has room for more
++		if (index > 0 && labelled.some(([lx, ly]) => Math.hypot(lx - x, ly - y) < 16)) return;
++
++		labelled.push([x, y]);
++		parts.push(
++			`<text x="${x + 9}" y="${y - 6}" font-size="11" font-weight="600" fill="${colors.text}">${index + 1}</text>`
++		);
++	});
++
++	const length = scaleLength(sketch) * scale;
++
++	parts.push(
++		`<path d="M${width - 18},${34} L${width - 18},${16} M${width - 22},${22} L${width - 18},${16} L${width - 14},${22}" fill="none" stroke="${colors.text}" stroke-width="1.2" opacity="0.7"/>`,
++		`<text x="${width - 33}" y="${24}" font-size="11" font-weight="700" fill="${colors.text}" opacity="0.7">N</text>`,
++		`<line x1="14" y1="${height - 18}" x2="${14 + length}" y2="${height - 18}" stroke="${colors.text}" stroke-width="2" opacity="0.7"/>`,
++		`<text x="${14 + length / 2}" y="${height - 5}" font-size="10" text-anchor="middle" fill="${colors.text}" opacity="0.7">${figure(scaleLength(sketch))} ${escape(sketch.unit)}</text>`,
++		'</svg>'
++	);
++
++	return parts.join('');
++}
++
++function escape(text: string): string {
++	return text.replace(
++		/[<>&"]/g,
++		(c) => ({ '"': '&quot;', '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c] ?? c
++	);
++}
++
++function number(value: number): string {
++	return value.toFixed(3);
++}
++
++/** The figure as an R12 DXF in its own unit, the first point at the origin, as ToshLLM exports it. */
++export function dxf(sketch: ToshSketch): string {
++	const out = [
++		'0',
++		'SECTION',
++		'2',
++		'HEADER',
++		'9',
++		'$ACADVER',
++		'1',
++		'AC1009',
++		'9',
++		'$INSUNITS',
++		'70',
++		sketch.unit.toLowerCase().startsWith('m') ? '6' : '2',
++		'0',
++		'ENDSEC',
++		'0',
++		'SECTION',
++		'2',
++		'ENTITIES',
++		'0',
++		'POLYLINE',
++		'8',
++		'FIGURE',
++		'66',
++		'1',
++		'70',
++		'0',
++		'10',
++		'0.0',
++		'20',
++		'0.0',
++		'30',
++		'0.0'
++	];
++
++	for (const p of sketch.points.map((point) => placed(sketch, point))) {
++		out.push('0', 'VERTEX', '8', 'FIGURE', '10', number(p[0]), '20', number(p[1]), '30', '0.0');
++	}
++
++	out.push('0', 'SEQEND', '8', 'FIGURE');
++
++	if (isOpen(sketch)) {
++		const first = placed(sketch, sketch.points[0]);
++		const last = placed(sketch, sketch.points[sketch.points.length - 1]);
++
++		out.push(
++			'0',
++			'LINE',
++			'8',
++			'MISCLOSURE',
++			'10',
++			number(last[0]),
++			'20',
++			number(last[1]),
++			'30',
++			'0.0',
++			'11',
++			number(first[0]),
++			'21',
++			number(first[1]),
++			'31',
++			'0.0'
++		);
++	}
++
++	const size = Math.max(span(sketch) / 60, 1e-3);
++
++	corners(sketch)
++		.map((corner) => placed(sketch, corner))
++		.forEach((c, i) => {
++			out.push(
++				'0',
++				'POINT',
++				'8',
++				'CORNERS',
++				'10',
++				number(c[0]),
++				'20',
++				number(c[1]),
++				'30',
++				'0.0',
++				'0',
++				'TEXT',
++				'8',
++				'LABELS',
++				'10',
++				number(c[0] + size / 2),
++				'20',
++				number(c[1] + size / 2),
++				'30',
++				'0.0',
++				'40',
++				number(size),
++				'1',
++				String(i + 1)
++			);
++		});
++
++	const note = notice(sketch);
++
++	if (note) {
++		const placedAll = [...sketch.points, ...corners(sketch)].map((p) => placed(sketch, p));
++		const left = Math.min(...placedAll.map((p) => p[0]));
++		const bottom = Math.min(...placedAll.map((p) => p[1]));
++
++		out.push(
++			'0',
++			'TEXT',
++			'8',
++			'NOTICE',
++			'10',
++			number(left),
++			'20',
++			number(bottom - 3 * size),
++			'30',
++			'0.0',
++			'40',
++			number(size),
++			'1',
++			note.replace(/\n/g, ' ')
++		);
++	}
++
++	out.push('0', 'ENDSEC', '0', 'EOF');
++
++	return out.join('\n') + '\n';
++}
++
++/** The numbered corners, east and north of the first one. */
++export function csv(sketch: ToshSketch): string {
++	const suffix = sketch.unit ? `_${sketch.unit}` : '';
++	// a column rather than a comment line, which some table imports reject
++	const note = notice(sketch);
++	const column = note ? `,"${note.replace(/"/g, '""')}"` : '';
++	const rows = corners(sketch).map((corner, i) => {
++		const c = placed(sketch, corner);
++
++		return `${i + 1},${number(c[0])},${number(c[1])}${column}`;
++	});
++	const header =
++		(sketch.origin ? `point,x${suffix},y${suffix}` : `point,east${suffix},north${suffix}`) +
++		(note ? ',note' : '');
++
++	return [header, ...rows].join('\n') + '\n';
++}
++
++/** A PNG of the drawing on white, twice its size, as a report wants it. */
++export async function png(sketch: ToshSketch): Promise<Blob | null> {
++	const drawing = svg(sketch, 1200, 800, { line: '#2563eb', text: '#111' });
++	const image = new Image();
++
++	image.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(drawing);
++	await image.decode();
++	const canvas = document.createElement('canvas');
++
++	const note = notice(sketch);
++
++	canvas.width = 2400;
++	canvas.height = note ? 1680 : 1600;
++	const context = canvas.getContext('2d');
++
++	if (!context) return null;
++
++	context.fillStyle = '#fff';
++	context.fillRect(0, 0, canvas.width, canvas.height);
++	context.drawImage(image, 0, 0, 2400, 1600);
++
++	if (note) {
++		context.fillStyle = '#111';
++		context.font = '40px system-ui, sans-serif';
++		context.textAlign = 'center';
++		context.fillText(note, 1200, 1640);
++	}
++
++	return new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
++}
+diff --git a/tools/ui/src/lib/types/api.d.ts b/tools/ui/src/lib/types/api.d.ts
+index b52485ade..999f3cf61 100644
+--- a/tools/ui/src/lib/types/api.d.ts
++++ b/tools/ui/src/lib/types/api.d.ts
+@@ -1,9 +1,10 @@
+ import type { ChatMessagePromptProgress, ChatRole } from './chat';
++import type { ToshChunk } from './tosh';
+ import type {
+ 	ContentPartType,
+ 	FileTypeAudio,
+ 	ServerModelsSseEventType,
+ 	ServerModelStatus,
+ 	ServerRole
+ } from '$lib/enums';
+ 
+@@ -197,16 +198,18 @@ export interface ApiModelDetails {
+ 		family?: string;
+ 		families?: string[];
+ 		parameter_size?: string;
+ 		quantization_level?: string;
+ 	};
+ }
+ 
+ export interface ApiLlamaCppServerProps {
++	/** The server answers chat requests that bring no tools with its own Tosh agent. */
++	tosh_agent?: boolean;
+ 	default_generation_settings: {
+ 		id: number;
+ 		id_task: number;
+ 		n_ctx: number;
+ 		speculative: boolean;
+ 		is_processing: boolean;
+ 		params: {
+ 			n_predict: number;
+@@ -345,16 +348,17 @@ export interface ApiChatCompletionToolCallDelta {
+ 	function?: ApiChatCompletionToolCallFunctionDelta;
+ }
+ 
+ export interface ApiChatCompletionToolCall extends ApiChatCompletionToolCallDelta {
+ 	function?: ApiChatCompletionToolCallFunctionDelta & { arguments?: string };
+ }
+ 
+ export interface ApiChatCompletionStreamChunk {
++	tosh?: ToshChunk;
+ 	id?: string;
+ 	object?: string;
+ 	model?: string;
+ 	choices: Array<{
+ 		model?: string;
+ 		metadata?: { model?: string };
+ 		delta: {
+ 			content?: string;
+diff --git a/tools/ui/src/lib/types/database.d.ts b/tools/ui/src/lib/types/database.d.ts
+index 57b77f06c..ce53e99f8 100644
+--- a/tools/ui/src/lib/types/database.d.ts
++++ b/tools/ui/src/lib/types/database.d.ts
+@@ -1,8 +1,9 @@
++import type { ToshMessageData } from './tosh';
+ import { AttachmentType, ReasoningEffort, ToolSource } from '$lib/enums';
+ import type { ChatMessageTimings, ChatMessageType, ChatRole } from '$lib/types/chat';
+ 
+ /**
+  * @deprecated Legacy per-conversation MCP server flags. MCP server enabled
+  * state is global now; per-conversation tool policy lives in
+  * `disabledTools` / `disabledToolCategories`. Read by the migration only.
+  */
+@@ -119,16 +120,18 @@ export interface DatabaseMessage {
+ 	content: string;
+ 	parent: string | null;
+ 	/**
+ 	 * @deprecated - left for backward compatibility
+ 	 */
+ 	thinking?: string;
+ 	/** Reasoning content produced by the model (separate from visible content) */
+ 	reasoningContent?: string;
++	/** What the server's Tosh agent reported for this answer: its steps, a sketch, a map */
++	tosh?: ToshMessageData;
+ 	/** Serialized JSON array of tool calls made by assistant messages */
+ 	toolCalls?: string;
+ 	/** Chat completion id streamed by the server, used to target realtime control (e.g. end reasoning) */
+ 	completionId?: string;
+ 	/** Tool call ID for tool result messages (role: 'tool') */
+ 	toolCallId?: string;
+ 	/** Working directory the tool call ran with (sent via the x-tool-cwd header), stored per call so the UI can show it accurately even after the conversation cwd changes */
+ 	toolCwd?: string;
+diff --git a/tools/ui/src/lib/types/index.ts b/tools/ui/src/lib/types/index.ts
+index 453af9bb8..21273ad03 100644
+--- a/tools/ui/src/lib/types/index.ts
++++ b/tools/ui/src/lib/types/index.ts
+@@ -235,8 +235,16 @@ export type {
+ 	WriteFileTitleMeta
+ } from './tools';
+ 
+ // Reasoning
+ export type { ReasoningEffortLevel } from './reasoning';
+ 
+ // Splash
+ export type { SplashDimensions } from './splash';
++export type {
++	ToshCall,
++	ToshChunk,
++	ToshMapLayer,
++	ToshMapRequest,
++	ToshMessageData,
++	ToshSketch
++} from './tosh';
+diff --git a/tools/ui/src/lib/types/settings.d.ts b/tools/ui/src/lib/types/settings.d.ts
+index 377a57040..20260b4c3 100644
+--- a/tools/ui/src/lib/types/settings.d.ts
++++ b/tools/ui/src/lib/types/settings.d.ts
+@@ -1,11 +1,12 @@
+ import type { ChatMessagePromptProgress, ChatMessageTimings } from './chat';
+ import type { DatabaseMessageExtra } from './database';
+ import type { OpenAIToolDefinition } from './mcp';
++import type { ToshChunk } from './tosh';
+ import type { Icon } from '@lucide/svelte';
+ import type { SETTING_CONFIG_DEFAULT, SETTINGS_SECTION_TITLES } from '$lib/constants';
+ import type {
+ 	ParameterSource,
+ 	ReasoningEffort,
+ 	SettingsFieldType,
+ 	StreamConnectionState,
+ 	SyncableParameterType
+@@ -124,16 +125,19 @@ export interface SettingsChatServiceOptions {
+ 	// Callbacks
+ 	onChunk?: (chunk: string) => void;
+ 	onReasoningChunk?: (chunk: string) => void;
+ 	onToolCallChunk?: (chunk: string) => void;
+ 	onAttachments?: (extras: DatabaseMessageExtra[]) => void;
+ 	onModel?: (model: string) => void;
+ 	onCompletionId?: (id: string) => void;
+ 	onTimings?: (timings?: ChatMessageTimings, promptProgress?: ChatMessagePromptProgress) => void;
++	onTosh?: (tosh: ToshChunk) => void;
++	/** "off" asks a server with a Tosh agent for raw inference, as an internal request such as a title wants */
++	toshAgent?: 'off';
+ 	onComplete?: (
+ 		response: string,
+ 		reasoningContent?: string,
+ 		timings?: ChatMessageTimings,
+ 		toolCalls?: string
+ 	) => void;
+ 	onError?: (error: Error) => void;
+ 	onConnectionState?: (state: StreamConnectionState) => void;
+diff --git a/tools/ui/src/lib/types/tosh.d.ts b/tools/ui/src/lib/types/tosh.d.ts
+new file mode 100644
+index 000000000..30f3ddc58
+--- /dev/null
++++ b/tools/ui/src/lib/types/tosh.d.ts
+@@ -0,0 +1,60 @@
++/** A call the server's Tosh agent made while it answered, as its progress events report it. */
++export interface ToshCall {
++	id?: string;
++	tool?: string;
++	arguments?: unknown;
++	status?: string;
++	state?: string;
++	result?: string;
++	summary?: string;
++}
++
++/** A figure the agent attached to an answer in a plane of its own, such as a tract from a deed's calls. */
++export interface ToshSketch {
++	title?: string;
++	unit: string;
++	points: number[][];
++	corners?: number[][];
++	closed: boolean;
++	/** Where the first point lies in the coordinate system `plane` names: exports put the figure there. */
++	origin?: number[];
++	plane?: string;
++	/** A line every export carries, such as a disclaimer that the figure is not a survey. */
++	notice?: string;
++	/** The coordinate system of `origin` as a shapefile's .prj holds it. */
++	prj?: string;
++}
++
++export interface ToshMapRequest {
++	calls: unknown[];
++	show?: boolean;
++}
++
++export interface ToshMapLayer {
++	title?: string;
++	type?: string;
++	features: unknown[];
++	link?: { title?: string; url?: string };
++	complete?: boolean;
++	subtitle?: string;
++	fields?: { name: string; alias?: string }[];
++	drawn?: boolean;
++}
++
++/** The `tosh` object of a chunk: a progress event while the agent works, or the answer's metadata at the end. */
++export interface ToshChunk {
++	version?: number;
++	event?: { type: string; call?: ToshCall; [key: string]: unknown };
++	sketches?: ToshSketch[];
++	map_request?: ToshMapRequest;
++	map?: { layers: ToshMapLayer[] };
++	[key: string]: unknown;
++}
++
++/** What an assistant message keeps of the agent's work. */
++export interface ToshMessageData {
++	steps?: ToshCall[];
++	sketches?: ToshSketch[];
++	mapRequest?: ToshMapRequest;
++	map?: { layers: ToshMapLayer[] };
++}
+diff --git a/tools/ui/src/lib/utils/convert-files-to-extra.ts b/tools/ui/src/lib/utils/convert-files-to-extra.ts
+index 735e91c44..507e2bb28 100644
+--- a/tools/ui/src/lib/utils/convert-files-to-extra.ts
++++ b/tools/ui/src/lib/utils/convert-files-to-extra.ts
+@@ -1,15 +1,16 @@
+ import { convertPDFToImage, convertPDFToText } from './pdf-processing';
+ import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
+ import { isLikelyTextFile, readFileAsText } from './text-files';
+ import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
+ import { SETTINGS_KEYS } from '$lib/constants';
+ import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
+ import { modelsStore } from '$lib/stores/models/index.svelte';
++import { serverStore } from '$lib/stores/server.svelte';
+ import { settingsStore } from '$lib/stores/settings/index.svelte';
+ import type { ChatUploadedFile, DatabaseMessageExtra, FileProcessingResult } from '$lib/types';
+ import { getFileTypeCategory } from '$lib/utils';
+ import { toast } from 'svelte-sonner';
+ 
+ function readFileAsBase64(file: File): Promise<string> {
+ 	return new Promise((resolve, reject) => {
+ 		const reader = new FileReader();
+@@ -134,17 +135,22 @@ export async function parseFilesToMessageExtras(
+ 					);
+ 
+ 					shouldProcessAsImages = false;
+ 				}
+ 
+ 				if (shouldProcessAsImages) {
+ 					// Process PDF as images (only for vision models)
+ 					try {
+-						const images = await convertPDFToImage(file.file);
++						const images = await convertPDFToImage(
++							file.file,
++							Number(settingsStore.getConfig(SETTINGS_KEYS.MAX_IMAGE_RESOLUTION)) ||
++								Number(serverStore.uiSettings?.[SETTINGS_KEYS.MAX_IMAGE_RESOLUTION]) ||
++								0
++						);
+ 
+ 						// Show success toast for PDF image processing
+ 						toast.success(
+ 							`PDF "${file.name}" processed as ${images.length} images for vision model.`,
+ 							{
+ 								duration: 3000
+ 							}
+ 						);
+diff --git a/tools/ui/src/lib/utils/pdf-processing.ts b/tools/ui/src/lib/utils/pdf-processing.ts
+index b79f8d785..de1407708 100644
+--- a/tools/ui/src/lib/utils/pdf-processing.ts
++++ b/tools/ui/src/lib/utils/pdf-processing.ts
+@@ -81,31 +81,37 @@ export async function convertPDFToText(file: File): Promise<string> {
+ 			`Failed to convert PDF to text: ${error instanceof Error ? error.message : 'Unknown error'}`
+ 		);
+ 	}
+ }
+ 
+ /**
+  * Convert PDF pages to PNG images as data URLs
+  * @param file - The PDF file to convert
+- * @param scale - Rendering scale factor (default: 1.5)
++ * @param megapixels - Size each page is drawn at, as the image size setting lets it reach the model (default: scale 1.5)
+  * @returns Promise resolving to array of PNG data URLs
+  */
+-export async function convertPDFToImage(file: File, scale: number = 1.5): Promise<string[]> {
++export async function convertPDFToImage(file: File, megapixels: number = 0): Promise<string[]> {
+ 	if (!browser) {
+ 		throw new Error('PDF processing is only available in the browser');
+ 	}
+ 
+ 	try {
+ 		const buffer = await getFileAsBuffer(file);
+ 		const doc = await pdfjs.getDocument({ data: buffer }).promise;
+ 		const pages: Promise<string>[] = [];
+ 
+ 		for (let i = 1; i <= doc.numPages; i++) {
+ 			const page = await doc.getPage(i);
++			const base = page.getViewport({ scale: 1 });
++			// a scan's figures need the pixels the setting allows; scale 1.5 makes a letter page 1.1 MP
++			const scale =
++				megapixels > 0
++					? Math.max(1.5, Math.sqrt((megapixels * 1e6) / (base.width * base.height)))
++					: 1.5;
+ 			const viewport = page.getViewport({ scale });
+ 			const canvas = document.createElement('canvas');
+ 			const ctx = canvas.getContext('2d');
+ 
+ 			canvas.width = viewport.width;
+ 			canvas.height = viewport.height;
+ 
+ 			if (!ctx) {
+@@ -115,17 +121,20 @@ export async function convertPDFToImage(file: File, scale: number = 1.5): Promis
+ 			const task = page.render({
+ 				canvas: canvas,
+ 				canvasContext: ctx,
+ 				viewport: viewport
+ 			});
+ 
+ 			pages.push(
+ 				task.promise.then(() => {
+-					return canvas.toDataURL(MimeTypeImage.PNG);
++					// a page drawn large is a scan photo by now: JPEG keeps it a few times smaller than PNG
++					return scale > 1.5
++						? canvas.toDataURL(MimeTypeImage.JPEG, 0.92)
++						: canvas.toDataURL(MimeTypeImage.PNG);
+ 				})
+ 			);
+ 		}
+ 
+ 		return await Promise.all(pages);
+ 	} catch (error) {
+ 		console.error('Error converting PDF to images:', error);
+ 

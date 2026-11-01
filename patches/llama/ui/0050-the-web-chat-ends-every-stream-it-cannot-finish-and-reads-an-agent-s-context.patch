@@ -1,0 +1,199 @@
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index 4da104717..92fe5b9c3 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -455,7 +455,8 @@ export class ChatService {
+ 		abortSignal?: AbortSignal,
+ 		onConnectionState?: (state: StreamConnectionState) => void,
+ 		streamModel?: string | null,
+-		onTosh?: (tosh: ToshChunk) => void
++		onTosh?: (tosh: ToshChunk) => void,
++		maxTokens?: number
+ 	): Promise<void> {
+ 		let reader = response.body?.getReader();
+ 
+@@ -670,6 +671,12 @@ export class ChatService {
+ 								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
+ 								if (parsed.tosh && typeof parsed.tosh === 'object') {
+ 									const event = parsed.tosh.event;
++									const used = parsed.tosh.context?.used;
++
++									// an agent's answer has no timings: the context meter reads its count instead
++									if (!event && typeof used === 'number' && !lastTimings) {
++										lastTimings = { prompt_n: used, cache_n: 0, predicted_n: 0 };
++									}
+ 
+ 									if (event?.type === 'retract') {
+ 										aggregatedContent = '';
+@@ -761,7 +768,13 @@ export class ChatService {
+ 
+ 				if (streamFinished) break;
+ 
+-				if (!conversationId) break;
++				if (!conversationId) {
++					onConnectionState?.(StreamConnectionState.LOST);
++					streamError = new Error('The connection ended before the answer did');
++					streamFinished = true;
++
++					break;
++				}
+ 
+ 				if (!madeProgress) {
+ 					onConnectionState?.(StreamConnectionState.LOST);
+@@ -797,7 +810,12 @@ export class ChatService {
+ 
+ 				const newReader = resumeResp.body?.getReader();
+ 
+-				if (!newReader) break;
++				if (!newReader) {
++					onConnectionState?.(StreamConnectionState.LOST);
++					onError?.(new Error('Stream connection lost and could not be resumed'));
++
++					break;
++				}
+ 
+ 				try {
+ 					reader.releaseLock();
+@@ -836,9 +854,14 @@ export class ChatService {
+ 					return;
+ 				}
+ 
+-				// an answer cut at its token limit says so, unless the agent already did
++				// an answer cut at its token limit says so, unless the agent already did; one that wrote fewer
++				// tokens than it was allowed was cut by the context
+ 				if (finishReason === 'length' && aggregatedContent && !/incomplet[ae]\._\s*$/.test(aggregatedContent)) {
+-					const note = '\n\n_The answer was cut at the limit of tokens per answer, so it is incomplete._';
++					const written = lastTimings?.predicted_n ?? 0;
++					const byContext = !!maxTokens && maxTokens > 0 && written > 0 && written < maxTokens;
++					const note = byContext
++						? "\n\n_The answer was cut when the conversation filled the model's context, so it is incomplete._"
++						: '\n\n_The answer was cut at the limit of tokens per answer, so it is incomplete._';
+ 
+ 					aggregatedContent += note;
+ 
+@@ -1371,7 +1394,8 @@ export class ChatService {
+ 					signal,
+ 					onConnectionState,
+ 					options.model,
+-					onTosh
++					onTosh,
++					options.max_tokens ?? undefined
+ 				);
+ 
+ 				return;
+diff --git a/tools/ui/src/lib/types/tosh.d.ts b/tools/ui/src/lib/types/tosh.d.ts
+index a9936ef8d..aed7989e3 100644
+--- a/tools/ui/src/lib/types/tosh.d.ts
++++ b/tools/ui/src/lib/types/tosh.d.ts
+@@ -48,6 +48,8 @@ export interface ToshChunk {
+ 	sketches?: ToshSketch[];
+ 	map_request?: ToshMapRequest;
+ 	map?: { layers: ToshMapLayer[] };
++	/** How full the context is after the turn, as the engine counted it. */
++	context?: { used?: number | null; n_ctx?: number | null; left_out?: number };
+ 	[key: string]: unknown;
+ }
+ 
+diff --git a/tools/ui/tests/unit/stream-ending.test.ts b/tools/ui/tests/unit/stream-ending.test.ts
+new file mode 100644
+index 000000000..f8bf880a8
+--- /dev/null
++++ b/tools/ui/tests/unit/stream-ending.test.ts
+@@ -0,0 +1,97 @@
++import { beforeAll, describe, expect, it } from 'vitest';
++
++beforeAll(() => {
++	const store = new Map<string, string>();
++	(globalThis as unknown as { localStorage: Storage }).localStorage = {
++		clear: () => store.clear(),
++		getItem: (k) => (store.has(k) ? store.get(k)! : null),
++		key: (i) => Array.from(store.keys())[i] ?? null,
++		get length() {
++			return store.size;
++		},
++		removeItem: (k) => {
++			store.delete(k);
++		},
++		setItem: (k, v) => {
++			store.set(k, String(v));
++		}
++	};
++});
++
++import { ChatService } from '$lib/services/chat.service';
++import type { ChatMessageTimings } from '$lib/types/chat';
++
++function streamOf(lines: string[]): Response {
++	const encoder = new TextEncoder();
++	const body = new ReadableStream<Uint8Array>({
++		start(controller) {
++			for (const line of lines) controller.enqueue(encoder.encode(line + '\n\n'));
++			controller.close();
++		}
++	});
++	return new Response(body, { status: 200 });
++}
++
++async function read(lines: string[], maxTokens?: number) {
++	const seen = {
++		content: '',
++		completed: undefined as undefined | { text: string; timings?: ChatMessageTimings },
++		errors: [] as Error[]
++	};
++	await ChatService.handleStreamResponse(
++		streamOf(lines),
++		(chunk) => (seen.content += chunk),
++		(text, _reasoning, timings) => (seen.completed = { text, timings }),
++		(error) => seen.errors.push(error),
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		undefined,
++		maxTokens
++	);
++	return seen;
++}
++
++const chunk = (value: unknown) => 'data: ' + JSON.stringify(value);
++
++describe('the end of a stream', () => {
++	it('is an error when it stops with nothing to resume from, never an answer left loading', async () => {
++		const seen = await read([chunk({ choices: [{ delta: { content: 'Half an' } }] })]);
++		expect(seen.completed).toBeUndefined();
++		expect(seen.errors).toHaveLength(1);
++		expect(seen.content).toContain('so it is incomplete._');
++	});
++
++	it("takes an agent's count of the context for its meter", async () => {
++		const seen = await read([
++			chunk({ choices: [{ delta: { content: 'Done.' } }] }),
++			chunk({
++				choices: [{ delta: {}, finish_reason: 'stop' }],
++				usage: { prompt_tokens: 9000, completion_tokens: 40 },
++				tosh: { version: 1, outcome: 'answered', context: { used: 3120, n_ctx: 8192, left_out: 0 } }
++			}),
++			'data: [DONE]'
++		]);
++		expect(seen.completed?.timings).toEqual({ prompt_n: 3120, cache_n: 0, predicted_n: 0 });
++	});
++
++	it('says whether the context or the limit of tokens cut an answer', async () => {
++		const cut = (predicted: number) => [
++			chunk({ choices: [{ delta: { content: 'Once upon' } }] }),
++			chunk({
++				choices: [{ delta: {}, finish_reason: 'length' }],
++				timings: { prompt_n: 100, cache_n: 0, predicted_n: predicted }
++			}),
++			'data: [DONE]'
++		];
++		expect((await read(cut(300), 1024)).completed?.text).toContain('filled the model\'s context');
++		expect((await read(cut(1024), 1024)).completed?.text).toContain('limit of tokens per answer');
++		expect((await read(cut(300))).completed?.text).toContain('limit of tokens per answer');
++	});
++});

@@ -26,6 +26,7 @@ struct ToshDropdown<Value: Hashable>: View {
 
     @State private var presented = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
 
     private var selected: Option? { options.first { $0.value == selection } }
 
@@ -49,6 +50,8 @@ struct ToshDropdown<Value: Hashable>: View {
             .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .background(WorkspaceStyle.inset, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(WorkspaceStyle.border))
+            // a plain button keeps its look when disabled; a locked choice must not look open
+            .opacity(isEnabled ? 1 : 0.5)
         }
         .buttonStyle(.plain)
         .popover(isPresented: $presented, arrowEdge: .bottom) {

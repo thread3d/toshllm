@@ -1,0 +1,1037 @@
+diff --git a/common/common.h b/common/common.h
+index 470eba20b..909f7f9e7 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -396,17 +396,21 @@ struct common_params_speculative {
+         return synth_len != -1.0 || !synth_rates.empty();
+     }
+ 
+     uint32_t need_n_rs_seq() const {
+         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+         });
+ 
+-        return needs_rs_seq ? draft.n_max : 0u;
++        // a prompt-lookup window next to the MTP runs two tokens longer and must roll back cheaply too
++        const bool mtp = std::any_of(types.begin(), types.end(), [](auto t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
++        const char * lookup = std::getenv("TOSH_MTP_LOOKUP");
++        const uint32_t extra = mtp && draft.n_max >= 1 && (lookup == nullptr || std::atoi(lookup) != 0) ? 2u : 0u;
++        return needs_rs_seq ? draft.n_max + extra : 0u;
+     }
+ };
+ 
+ struct common_params_diffusion {
+     int32_t steps         = 128;
+     bool    visual_mode   = false;
+ 
+     float   eps           = 0;        // epsilon for timesteps
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 97c3df0a0..1785afe6d 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -8,16 +8,17 @@
+ #include "ngram-cache.h"
+ #include "ngram-map.h"
+ #include "ngram-mod.h"
+ #include "sampling.h"
+ 
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+ 
+ #include <algorithm>
++#include <array>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+ #include <iomanip>
+ #include <map>
+ #include <cinttypes>
+ 
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -1431,22 +1432,263 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+         static const float alpha = getenv("TOSH_DFLASH_EWMA") ? (float) atof(getenv("TOSH_DFLASH_EWMA")) : 0.5f;
+         const float acc = std::min(1.0f, (float) n_accepted / (float) n_last_draft[seq_id]);
+         const float a = acc > acc_ewma[seq_id] ? 0.2f : alpha;  // rise fast, fall at alpha
+         acc_ewma[seq_id] = a * acc_ewma[seq_id] + (1.0f - a) * acc;
+         n_last_draft[seq_id] = 0;
+     }
+ };
+ 
++// Prompt lookup: proposes what followed the longest earlier occurrence of the current suffix of the
++// history (prompt plus accepted tokens). Every trigram maps to its four most recent end positions in a
++// fixed open-addressing table, so appends are O(1) and memory stays bounded.
++struct common_suffix_drafter {
++    static constexpr int ways = 4;
++
++    struct slot {
++        uint64_t key = 0;   // trigram hash, 0 = empty
++        uint32_t pos[ways] = {};
++        uint8_t  n = 0;
++    };
++
++    int min_match = 3;
++    int max_match = 64;
++    std::vector<llama_token> hist;
++    std::vector<slot> table;
++    size_t mask = 0;
++    int last_match = 0;
++
++    void init(size_t capacity) {
++        size_t cap = 1;
++        while (cap < capacity*2) {
++            cap <<= 1;
++        }
++        table.assign(cap, slot{});
++        mask = cap - 1;
++        hist.clear();
++        hist.reserve(capacity);
++    }
++
++    void reset() {
++        hist.clear();
++        std::fill(table.begin(), table.end(), slot{});
++        last_match = 0;
++    }
++
++    static uint64_t mix(uint64_t x) {
++        x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
++        x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
++        return x ^ (x >> 33);
++    }
++
++    uint64_t key_at(size_t end) const {
++        const uint64_t a = (uint32_t) hist[end - 2], b = (uint32_t) hist[end - 1], c = (uint32_t) hist[end];
++        return mix(a*0x9E3779B97F4A7C15ull ^ mix(b + 0x632BE59BD9B4E019ull) ^ (c << 1)) | 1ull;
++    }
++
++    slot * find(uint64_t key, bool insert) {
++        for (size_t i = key & mask, probes = 0; probes <= mask; i = (i + 1) & mask, ++probes) {
++            slot & sl = table[i];
++            if (sl.key == key) {
++                return &sl;
++            }
++            if (sl.key == 0) {
++                if (!insert) {
++                    return nullptr;
++                }
++                sl.key = key;
++                return &sl;
++            }
++        }
++        return nullptr;
++    }
++
++    void append(llama_token t) {
++        if (table.empty()) {
++            return;
++        }
++        hist.push_back(t);
++        const size_t end = hist.size() - 1;
++        if (end < 2) {
++            return;
++        }
++        slot * sl = find(key_at(end), true);
++        if (sl == nullptr) {
++            return;
++        }
++        for (int w = ways - 1; w > 0; --w) {
++            sl->pos[w] = sl->pos[w - 1];
++        }
++        sl->pos[0] = (uint32_t) end;
++        if (sl->n < ways) {
++            sl->n++;
++        }
++    }
++
++    int propose(int max_k, llama_token * out) {
++        last_match = 0;
++        const size_t n = hist.size();
++        if (n < 4 || max_k <= 0 || table.empty()) {
++            return 0;
++        }
++        const size_t cur = n - 1;
++        const slot * sl = find(key_at(cur), false);
++        if (sl == nullptr) {
++            return 0;
++        }
++        size_t best_end = 0;
++        int best_len = 0;
++        for (int w = 0; w < sl->n; ++w) {
++            const size_t p = sl->pos[w];
++            if (p >= cur) {
++                continue;
++            }
++            int len = 0;
++            while (len < max_match && len <= (int) p && hist[p - len] == hist[cur - len]) {
++                len++;
++            }
++            if (len > best_len) {   // most recent first, so ties keep the newer
++                best_len = len;
++                best_end = p;
++            }
++        }
++        if (best_len < min_match) {
++            return 0;
++        }
++        last_match = best_len;
++        int k = 0;
++        for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) {
++            out[k++] = hist[q];
++        }
++        return k;
++    }
++};
++
++// Per verify round: the MTP window, or a lookup window when its expected committed tokens per
++// millisecond beat the MTP's by a margin. Costs are measured round times per window size (sizes not
++// seen yet are scaled from seen ones by a prior shape); lookup acceptance is learned per bucket of
++// match length. Taking the lookup whenever it proposed more lost on ordinary text.
++struct common_speculative_lookup_policy {
++    static constexpr int max_t   = 8;
++    static constexpr int buckets = 4;
++
++    int    t_cap;
++    double margin = 0.03;
++    std::array<double, max_t + 1> cost{}, cost_n{};
++    std::array<double, max_t + 1> mtp_tok{}, mtp_n{};
++    std::array<double, buckets>   ok{}, bad{};
++
++    explicit common_speculative_lookup_policy(int t) : t_cap(std::clamp(t, 1, max_t)) {}
++
++    static int bucket(int match) {
++        return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
++    }
++
++    double lookup_rate(int match) const {
++        static constexpr double prior_q[buckets] = { 0.75, 0.88, 0.93, 0.96 };
++        static constexpr double prior_n = 4.0;
++        const int b = bucket(match);
++        return (ok[b] + prior_n*prior_q[b]) / (ok[b] + bad[b] + prior_n);
++    }
++
++    double cost_ms(int t) const {
++        static constexpr double shape[max_t + 1] = { 0.0, 1.0, 1.35, 1.7, 2.05, 2.45, 2.85, 3.25, 3.6 };
++        t = std::clamp(t, 1, max_t);
++        if (cost_n[t] > 0) {
++            return cost[t];
++        }
++        double num = 0.0, den = 0.0;
++        for (int u = 1; u <= max_t; ++u) {
++            if (cost_n[u] > 0) {
++                const double w = std::min(cost_n[u], 20.0);
++                num += w*cost[u]*shape[t]/shape[u];
++                den += w;
++            }
++        }
++        return den > 0 ? num/den : shape[t];
++    }
++
++    double mtp_tokens(int t) const {
++        return mtp_n[t] > 0 ? mtp_tok[t] : 1.0 + 0.7*(t - 1);
++    }
++
++    // window size t counts the committed token, so t - 1 drafts; 0 keeps the MTP window
++    int choose(int t_mtp, int lookup_k, int match) const {
++        t_mtp = std::clamp(t_mtp, 1, t_cap);
++        const double base = mtp_tokens(t_mtp) / cost_ms(t_mtp);
++        const double q = lookup_rate(match);
++        double e = 1.0, qi = 1.0, best = 0.0;
++        int best_t = 0;
++        for (int k = 1; k <= std::min(lookup_k, t_cap - 1); ++k) {
++            qi *= q;
++            e  += qi;
++            const double r = e / cost_ms(k + 1);
++            if (r > best) {
++                best   = r;
++                best_t = k + 1;
++            }
++        }
++        if (best_t > 0 && best > base*(1.0 + margin)) {
++            return best_t;
++        }
++        // a guessed cost could keep a size from ever being measured: try it a few times first
++        const int t_full = std::min(lookup_k, t_cap - 1) + 1;
++        if (t_full > t_mtp && cost_n[t_full] < 3 && q >= 0.85) {
++            return t_full;
++        }
++        return 0;
++    }
++
++    void observe(bool lookup, int t, int accepted, int match, double round_ms) {
++        static constexpr double cost_alpha = 0.1;
++        static constexpr double tok_alpha  = 0.05;
++        static constexpr double decay      = 0.97;
++        t = std::clamp(t, 1, max_t);
++        if (round_ms > 0) {
++            cost[t] = cost_n[t] > 0 ? (1.0 - cost_alpha)*cost[t] + cost_alpha*round_ms : round_ms;
++            cost_n[t] += 1.0;
++        }
++        if (lookup) {
++            const int b = bucket(match);
++            ok[b]  = decay*ok[b] + accepted;
++            bad[b] = decay*bad[b] + (accepted < t - 1 ? 1.0 : 0.0);
++        } else {
++            const double got = accepted + 1.0;
++            mtp_tok[t] = mtp_n[t] > 0 ? (1.0 - tok_alpha)*mtp_tok[t] + tok_alpha*got : got;
++            mtp_n[t] += 1.0;
++        }
++    }
++};
++
++static bool common_speculative_mtp_lookup_enabled() {
++    const char * v = getenv("TOSH_MTP_LOOKUP");
++    return v == nullptr || atoi(v) != 0;
++}
++
+ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
++    // acceptance backoff, same policy as the DFlash planner
+     std::vector<float>   acc_ewma;     // per-seq EWMA of acceptance, starts at 1.0 (warm)
+     std::vector<int32_t> n_last_draft; // per-seq tokens drafted last step, 0 if skipped
+     std::vector<int32_t> steps_cold;   // per-seq skipped steps since the last probe
+     std::vector<int32_t> probe_gap;    // per-seq probe interval, doubles on a failed probe
+ 
++    // prompt lookup next to the MTP: its window may run two tokens past the MTP's
++    bool use_lookup = false;
++    std::unique_ptr<common_speculative_lookup_policy> lookup_policy;
++    std::vector<common_suffix_drafter> sfx;
++    struct round_state {
++        int64_t   t_us = -1;
++        llama_pos pos  = -1;
++        int       t    = 1;
++        int       match = 0;
++        bool      lookup = false;
++        int       t_prev = 0;   // window of the round before: a change of size rebuilds the verify graph
++    };
++    std::vector<round_state> rounds;
++
+     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+ 
+     common_batch batch;
+ 
+     std::vector<common_sampler_ptr> smpls;
+ 
+     std::vector<common_params_sampling> smpls_cfg;
+ 
+@@ -1556,16 +1798,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+ 
+             chain_h.assign(n_seq, {});
+             for (auto & c : chain_h) {
+                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
+             }
+         }
+         this->n_max = this->params.n_max;
++        use_lookup = common_speculative_mtp_lookup_enabled() && !chain_heads && !is_mem_shared && this->params.n_max >= 1;
++        if (use_lookup) {
++            this->n_max = std::min(this->params.n_max + 2, common_speculative_lookup_policy::max_t - 1);
++            lookup_policy = std::make_unique<common_speculative_lookup_policy>(this->n_max + 1);
++            sfx.resize(n_seq);
++            rounds.assign(n_seq, {});
++        }
+ 
+         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+ 
+         cold_rows.assign(n_seq, {});
+         cold_h.assign(n_seq, {});
+ 
+         cold_defer = getenv("TOSH_MTP_COLD_DEFER_DISABLE") == nullptr;
+         // 0.65 sat above the acceptance real content reaches, so it backed off where drafting
+@@ -1655,16 +1904,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+         }
+ 
+         cold_rows[seq_id].clear();
+         cold_h[seq_id].clear();
+ 
++        if (use_lookup) {
++            auto & sd = sfx[seq_id];
++            if (sd.table.empty()) {
++                sd.init((size_t) llama_n_ctx(this->params.ctx_tgt) + 4096);
++            }
++            sd.reset();
++            for (llama_token t : prompt) {
++                sd.append(t);
++            }
++            rounds[seq_id] = {};
++        }
++
+         auto * ctx_dft = this->params.ctx_dft;
+         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+ 
+         if (pos_max < N - 1 && !is_mem_shared) {
+             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
+                     "process() hook may not have run on every prefill ubatch "
+                     "(need_embd / output flag on every prompt position?). "
+                     "Drafts may degrade.\n",
+@@ -1726,18 +1987,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+             //                                                       ^--- this is a problem
+             // TODO:this is generally true, but would be nice to assert it
+             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+ 
+             for (int k = 0; k < n_tokens; ++k) {
+                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
+ 
+-                const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
+-
+                 const float * h_row = k == i_batch_beg[seq_id]
+                     ? pending_h[seq_id].data()
+                     : h_tgt + (size_t) (k - 1) * n_embd;
+ 
+                 // stash the rows of backed-off sequences instead of decoding them
+                 if (can_defer && cold_step(seq_id) && cold_rows[seq_id].size() < cold_max) {
+                     cold_rows[seq_id].push_back({ batch_in.tokens[k].id, batch_in.tokens[k].pos[0] });
+                     cold_h[seq_id].insert(cold_h[seq_id].end(), h_row, h_row + n_embd);
+@@ -1827,16 +2086,54 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         if ((int) acc_ewma.size() != (int) n_seq) {
+             acc_ewma.assign(n_seq, 1.0f);
+             n_last_draft.assign(n_seq, 0);
+             steps_cold.assign(n_seq, 0);
+             probe_gap.assign(n_seq, probe_base);
+         }
+ 
++        const int64_t t_now = ggml_time_us();
++        int n_active = 0;
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            n_active += dparams[seq_id].drafting ? 1 : 0;
++        }
++        if (use_lookup) {
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                auto & dp = dparams[seq_id];
++                auto & rs = rounds[seq_id];
++                if (!dp.drafting || dp.prompt == nullptr) {
++                    continue;
++                }
++                // the round since the last draft call: its accepted tokens are the positions it advanced;
++                // another sequence sharing the steps would make the time not this window's
++                if (rs.t_us >= 0 && n_active == 1) {
++                    const int adv = (int) (dp.pos0 - rs.pos);
++                    const double ms = (t_now - rs.t_us) / 1000.0;
++                    if (adv >= 1 && adv <= rs.t && ms > 0.0 && ms < 5000.0) {
++                        // the round that changed size paid a graph rebuild: its acceptance counts, its time does not
++                        lookup_policy->observe(rs.lookup, rs.t, adv - 1, rs.match, rs.t == rs.t_prev ? ms : 0.0);
++                    }
++                }
++                rs.t_us = -1;
++                // the history is the prompt so far plus the last sampled token
++                auto & sd = sfx[seq_id];
++                const llama_tokens & pr = *dp.prompt;
++                if (sd.hist.size() > pr.size() + 1 || (!sd.hist.empty() && sd.hist.size() <= pr.size() && sd.hist.back() != pr[sd.hist.size() - 1])) {
++                    sd.reset();
++                }
++                for (size_t k = sd.hist.size(); k < pr.size(); ++k) {
++                    sd.append(pr[k]);
++                }
++                if (sd.hist.size() == pr.size()) {
++                    sd.append(dp.id_last);
++                }
++            }
++        }
++
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+ 
+             if (!dp.drafting) {
+                 continue;
+             }
+ 
+             // while backed off, probe every probe_gap steps and double the gap on a failed probe,
+@@ -1996,34 +2293,76 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+             auto & dp = dparams[seq_id];
+             if (!dp.drafting) {
+                 continue;
+             }
+ 
+             if (dp.result->size() < (size_t) params.n_min) {
+                 dp.result->clear();
++                if (dp.result_q) {
++                    dp.result_q->clear();
++                }
++            }
+             if (drafted_this_step[seq_id]) {
+                 n_last_draft[seq_id] = (int32_t) dp.result->size();
+             }
++
++            if (use_lookup) {
++                auto & rs = rounds[seq_id];
++                auto & result = *dp.result;
++                const int t_prev = rs.t;
++                rs = {};
++                rs.t_prev = t_prev;
++                rs.t = (int) result.size() + 1;
++                // a lookup window competes only where the MTP's own first guess agrees with it
++                if (!result.empty()) {
++                    llama_token buf[common_speculative_lookup_policy::max_t];
++                    const int cap = std::min(this->n_max, dp.n_max > 0 ? dp.n_max : this->n_max);
++                    const int k = sfx[seq_id].propose(cap, buf);
++                    if (k > 0 && buf[0] == result[0]) {
++                        const int t = lookup_policy->choose(rs.t, k, sfx[seq_id].last_match);
++                        if (t > 0) {
++                            result.assign(buf, buf + (t - 1));
++                            // the window's tokens carry no draft distribution, so the target
++                            // verifies them by match instead of by rejection
++                            if (dp.result_q) {
++                                dp.result_q->clear();
++                            }
++                            rs.t      = t;
++                            rs.lookup = true;
++                            rs.match  = sfx[seq_id].last_match;
++                            n_last_draft[seq_id] = (int32_t) result.size();
++                        }
++                    }
++                }
++                rs.t_us = t_now;
++                rs.pos  = dp.pos0;
+             }
+         }
+     }
+ 
+     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
+ 
++        if (use_lookup && rounds[seq_id].lookup) {
++            n_last_draft[seq_id] = 0;   // a lookup window says nothing about the MTP's acceptance
++        }
+         if ((int) acc_ewma.size() == (int) n_seq && n_last_draft[seq_id] > 0) {
++            // one rejected draft of two halved the average at 0.5 and turned drafting off while
++            // acceptance still paid; 0.92 follows the last dozen drafts instead
++            static const float alpha = getenv("TOSH_MTP_EWMA") ? (float) atof(getenv("TOSH_MTP_EWMA")) : 0.92f;
+             const float acc = std::min(1.0f, (float) n_accepted / (float) n_last_draft[seq_id]);
+             const float a = acc > acc_ewma[seq_id] ? 0.2f : alpha;  // rise fast, fall at alpha
+             acc_ewma[seq_id] = a * acc_ewma[seq_id] + (1.0f - a) * acc;
+             n_last_draft[seq_id] = 0;
+         }
++
+         const int32_t n_rows = verify_h_rows[seq_id];
+         if (n_rows <= 0) {
+             return;
+         }
+ 
+         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+@@ -2596,19 +2935,23 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
+     return result;
+ }
+ 
+ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+     int32_t n_max = 0;
+ 
+     for (const auto type : spec->types) {
+         switch (type) {
++            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
++                // a lookup window may run two tokens past the MTP's
++                n_max = std::max(n_max, std::max(0, spec->draft.n_max) +
++                        (common_speculative_mtp_lookup_enabled() && spec->draft.n_max >= 1 ? 2 : 0));
++                break;
+             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+-            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
+                 break;
+             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                 n_max = std::max(n_max, (int32_t) spec->ngram_simple.size_m);
+                 break;
+             case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ffad54935..08f8585aa 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,9 +1,11 @@
+ #include "llama-graph.h"
++#include "llama-vocab.h"
++
+ #ifdef TOSH_ENABLE_DYNAMIC_MOE
+ #include "tosh-dmoe.h"
+ #endif
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-tosh-dmoe.h"
+ #include "llama-batch.h"
+@@ -1608,16 +1610,46 @@ ggml_tensor * llm_graph_context::build_hadamard_lookup(
+     // latent rows back to the primal basis: h = s * (H z)
+     rows = llama_mul_mat_hadamard(ctx0, rows, it->second.rot);
+     if (it->second.signs) {
+         rows = ggml_mul(ctx0, rows, it->second.signs);
+     }
+     return rows;
+ }
+ 
++ggml_tensor * llm_graph_context::build_mtp_head(
++        const llama_vocab & vocab,
++              ggml_tensor * head_w,
++              ggml_tensor * head_s,
++              ggml_tensor * cur) const {
++    const int64_t n_vocab = head_w->ne[1];
++    // Qwen 3.x keeps the byte-level BPE ranks of its 151643-token predecessor first; the rows after
++    // them are rarer scripts, which a draft seldom needs and every draft token pays to score
++    static const int64_t rows = getenv("TOSH_MTP_HEAD_ROWS") ? atoll(getenv("TOSH_MTP_HEAD_ROWS")) : 151643;
++    static const int64_t tail = [&] {
++        for (int64_t id = std::max<int64_t>(rows, 0); id < n_vocab; ++id) {
++            if (vocab.token_get_attr((llama_token) id) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) {
++                return id;
++            }
++        }
++        return n_vocab;
++    }();
++    if (rows <= 0 || n_vocab <= 200000 || rows >= n_vocab || head_s != nullptr || n_vocab - tail > 4096) {
++        return build_lora_mm(head_w, cur, head_s);
++    }
++    ggml_tensor * head = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, head_w, head_w->ne[0], rows, head_w->nb[1], 0), cur);
++    head = ggml_pad(ctx0, head, (int) (tail - rows), 0, 0, 0);
++    if (tail < n_vocab) {
++        ggml_tensor * special = ggml_mul_mat(ctx0,
++                ggml_view_2d(ctx0, head_w, head_w->ne[0], n_vocab - tail, head_w->nb[1], tail*head_w->nb[1]), cur);
++        head = ggml_concat(ctx0, head, special, 0);
++    }
++    return head;
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+     ggml_tensor * res = ggml_mul_mat(ctx0, w, build_hadamard_input(w, cur));
+ 
+     if (prec_policy) {
+         prec_policy->apply(res);
+@@ -3042,16 +3074,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             }
+         }
+ 
+         const int64_t orig_head_v = hparams.n_embd_head_v(il);
+         if (orig_head_v != kqv->ne[0]) {
+             kqv = ggml_view_4d(ctx0, kqv, orig_head_v, kqv->ne[1], kqv->ne[2], kqv->ne[3], kqv->nb[1], kqv->nb[2], kqv->nb[3], 0);
+             kqv = ggml_cont(ctx0, kqv);
+         }
++
+         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+         if (v_mla) {
+             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+             cb(kqv, "kqv_mla", il);
+         }
+ 
+         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+ 
+@@ -3259,16 +3292,83 @@ ggml_tensor * llm_graph_context::build_attn(
+ 
+     if (wo_b) {
+         cur = ggml_add(ctx0, cur, wo_b);
+     }
+ 
+     return cur;
+ }
+ 
++bool llm_graph_context::mtp_kv_only() const {
++    static const bool disabled = getenv("TOSH_MTP_KV_ONLY_DISABLE") != nullptr;
++
++    return !disabled && n_outputs == 0;
++}
++
++void llm_graph_context::build_attn_kv_store(
++        llm_graph_input_attn_kv * inp,
++        ggml_tensor * k_cur,
++        ggml_tensor * v_cur,
++                int   il) const {
++    if (inp->self_k_rot) {
++        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
++    }
++
++    if (inp->self_v_rot) {
++        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
++    }
++
++    ggml_build_forward_expand(gf, v_cur);
++    ggml_build_forward_expand(gf, k_cur);
++
++    const auto * mctx_cur = inp->mctx;
++
++    const auto & k_idxs = inp->get_k_idxs();
++    const auto & v_idxs = inp->get_v_idxs();
++
++    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
++    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
++}
++
++void llm_graph_context::build_attn_kv_store(
++        llm_graph_input_attn_kv_iswa * inp,
++        ggml_tensor * k_cur,
++        ggml_tensor * v_cur,
++                int   il) const {
++    const bool is_swa = hparams.is_swa(il);
++
++    auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
++    auto * v_rot = is_swa ? inp->self_v_rot_swa : inp->self_v_rot;
++
++    if (k_rot && k_cur) {
++        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, k_rot);
++    }
++
++    if (v_rot && v_cur) {
++        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, v_rot);
++    }
++
++    const auto * mctx_cur = is_swa ? inp->mctx->get_swa() : inp->mctx->get_base();
++
++    if (k_cur) {
++        ggml_build_forward_expand(gf, k_cur);
++
++        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
++
++        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
++    }
++
++    if (v_cur) {
++        ggml_build_forward_expand(gf, v_cur);
++
++        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
++
++        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
++    }
++}
+ 
+ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
+            ggml_context * ctx0,
+      const llama_ubatch & ubatch,
+     const llama_hparams & hparams,
+     const llama_cparams & cparams,
+     const llama_kv_cache_context * mctx_cur) {
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 568ca7a0a..6ec5c4c48 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -26,16 +26,17 @@ struct llama_hadamard_transform {
+     // perm_rep > 1: the activation arrives as [hd, nk, rep] and the fold expects [hd, rep, nk]
+     int64_t perm_hd  = 0;
+     int64_t perm_nk  = 0;
+     int64_t perm_rep = 0;
+ };
+ using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+ 
+ struct llama_cparams;
++struct llama_vocab;
+ struct llama_layer;
+ struct llama_prec_policy;
+ 
+ struct llama_memory_context_i;
+ 
+ class llama_kv_cache_context;
+ class llama_kv_cache_dsa_context;
+ class llama_kv_cache_dsa_iswa_context;
+@@ -1095,16 +1096,24 @@ struct llm_graph_context {
+               const llama_hadamard_rotations * inverses = nullptr) const;
+ 
+     // do mat_mul, while optionally apply lora and per-tensor scale
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+               ggml_tensor * cur,
+               ggml_tensor * w_s = nullptr) const;
+ 
++    // logits of a draft head over the frequent prefix of a large vocabulary plus the control
++    // tokens at its end; the rest stay 0, which a top candidate always beats
++    ggml_tensor * build_mtp_head(
++        const llama_vocab & vocab,
++              ggml_tensor * head_w,
++              ggml_tensor * head_s,
++              ggml_tensor * cur) const;
++
+     // do mat_mul_id, while optionally apply lora and per-expert scale
+     ggml_tensor * build_lora_mm_id(
+               ggml_tensor * w,   // ggml_tensor * as
+               ggml_tensor * cur, // ggml_tensor * b
+               ggml_tensor * ids,
+               ggml_tensor * w_s = nullptr) const;
+ 
+     ggml_tensor * build_norm(
+@@ -1262,16 +1271,32 @@ struct llm_graph_context {
+             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+             ggml_tensor * kq_b,
+             ggml_tensor * sinks, // [n_head_q]
+             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
+                   float   kq_scale,
+                     int   il) const;
+ 
++    // true on the MTP catch-up decode, whose output nobody reads: the graph can end at the K/V store
++    bool mtp_kv_only() const;
++
++    // write K/V into the cache without attending, for passes whose output nobody reads
++    void build_attn_kv_store(
++            llm_graph_input_attn_kv * inp,
++            ggml_tensor * k_cur,
++            ggml_tensor * v_cur,
++                    int   il) const;
++
++    void build_attn_kv_store(
++            llm_graph_input_attn_kv_iswa * inp,
++            ggml_tensor * k_cur,
++            ggml_tensor * v_cur,
++                    int   il) const;
++
+     llm_graph_input_attn_k  * build_attn_inp_k() const;
+ 
+     ggml_tensor * build_attn(
+             llm_graph_input_attn_k * inp,
+             ggml_tensor * wo,
+             ggml_tensor * wo_b,
+             ggml_tensor * wo_s,
+             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+diff --git a/src/models/cohere2moe.cpp b/src/models/cohere2moe.cpp
+index cf2af012d..4c369a684 100644
+--- a/src/models/cohere2moe.cpp
++++ b/src/models/cohere2moe.cpp
+@@ -329,18 +329,20 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
+     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+     ggml_set_input(inp->h);
+     ggml_set_name(inp->h, "mtp_h_input");
+ 
+     ggml_tensor * h_embd = inp->h;
+ 
+     res->add_input(std::move(inp));
+ 
++    const bool kv_only = mtp_kv_only();
++
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+     auto * inp_attn = build_attn_inp_kv_iswa();
+ 
+     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, cohere2moe_norm_type, il);
+     cb(h_norm, "mtp_hnorm", il);
+ 
+     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, cohere2moe_norm_type, il);
+     cb(e_norm, "mtp_enorm", il);
+ 
+@@ -366,16 +368,21 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llama_model & model, const ll
+             ctx0, Kcur, inp_pos, rope_factors,
+             n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+ 
+     cb(Qcur, "mtp_Qcur", il);
+     cb(Kcur, "mtp_Kcur", il);
+     cb(Vcur, "mtp_Vcur", il);
+ 
++    if (kv_only) {
++        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
++        return;
++    }
++
+     cur = build_attn(inp_attn,
+             layer.wo, layer.wo_b, layer.wo_s,
+             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+             1.0f / sqrtf(float(n_embd_head)), il);
+     cb(cur, "mtp_attn_out", il);
+ 
+     ggml_tensor * attn_out = cur;
+ 
+diff --git a/src/models/hy-v3.cpp b/src/models/hy-v3.cpp
+index f6b72d843..e4929ec84 100644
+--- a/src/models/hy-v3.cpp
++++ b/src/models/hy-v3.cpp
+@@ -266,18 +266,20 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
+     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+ 
+     ggml_tensor * h_input  = inp->embd;
+     ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+     cb(tok_embd, "mtp_tok_embd", il);
+ 
+     res->add_input(std::move(inp));
+ 
++    const bool kv_only = mtp_kv_only();
++
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+     auto * inp_attn           = build_attn_inp_kv();
+ 
+     ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+     cb(h_norm, "mtp_hnorm", il);
+ 
+     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+     cb(e_norm, "mtp_enorm", il);
+ 
+@@ -303,16 +305,21 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llama_model & model, const llm_gra
+ 
+         Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, rope_factors,
+                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                 ext_factor, attn_factor, beta_fast, beta_slow);
+         Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, rope_factors,
+                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                 ext_factor, attn_factor, beta_fast, beta_slow);
+ 
++        if (kv_only) {
++            build_attn_kv_store(inp_attn, Kcur, Vcur, il);
++            return;
++        }
++
+         const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
+ 
+         cur = build_attn(inp_attn,
+                 layer.wo, layer.wo_b, layer.wo_s,
+                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+         cb(cur, "mtp_attn_out", il);
+     }
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index d42798103..7dbaa9b51 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -554,18 +554,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+     ggml_set_input(inp->h);
+     ggml_set_name(inp->h, "mtp_h_input");
+ 
+     ggml_tensor * h_embd = inp->h;
+ 
+     res->add_input(std::move(inp));
+ 
++    const bool kv_only = mtp_kv_only();
++
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+     cb(h_norm, "mtp_hnorm", il);
+ 
+     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+     cb(e_norm, "mtp_enorm", il);
+@@ -613,16 +615,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+ 
++    if (kv_only) {
++        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
++        return;
++    }
++
+     const float kq_scale = hparams.f_attention_scale == 0.0f
+             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+     cur = build_attn(inp_attn,
+             nullptr, nullptr, nullptr,
+             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+     cb(cur, "mtp_attn_pregate", il);
+ 
+@@ -658,14 +665,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     res->t_h_nextn = cur;
+ 
+     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    cur = build_mtp_head(model.vocab, head_w, head_s, cur);
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+     ggml_build_forward_expand(gf, cur);
+ }
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index e4c415642..d85edbc1f 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -604,18 +604,20 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+     ggml_set_input(inp->h);
+     ggml_set_name(inp->h, "mtp_h_input");
+ 
+     ggml_tensor * h_embd = inp->h;
+ 
+     res->add_input(std::move(inp));
+ 
++    const bool kv_only = mtp_kv_only();
++
+     ggml_tensor * inp_pos     = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
+ 
+     auto * inp_attn = build_attn_inp_kv();
+ 
+     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
+     cb(h_norm, "mtp_hnorm", il);
+ 
+     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+     cb(e_norm, "mtp_enorm", il);
+@@ -663,16 +665,21 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+ 
+     Qcur = ggml_rope_multi(ctx0, Qcur, inp_pos, nullptr,
+             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+     Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+             ext_factor, attn_factor, beta_fast, beta_slow);
+ 
++    if (kv_only) {
++        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
++        return;
++    }
++
+     const float kq_scale = hparams.f_attention_scale == 0.0f
+             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+     cur = build_attn(inp_attn,
+             nullptr, nullptr, nullptr,
+             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+     cb(cur, "mtp_attn_pregate", il);
+ 
+@@ -741,14 +748,14 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     res->t_h_nextn= cur;
+ 
+     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     cb(cur, "mtp_shared_head_norm", -1);
+ 
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++    cur = build_mtp_head(model.vocab, head_w, head_s, cur);
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+     ggml_build_forward_expand(gf, cur);
+ }
+diff --git a/src/models/step35.cpp b/src/models/step35.cpp
+index ca68855d8..8ebc76dbf 100644
+--- a/src/models/step35.cpp
++++ b/src/models/step35.cpp
+@@ -459,16 +459,21 @@ llama_model_step35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+         ext_factor, attn_factor, beta_fast, beta_slow);
+     Kcur = ggml_rope_ext(
+         ctx0, Kcur, inp_pos, rope_factors,
+         n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+         ext_factor, attn_factor, beta_fast, beta_slow);
+     cb(Qcur, "mtp_Qcur_pos", il);
+     cb(Kcur, "mtp_Kcur_pos", il);
+ 
++    if (mtp_kv_only()) {
++        build_attn_kv_store(inp_attn, Kcur, Vcur, il);
++        return;
++    }
++
+     const float kq_scale = 1.0f / sqrtf(float(n_embd_head_k));
+     ggml_tensor * attn_out = build_attn(inp_attn,
+             nullptr, nullptr, nullptr,
+             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+     cb(attn_out, "mtp_attn_out", il);
+ 
+     // head-wise attention gate: sigmoid(g_proj(x))
+     if (layer.wqkv_gate) {

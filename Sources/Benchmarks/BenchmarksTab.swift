@@ -37,6 +37,8 @@ struct BenchmarksView: View {
     @State private var hardware = HardwareInfo.detect()
     @State private var outputDismissed = false
     @State private var configFieldsWide = true
+    @State private var systemFactsWide = true
+    @State private var resultsCompact = false
 
     private var gpus: [GPUDevice] { hardware.gpus }
     private var busy: Bool { bench.running || bench.sweeping }
@@ -193,11 +195,15 @@ struct BenchmarksView: View {
                               systemImage: showAdvanced ? "chevron.up" : "slider.horizontal.3")
                     }
                     .glassButton().controlSize(.small)
+                    .labelStyle(CompactLabelStyle(compact: !configFieldsWide))
+                    .help(loc.t("Opciones avanzadas de la prueba", "Advanced test options"))
 
                     Button { rememberWorkload(); bench.runReal(settings: cfg) } label: {
                         Label(loc.t("Generación real", "Real generation"), systemImage: "text.bubble")
                     }
                     .glassButton().controlSize(.small)
+                    .labelStyle(CompactLabelStyle(compact: !configFieldsWide))
+                    .help(loc.t("Mide la velocidad real con el servidor, MTP incluido", "Measures the real speed through the server, MTP included"))
                     .disabled(busy || cfg.modelPath.isEmpty
                               || server.state == .running || server.state == .starting)
 
@@ -205,6 +211,8 @@ struct BenchmarksView: View {
                         Label(loc.t("Compartir", "Share"), systemImage: "person.3")
                     }
                     .glassButton().controlSize(.small)
+                    .labelStyle(CompactLabelStyle(compact: !configFieldsWide))
+                    .help(loc.t("Comparte un resultado con la comunidad", "Shares a result with the community"))
                     .disabled(busy || cfg.modelPath.isEmpty)
 
                     if busy {
@@ -341,7 +349,7 @@ struct BenchmarksView: View {
     private var compactWorkloadFields: some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(loc.t("CARGA", "WORKLOAD"))
-                .font(.system(size: 9, weight: .semibold)).tracking(0.6)
+                .font(.system(size: 10, weight: .semibold)).tracking(0.6)
                 .foregroundStyle(.tertiary)
             HStack(spacing: 8) {
                 compactNumberField("Prompt", value: $cfg.benchPP)
@@ -353,7 +361,7 @@ struct BenchmarksView: View {
 
     private func compactNumberField(_ label: String, value: Binding<Int>) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(label).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+            Text(label).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             BenchmarkIntegerField(value: value)
                 .frame(height: 17)
                 .padding(.horizontal, 8).padding(.vertical, 6)
@@ -606,7 +614,7 @@ struct BenchmarksView: View {
                                       @ViewBuilder _ content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label.uppercased())
-                .font(.system(size: 9, weight: .semibold)).tracking(0.6)
+                .font(.system(size: 10, weight: .semibold)).tracking(0.6)
                 .foregroundStyle(.tertiary)
             content()
         }
@@ -624,7 +632,7 @@ struct BenchmarksView: View {
                 Text(title.uppercased())
                 Text(flag).foregroundStyle(.tertiary)
             }
-            .font(.system(size: 9, weight: .semibold)).tracking(0.5).foregroundStyle(.secondary)
+            .font(.system(size: 10, weight: .semibold)).tracking(0.5).foregroundStyle(.secondary)
             BenchmarkIntegerField(value: value, pointSize: 15)
                 .padding(.horizontal, 9).padding(.vertical, 7)
                 .background(WorkspaceStyle.surface, in: RoundedRectangle(cornerRadius: 8))
@@ -693,7 +701,7 @@ struct BenchmarksView: View {
                                 ProgressView(value: min(vram, 1))
                                     .tint(vram > 0.95 ? .orange : .pink)
                                 Text(vram, format: .percent.precision(.fractionLength(0)))
-                                    .font(.system(size: 9.5, design: .monospaced))
+                                    .font(.system(size: 10, design: .monospaced))
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -767,20 +775,43 @@ struct BenchmarksView: View {
 
     private var systemCard: some View {
         Card(title: loc.t("Tu sistema", "Your system"), icon: "cpu") {
-            HStack(spacing: 0) {
-                systemFact("cpu", hardware.cpuBrand,
-                           "\(hardware.physicalCores) cores / \(hardware.logicalCores) threads")
-                systemDivider
-                systemFact("memorychip", String(format: "%.0f GB RAM", hardware.ramGB), hardware.arch)
-                systemDivider
-                systemFact("display", hardware.bestGPU?.name ?? "GPU",
-                           hardware.bestGPU.map { "\($0.vramGB) GB VRAM" } ?? "—")
-                systemDivider
-                systemFact("apple.logo", hardware.osVersion, hardware.model)
-                systemDivider
-                systemFact("bolt.fill", "Metal", faChipText(cfg.benchmarkFlashAttentionRoute))
+            Group {
+                if systemFactsWide {
+                    HStack(spacing: 0) {
+                        cpuFact; systemDivider; ramFact; systemDivider; gpuFact
+                        systemDivider; osFact; systemDivider; engineFact
+                    }
+                } else {
+                    // two rows on the same three columns, so the second lines up under the first
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 0) { cpuFact; systemDivider; ramFact; systemDivider; gpuFact }
+                        HStack(spacing: 0) {
+                            osFact; systemDivider; engineFact
+                            systemDivider.hidden(); Color.clear.frame(maxWidth: .infinity, maxHeight: 1)
+                        }
+                    }
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onGeometryChange(for: Bool.self) { $0.size.width >= 1000 } action: { systemFactsWide = $0 }
         }
+    }
+
+    private var cpuFact: some View {
+        systemFact("cpu", hardware.cpuShortName,
+                   loc.t("%@ núcleos / %@ hilos", "%@ cores / %@ threads",
+                         "\(hardware.physicalCores)", "\(hardware.logicalCores)"))
+    }
+    private var ramFact: some View {
+        systemFact("memorychip", String(format: "%.0f GB RAM", hardware.ramGB), hardware.arch)
+    }
+    private var gpuFact: some View {
+        systemFact("display", hardware.bestGPU?.name ?? "GPU",
+                   hardware.bestGPU.map { "\($0.vramGB) GB VRAM" } ?? "—")
+    }
+    private var osFact: some View { systemFact("apple.logo", hardware.osVersion, hardware.model) }
+    private var engineFact: some View {
+        systemFact("bolt.fill", "Metal", faChipText(cfg.benchmarkFlashAttentionRoute))
     }
 
     @ViewBuilder private var contextualStatusCard: some View {
@@ -804,6 +835,7 @@ struct BenchmarksView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .help("\(title) · \(subtitle)")
     }
 
     private var systemDivider: some View {
@@ -863,45 +895,59 @@ struct BenchmarksView: View {
 
     private var resultsCard: some View {
         let visible = Array(filteredResults.prefix(resultsLimit))
-        let maxPrompt = visible.map(\.pp).max() ?? 1
-        let maxGeneration = visible.map(\.tg).max() ?? 1
         return Card(title: loc.t("Resultados", "Results"), icon: "tablecells",
                     trailing: {
                         Text("\(visible.count) / \(filteredResults.count)")
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }) {
-            // Narrower than its columns it scrolls sideways, so the table never asks the
-            // window for more width than it has.
-            ScrollView(.horizontal) {
-                VStack(spacing: 0) {
-                    BenchmarkResultTableHeader(loc: loc)
-                    Divider()
-                    ForEach(visible) { result in
-                        BenchmarkResultTableRow(result: result,
-                                                isBest: result.id == bench.history.max(by: { $0.tg < $1.tg })?.id,
-                                                maxPrompt: maxPrompt,
-                                                maxGeneration: maxGeneration,
-                                                loc: loc,
-                                                onSaveProfile: { promptSave(result) },
-                                                onApplyGlobal: { applyGlobal(result) },
-                                                onDelete: { bench.delete(result) })
-                        if result.id != visible.last?.id { Divider().opacity(0.45) }
+            // Narrower than its columns, each row stacks its details under the model instead of
+            // scrolling sideways, so the speeds and actions never sit past the edge.
+            Group {
+                if resultsCompact {
+                    resultsRows(visible, compact: true)
+                } else {
+                    ScrollView(.horizontal) {
+                        resultsRows(visible, compact: false)
+                            .containerRelativeFrame(.horizontal) { width, _ in max(width, Self.resultsTableMinWidth) }
                     }
-                    if visible.isEmpty {
-                        ContentUnavailableView.search(text: resultSearch)
-                            .frame(height: 120)
-                    }
-                    if visible.count < filteredResults.count {
-                        Divider().opacity(0.45)
-                        BenchmarkLoadMoreButton(remaining: filteredResults.count - visible.count,
-                                                loc: loc) {
-                            resultsLimit = min(resultsLimit + 20, filteredResults.count)
-                        }
-                    }
+                    .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
                 }
-                .containerRelativeFrame(.horizontal) { width, _ in max(width, Self.resultsTableMinWidth) }
             }
-            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .frame(maxWidth: .infinity)
+            .onGeometryChange(for: Bool.self) { $0.size.width < Self.resultsTableMinWidth } action: { resultsCompact = $0 }
+        }
+    }
+
+    private func resultsRows(_ visible: [BenchResult], compact: Bool) -> some View {
+        let maxPrompt = visible.map(\.pp).max() ?? 1
+        let maxGeneration = visible.map(\.tg).max() ?? 1
+        let bestID = bench.history.max(by: { $0.tg < $1.tg })?.id
+        return VStack(spacing: 0) {
+            BenchmarkResultTableHeader(loc: loc, compact: compact)
+            Divider()
+            ForEach(visible) { result in
+                BenchmarkResultTableRow(result: result,
+                                        isBest: result.id == bestID,
+                                        maxPrompt: maxPrompt,
+                                        maxGeneration: maxGeneration,
+                                        compact: compact,
+                                        loc: loc,
+                                        onSaveProfile: { promptSave(result) },
+                                        onApplyGlobal: { applyGlobal(result) },
+                                        onDelete: { bench.delete(result) })
+                if result.id != visible.last?.id { Divider().opacity(0.45) }
+            }
+            if visible.isEmpty {
+                ContentUnavailableView.search(text: resultSearch)
+                    .frame(height: 120)
+            }
+            if visible.count < filteredResults.count {
+                Divider().opacity(0.45)
+                BenchmarkLoadMoreButton(remaining: filteredResults.count - visible.count,
+                                        loc: loc) {
+                    resultsLimit = min(resultsLimit + 20, filteredResults.count)
+                }
+            }
         }
     }
 
@@ -914,25 +960,34 @@ struct BenchmarksView: View {
     // MARK: best results
 
     private var bestCards: some View {
-        HStack(spacing: 12) {
-            if let best = bench.history.max(by: { $0.tg < $1.tg }) {
-                bestCard(title: loc.t("Mejor generación", "Best generation"),
-                         icon: "bolt.fill", value: best.tg, color: Color.appAccent, result: best)
-            }
-            if let best = bench.history.max(by: { $0.pp < $1.pp }) {
-                bestCard(title: loc.t("Mejor prompt", "Best prompt"),
-                         icon: "text.alignleft", value: best.pp, color: Color.chartSecondary.opacity(0.85), result: best)
-            }
-            summaryStatCard(title: loc.t("Total de pruebas", "Total runs"), icon: "clock",
-                            value: "\(bench.history.count)",
-                            subtitle: loc.t("en %@ modelos", "across %@ models",
-                                            "\(Set(bench.history.map(\.shortModel)).count)"),
-                            color: .purple)
-            summaryStatCard(title: loc.t("Completadas", "Completed"), icon: "checkmark",
-                            value: "100%", subtitle: loc.t("Sin errores guardados", "No saved errors"),
-                            color: .green)
+        AdaptiveTwoUp(threshold: 840, spacing: 12) {
+            HStack(spacing: 12) { bestResultCards }
+        } second: {
+            HStack(spacing: 12) { summaryCards }
         }
         .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder private var bestResultCards: some View {
+        if let best = bench.history.max(by: { $0.tg < $1.tg }) {
+            bestCard(title: loc.t("Mejor generación", "Best generation"),
+                     icon: "bolt.fill", value: best.tg, color: Color.appAccent, result: best)
+        }
+        if let best = bench.history.max(by: { $0.pp < $1.pp }) {
+            bestCard(title: loc.t("Mejor prompt", "Best prompt"),
+                     icon: "text.alignleft", value: best.pp, color: Color.chartSecondary.opacity(0.85), result: best)
+        }
+    }
+
+    @ViewBuilder private var summaryCards: some View {
+        summaryStatCard(title: loc.t("Total de pruebas", "Total runs"), icon: "clock",
+                        value: "\(bench.history.count)",
+                        subtitle: loc.t("en %@ modelos", "across %@ models",
+                                        "\(Set(bench.history.map(\.shortModel)).count)"),
+                        color: .purple)
+        summaryStatCard(title: loc.t("Completadas", "Completed"), icon: "checkmark",
+                        value: "100%", subtitle: loc.t("Sin errores guardados", "No saved errors"),
+                        color: .green)
     }
 
     /// Save a run's config snapshot as a profile (name prompt) / apply it to the
@@ -971,7 +1026,7 @@ struct BenchmarksView: View {
                     .background(color.opacity(0.15), in: Circle())
                 Text(title.uppercased())
                     .font(.system(size: 10, weight: .bold)).tracking(0.6)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
                 Spacer()
             }
 
@@ -1006,7 +1061,7 @@ struct BenchmarksView: View {
                     .font(.system(size: 13, weight: .semibold)).foregroundStyle(color)
                     .frame(width: 28, height: 28).background(color.opacity(0.15), in: Circle())
                 Text(title.uppercased()).font(.system(size: 10, weight: .bold)).tracking(0.6)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
                 Spacer()
             }
             Text(value).font(.system(size: 29, weight: .bold, design: .rounded)).foregroundStyle(color)
@@ -1339,22 +1394,30 @@ private struct BenchmarkIntegerField: NSViewRepresentable {
 
 private struct BenchmarkResultTableHeader: View {
     let loc: Localizer
+    var compact = false
 
     var body: some View {
         HStack(spacing: 12) {
-            Text(loc.t("MODELO", "MODEL")).frame(minWidth: 230, maxWidth: .infinity, alignment: .leading)
-            Text(loc.t("QUANT", "QUANT")).frame(width: 96, alignment: .leading)
-            Text(loc.t("CONFIGURACIÓN / GPU", "CONFIGURATION / GPU"))
-                .frame(width: 180, alignment: .leading)
+            if compact {
+                Text(loc.t("MODELO Y CONFIGURACIÓN", "MODEL AND CONFIGURATION"))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text(loc.t("MODELO", "MODEL")).frame(minWidth: 230, maxWidth: .infinity, alignment: .leading)
+                Text(loc.t("QUANT", "QUANT")).frame(width: 96, alignment: .leading)
+                Text(loc.t("CONFIGURACIÓN / GPU", "CONFIGURATION / GPU"))
+                    .frame(width: 180, alignment: .leading)
+            }
             HStack(spacing: 14) {
                 Label("Prompt t/s", systemImage: "circle.fill").foregroundStyle(Color.chartSecondary)
                 Label(loc.t("Generación t/s", "Generation t/s"), systemImage: "circle.fill")
                     .foregroundStyle(Color.appAccent)
             }
-            .frame(minWidth: 300, maxWidth: .infinity, alignment: .leading)
+            .fixedSize()
+            .frame(minWidth: compact ? BenchmarkResultTableRow.compactMetricsWidth : 300,
+                   maxWidth: compact ? BenchmarkResultTableRow.compactMetricsWidth : .infinity, alignment: .leading)
             Text(loc.t("ACCIONES", "ACTIONS")).frame(width: 92, alignment: .trailing)
         }
-        .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+        .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
         .padding(.horizontal, 10).padding(.vertical, 7)
     }
 }
@@ -1364,87 +1427,149 @@ private struct BenchmarkResultTableRow: View, Equatable {
     let isBest: Bool
     let maxPrompt: Double
     let maxGeneration: Double
+    var compact = false
     let loc: Localizer
     let onSaveProfile: () -> Void
     let onApplyGlobal: () -> Void
     let onDelete: () -> Void
 
+    static let compactMetricsWidth: CGFloat = 200
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.result.id == rhs.result.id && lhs.isBest == rhs.isBest
             && lhs.maxPrompt == rhs.maxPrompt && lhs.maxGeneration == rhs.maxGeneration
+            && lhs.compact == rhs.compact
     }
 
     var body: some View {
+        Group {
+            if compact { compactRow } else { wideRow }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .contentShape(Rectangle())
+    }
+
+    private var wideRow: some View {
         HStack(spacing: 12) {
             HStack(spacing: 9) {
                 ModelBrandIcon(name: result.shortModel, size: 28)
                 VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) {
-                        Text(result.shortModel).font(.callout.weight(.semibold)).lineLimit(1)
-                        if isBest { Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(.yellow) }
-                        if let fa = result.faLabel {
-                            Label(fa, systemImage: "bolt.fill")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(Color.appAccent)
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(Color.appAccent.opacity(0.13), in: Capsule())
-                                .fixedSize()
-                        }
-                        if let dmoe = result.dynamicMoeLabel {
-                            Image(systemName: "memorychip")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(Color.chartSecondary)
-                                .padding(.horizontal, 5).padding(.vertical, 2)
-                                .background(Color.chartSecondary.opacity(0.13), in: Capsule())
-                                .help(loc.t("Medido con %@", "Measured with %@", dmoe))
-                        }
-                    }
-                    Text(result.date, format: .dateTime.day().month().hour().minute())
-                        .font(.caption2).foregroundStyle(.tertiary)
+                    titleLine
+                    dateLine
                 }
             }
             .frame(minWidth: 230, maxWidth: .infinity, alignment: .leading)
 
-            Text(result.quantization)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .padding(.horizontal, 6).padding(.vertical, 3)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .frame(width: 96, alignment: .leading)
+            quantChip.frame(width: 96, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(engineLine)
                     .font(.caption.weight(.medium)).lineLimit(1)
-                Text(result.gpu ?? loc.t("GPU predeterminada", "Default GPU"))
+                Text(gpuLine)
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                Text(workloadLine)
-                    .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundStyle(.secondary).lineLimit(1)
-                Text(storageAndVersionLine)
-                    .font(.system(size: 9.5, design: .monospaced))
-                    .foregroundStyle(.tertiary).lineLimit(1)
+                workloadText
+                storageText
             }
             .frame(width: 180, alignment: .leading)
             .help(completeConfiguration)
 
-            VStack(spacing: 5) {
-                tableMetric(value: result.pp, maximum: maxPrompt, color: Color.chartSecondary)
-                tableMetric(value: result.tg, maximum: maxGeneration, color: Color.appAccent)
-            }
-            .frame(minWidth: 300, maxWidth: .infinity)
-
-            HStack(spacing: 4) {
-                if result.profile != nil {
-                    tableAction("square.and.arrow.down", loc.t("Guardar como perfil", "Save as profile"), onSaveProfile)
-                    tableAction("checkmark.circle", loc.t("Aplicar a Ajustes", "Apply to Settings"), onApplyGlobal)
-                }
-                tableAction("trash", loc.t("Eliminar", "Delete"), destructive: true, onDelete)
-            }
-            .frame(width: 92, alignment: .trailing)
+            metrics.frame(minWidth: 300, maxWidth: .infinity)
+            actions
         }
-        .padding(.horizontal, 10).padding(.vertical, 7)
-        .contentShape(Rectangle())
+    }
+
+    private var compactRow: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ModelBrandIcon(name: result.shortModel, size: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    titleLine
+                    quantChip
+                }
+                dateLine
+                Text("\(engineLine) · \(gpuLine)")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                workloadText
+                storageText
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .help(completeConfiguration)
+            metrics
+                .frame(width: Self.compactMetricsWidth)
+                .padding(.top, 8)
+            actions.padding(.top, 4)
+        }
+    }
+
+    private var titleLine: some View {
+        HStack(spacing: 5) {
+            Text(result.shortModel).font(.callout.weight(.semibold)).lineLimit(1)
+            if isBest { Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(.yellow) }
+            if let fa = result.faLabel {
+                Label(fa, systemImage: "bolt.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.appAccent)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.appAccent.opacity(0.13), in: Capsule())
+                    .fixedSize()
+            }
+            if let dmoe = result.dynamicMoeLabel {
+                Image(systemName: "memorychip")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.chartSecondary)
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(Color.chartSecondary.opacity(0.13), in: Capsule())
+                    .help(loc.t("Medido con %@", "Measured with %@", dmoe))
+            }
+        }
+    }
+
+    private var dateLine: some View {
+        Text(result.date, format: .dateTime.day().month().hour().minute())
+            .font(.caption2).foregroundStyle(.tertiary)
+    }
+
+    private var quantChip: some View {
+        Text(result.quantization)
+            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 5))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var gpuLine: String { result.gpu ?? loc.t("GPU predeterminada", "Default GPU") }
+
+    private var workloadText: some View {
+        Text(workloadLine)
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.secondary).lineLimit(1)
+            .help(workloadLine)
+    }
+
+    private var storageText: some View {
+        Text(storageAndVersionLine)
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(.tertiary).lineLimit(1)
+            .help(storageAndVersionLine)
+    }
+
+    private var metrics: some View {
+        VStack(spacing: 5) {
+            tableMetric(value: result.pp, maximum: maxPrompt, color: Color.chartSecondary)
+            tableMetric(value: result.tg, maximum: maxGeneration, color: Color.appAccent)
+        }
+    }
+
+    private var actions: some View {
+        HStack(spacing: 4) {
+            if result.profile != nil {
+                tableAction("square.and.arrow.down", loc.t("Guardar como perfil", "Save as profile"), onSaveProfile)
+                tableAction("checkmark.circle", loc.t("Aplicar a Ajustes", "Apply to Settings"), onApplyGlobal)
+            }
+            tableAction("trash", loc.t("Eliminar", "Delete"), destructive: true, onDelete)
+        }
+        .frame(width: 92, alignment: .trailing)
     }
 
     private var engineLine: String {
@@ -1483,8 +1608,7 @@ private struct BenchmarkResultTableRow: View, Equatable {
     }
 
     private var completeConfiguration: String {
-        [engineLine, result.gpu ?? loc.t("GPU predeterminada", "Default GPU"),
-         workloadLine, storageAndVersionLine].joined(separator: "\n")
+        [engineLine, gpuLine, workloadLine, storageAndVersionLine].joined(separator: "\n")
     }
 
     private func tableMetric(value: Double, maximum: Double, color: Color) -> some View {
@@ -1631,13 +1755,13 @@ private struct BenchHistoryRow: View, Equatable {
             // Fixed-width metric columns so values line up across rows.
             HStack(spacing: 18) {
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text("prompt").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Text("prompt").font(.system(size: 10)).foregroundStyle(.tertiary)
                     Text(String(format: "%.1f", r.pp))
                         .font(.system(.callout, design: .monospaced))
                 }
                 .frame(minWidth: 58, alignment: .trailing)
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text("gen").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    Text("gen").font(.system(size: 10)).foregroundStyle(.tertiary)
                     Text(String(format: "%.1f", r.tg))
                         .font(.system(.callout, design: .monospaced).weight(.semibold))
                         .foregroundStyle(Color.appAccent)

@@ -412,6 +412,12 @@ def ungrounded(answer, sources, results):
 
 # what becomes of a round that ended without tool calls
 
+def language_note(question):
+    """The notes below go to the model as the user's last message, and it answers in their language unless shown
+    the user's own words."""
+    return " Write the answer in the same language as this request from the user: \u00ab" + str(question)[:300] + "\u00bb"
+
+
 STANDING_NOTE = ("Answer in prose with the values the tools returned, written as they returned them; do not paste the "
                  "raw tool output. Do not add digits, constants, closed forms or intermediate steps that no tool "
                  "returned; say instead what was not computed.")

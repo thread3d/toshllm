@@ -10,14 +10,19 @@ struct ToolPermissionCard: View {
     @EnvironmentObject private var loc: Localizer
     @State private var showingArguments = false
 
+    private var usesInternet: Bool { request.name == ChatRoadRoute.toolName }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 9) {
-                Image(systemName: request.writesData ? "exclamationmark.shield.fill" : "checkmark.shield.fill")
-                    .foregroundStyle(request.writesData ? .orange : .blue)
+                Image(systemName: usesInternet ? "network" : request.writesData ? "exclamationmark.shield.fill" : "checkmark.shield.fill")
+                    .foregroundStyle(usesInternet || request.writesData ? .orange : .blue)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(request.displayName).font(.callout.weight(.semibold))
-                    Text(request.writesData
+                    Text(usesInternet
+                         ? loc.t("Envía los puntos a Apple Maps por internet para trazar la ruta por carretera. Si lo deniegas, se dibuja una línea recta.",
+                                 "Sends the points to Apple Maps over the internet to find the road route. If you deny it, a straight line is drawn.")
+                         : request.writesData
                          ? loc.t("Puede modificar archivos o ejecutar acciones.",
                                  "Can modify files or run actions.")
                          : loc.t("Solicita acceso de lectura.", "Requests read access."))

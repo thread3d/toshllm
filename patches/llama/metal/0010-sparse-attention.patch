@@ -1,0 +1,674 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 15cec07ac..f6745d185 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -507,16 +507,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
+         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+ 
+         ggml_metal_cv_free(cv);
+     }
+ 
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer_amd(
++        ggml_metal_library_t lib,
++        const ggml_tensor * op) {
++    GGML_ASSERT(op->op == GGML_OP_LIGHTNING_INDEXER);
++
++    char base[256];
++    char name[256];
++
++    const int16_t nh = op->src[0]->ne[1];
++
++    snprintf(base, 256, "kernel_lightning_indexer_amd_%s", ggml_type_name(op->src[1]->type));
++    snprintf(name, 256, "%s_nh=%d", base, nh);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int16(cv, nh, FC_LIGHTNING_INDEXER + 0);
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char name[256];
+     const char * base = nullptr;
+ 
+     switch (op->op) {
+         case GGML_OP_DSV4_HC_COMB:
+             base = "kernel_dsv4_hc_comb_f32";
+             snprintf(name, 256, "%s", base);
+@@ -2635,17 +2654,19 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(
+         ggml_metal_library_t lib,
+         const ggml_tensor * op) {
+     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+     assert(op->src[3]);
+ 
+     char name[256];
+ 
+-    snprintf(name, 256, "kernel_flash_attn_ext_vec_idx");
++    const int nw = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->simd_width;
++
++    snprintf(name, 256, "kernel_flash_attn_ext_vec_idx%s", nw == 64 ? "_w64" : "");
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+     if (!res.pipeline) {
+         res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+     }
+ 
+     GGML_UNUSED(op);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index d52df6700..597401cae 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -124,16 +124,17 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_blk        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_add        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer_amd(ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_decode   (ggml_metal_library_t lib, const struct ggml_tensor * op, bool silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index da30462f4..20c5489e7 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -2147,17 +2147,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                 default:
+                     return false;
+             }
+             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+         case GGML_OP_LIGHTNING_INDEXER:
+             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
+                 return false;
+             }
+-            if (!has_simdgroup_mm ||
++            if ((!has_simdgroup_mm && op->src[1]->type == GGML_TYPE_BF16) ||
+                 op->src[0]->type != GGML_TYPE_F32 ||
+                 op->src[2]->type != GGML_TYPE_F32 ||
+                 op->src[3]->type != GGML_TYPE_F16 ||
+                 op->type         != GGML_TYPE_F32 ||
+                 !ggml_is_contiguous_rows(op->src[0]) ||
+                 !ggml_is_contiguous_rows(op->src[1]) ||
+                 !ggml_is_contiguous_rows(op->src[2]) ||
+                 !ggml_is_contiguous_rows(op->src[3])) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 8f34d24f2..578a9a80f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -139,16 +139,19 @@
+ #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
+ #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
+ 
+ #define OP_LIGHTNING_INDEXER_DK    128
+ #define OP_LIGHTNING_INDEXER_NHPTG   8
+ #define OP_LIGHTNING_INDEXER_NKPSG   8
+ #define OP_LIGHTNING_INDEXER_NSG     8
+ #define OP_LIGHTNING_INDEXER_NBPTG   8
++// GPUs without simdgroup matrices: keys and query rows per threadgroup of the scalar kernel
++#define OP_LIGHTNING_INDEXER_AMD_NK  64
++#define OP_LIGHTNING_INDEXER_AMD_NB   4
+ 
+ #define OP_UNARY_NUM_SCALE      10
+ #define OP_UNARY_NUM_FILL       11
+ #define OP_UNARY_NUM_CLAMP      12
+ #define OP_UNARY_NUM_SQR        13
+ #define OP_UNARY_NUM_SQRT       14
+ #define OP_UNARY_NUM_SIN        15
+ #define OP_UNARY_NUM_COS        16
+@@ -482,16 +485,18 @@ typedef struct {
+     float    m1;
+     int32_t  n_head_log2;
+     float    logit_softcap;
+     int32_t  n_kv_max_padded;
+     int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
+ } ggml_metal_kargs_flash_attn_ext_vec;
+ 
++// the AMD kernels take their own copy: a field added to the upstream vec struct changes the
++// constant buffer layout and with it the code the Metal compiler emits for them
+     uint64_t nb23;
+     int32_t  ne31;
+     int32_t  ne32;
+     int32_t  ne33;
+     uint64_t nb31;
+     uint64_t nb32;
+     uint64_t nb33;
+     int32_t  ne1;
+@@ -500,16 +505,18 @@ typedef struct {
+     float    scale;
+     float    max_bias;
+     float    m0;
+     float    m1;
+     int32_t  n_head_log2;
+     float    logit_softcap;
+     int32_t  has_sinks; // read by the AMD kernels; upstream uses a function constant
+     int32_t  has_mask;  // 0 for bidirectional attention (vision towers), which has no mask
++    int32_t  n_kv_max_padded; // sparse: length of the per-row index list
++} ggml_metal_kargs_flash_attn_ext_amd;
+ typedef struct {
+     int32_t  ne30;
+     int32_t  ne31;
+     int32_t  ne32;
+     int32_t  ne33;
+     uint64_t nb31;
+     uint64_t nb32;
+     uint64_t nb33;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 44519f5aa..8bd07ad25 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1427,16 +1427,32 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+     };
+ 
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),  1);
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),  2);
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w),  3);
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(m),  4);
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+ 
++    // without simdgroup matrices (AMD) a scalar kernel keeps the indexer on the GPU
++    if (!ggml_metal_device_get_props(ctx->dev)->has_simdgroup_mm) {
++        const int nk = OP_LIGHTNING_INDEXER_AMD_NK;
++        const int nb = OP_LIGHTNING_INDEXER_AMD_NB;
++
++        auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer_amd(ctx->lib, op);
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
++        ggml_metal_encoder_dispatch_threadgroups(enc,
++                (k->ne[2] + nk - 1)/nk,
++                (q->ne[2] + nb - 1)/nb,
++                q->ne[3], nk*nb, 1, 1);
++
++        return 1;
++    }
++
+     const int nsg   = OP_LIGHTNING_INDEXER_NSG;
+     const int nkptg = OP_LIGHTNING_INDEXER_NKPSG*nsg;
+     const int nbptg = OP_LIGHTNING_INDEXER_NBPTG;
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(ctx->lib, op);
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+     ggml_metal_encoder_dispatch_threadgroups(enc,
+@@ -1709,16 +1725,17 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+ 
+     ggml_metal_kargs_ssm_conv args = {
+         /*.ne00 =*/ ne00,
+         /*.ne01 =*/ ne01,
+         /*.ne02 =*/ ne02,
+         /*.nb00 =*/ nb00,
+         /*.nb01 =*/ nb01,
+         /*.nb02 =*/ nb02,
++        /*.ne10 =*/ ne10,
+         /*.ne11 =*/ ne11,
+         /*.nb10 =*/ nb10,
+         /*.nb11 =*/ nb11,
+         /*.ne0  =*/ ne0,
+         /*.ne1  =*/ ne1,
+         /*.ne2  =*/ ne2,
+         /*.nb0  =*/ nb0,
+         /*.nb1  =*/ nb1,
+@@ -1749,17 +1766,17 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+ 
+         // Dispatch: ne01 rows, ceil(ne1/BATCH_SIZE) token batches, ne02 sequences
+         // Each threadgroup has BATCH_SIZE threads, each handling one token
+         const int n_token_batches = (ne1 + BATCH_SIZE - 1) / BATCH_SIZE;
+         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, n_token_batches, ne02, BATCH_SIZE, 1, 1);
+     } else {
+-        auto pipeline = ggml_metal_library_get_pipeline_ssm_conv(lib, op, (int32_t) ne10, use_silu);
++        // decode packs rows across a threadgroup; token/seq stay grid dims
+         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_decode(lib, op, use_silu);
+ 
+         ggml_metal_encoder_set_pipeline(enc, pipeline);
+         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+ 
+@@ -3813,16 +3830,22 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+                      (int) ne00, (int) ne20, ks, vs, props_dev->simd_width == 64 ? "_w64" : "");
+         }
+     }
+     // wave32 rides on simdgroup_reduction; wave64 uses the _w64 instantiations and
+     // is gated by wave64_decode (simdgroup_reduction is forced off there).
+     const bool fa_amd_width_ok = props_dev->simd_width == 32
+         ? props_dev->has_simdgroup_reduction
+         : props_dev->wave64_decode;
++    // sparse attention (QSA / DeepSeek-V4): the mask already carries the selection, the
++    // index kernel compacts it and the vec kernel walks the list instead of the whole cache
++    const int amd_n_kv_max = ggml_metal_op_flash_attn_ext_n_kv_max_sparse(op);
++    const bool amd_sparse  = amd_n_kv_max > 0 && ne01 == 1;
++    const int amd_n_kv_pad = amd_sparse ? GGML_PAD(amd_n_kv_max, OP_FLASH_ATTN_EXT_VEC_NCPSG) : 0;
++
+     if (TOSH_ENV("TOSH_FA_AMD") != NULL && fa_amd_pipeline[0] != '\0' &&
+         !props_dev->has_simdgroup_mm && fa_amd_width_ok &&
+         !has_bias && !has_scap) {
+ 
+         ggml_metal_kargs_flash_attn_ext_amd args = {
+             /*.ne01          =*/ ne01,
+             /*.ne02          =*/ ne02,
+             /*.ne03          =*/ ne03,
+@@ -3852,16 +3875,18 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             /*.scale         =*/ scale,
+             /*.max_bias      =*/ max_bias,
+             /*.m0            =*/ m0,
+             /*.m1            =*/ m1,
+             /*.n_head_log2   =*/ n_head_log2,
+             /*.logit_softcap =*/ logit_softcap,
+             /*.has_sinks     =*/ has_sinks ? 1 : 0,
+             /*.has_mask      =*/ has_mask ? 1 : 0,
++            /*.n_kv_max_padded =*/ amd_n_kv_pad,
++        };
+ 
+         // queries per threadgroup, matching the instantiation for this head size
+         static const bool pf512 = TOSH_ENV("TOSH_FA_PF_DK512") != nullptr;
+         // MLA keeps K wider than V; the tile kernel it used to fall back to measures ~26% slower
+         static const bool pfmla = TOSH_ENV("TOSH_FA_PF_MLA_DISABLE") == nullptr;
+         const bool fa_pf_512 = pf512 && ne00 == 512 && ne00 == ne20;
+         const bool fa_pf_mla = pfmla && ne00 == 576 && ne20 == 512 &&
+                                op->src[2]->type == GGML_TYPE_F16;
+@@ -4081,16 +4106,51 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             (props_dev->simd_width == 32 || props_dev->simd_width == 64) &&
+             (wg_dk128 || ne11 >= 1024) &&
+             TOSH_ENV("TOSH_FA_WG_DISABLE") == NULL ? 32 : 1;
+ 
+         char fa_amd_wg_pipeline[96];
+         if (fa_amd_nwg > 1) {
+             snprintf(fa_amd_wg_pipeline, sizeof(fa_amd_wg_pipeline), "%s_wg32", fa_amd_pipeline);
+         }
++
++        // sparse: build the compacted index list first, on the same encoder
++        ggml_metal_buffer_id bid_amd_idx = bid_tmp;
++        if (amd_sparse) {
++            bid_amd_idx.offs += ggml_metal_op_flash_attn_ext_extra_tmp(op)
++                              + ggml_metal_op_flash_attn_ext_extra_kv_f16(op);
++
++            ggml_metal_kargs_flash_attn_ext_vec_idx argsi = {
++                /*.ne30            =*/ ne30,
++                /*.ne31            =*/ ne31,
++                /*.ne32            =*/ ne32,
++                /*.ne33            =*/ ne33,
++                /*.nb31            =*/ nb31,
++                /*.nb32            =*/ nb32,
++                /*.nb33            =*/ nb33,
++                /*.n_kv_max        =*/ amd_n_kv_max,
++                /*.n_kv_max_padded =*/ amd_n_kv_pad,
++            };
++
++            auto pipei = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(lib, op);
++
++            ggml_metal_encoder_set_pipeline(enc, pipei);
++            ggml_metal_encoder_set_bytes   (enc, &argsi, sizeof(argsi), 0);
++            ggml_metal_encoder_set_buffer  (enc, bid_src3,    1);
++            ggml_metal_encoder_set_buffer  (enc, bid_amd_idx, 2);
++
++            int nthi = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipei), 256);
++            // whole simdgroups only: a partial one loses its slice of the count
++            const int nwi = props_dev->simd_width;
++            nthi = std::max(nwi, (nthi/nwi)*nwi);
++
++            ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, nthi, 1, 1);
++            ggml_metal_op_concurrency_reset(ctx);
++        }
++
+         auto pipeline = ggml_metal_fa_amd_pipeline(lib, fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
+         // 32 KB of threadgroup memory (GCN 1.0) does not hold the 64-lane kernel; its twin
+         // with half the simdgroups does. TOSH_FA_AMD_LDS32=1 takes the twin on any wave64 card.
+         static const bool lds32_force = TOSH_ENV("TOSH_FA_AMD_LDS32") != NULL;
+         if ((!pipeline.pipeline || lds32_force) && props_dev->simd_width == 64) {
+             char lds_pipeline[112];
+             snprintf(lds_pipeline, sizeof(lds_pipeline), "%s_lds32", fa_amd_nwg > 1 ? fa_amd_wg_pipeline : fa_amd_pipeline);
+             auto lds = ggml_metal_fa_amd_pipeline(lib, lds_pipeline);
+@@ -4116,16 +4176,18 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+         ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+         ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+         ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
+         ggml_metal_encoder_set_buffer  (enc, bid_pad,  6);
+         ggml_metal_encoder_set_buffer  (enc, fa_amd_nwg > 1 ? bid_tmp : bid_dst, 7);
++        ggml_metal_encoder_set_buffer  (enc, bid_amd_idx, 8);
++
+         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03*fa_amd_nwg, props_dev->simd_width, fa_amd_nsg, 1);
+ 
+         if (fa_amd_nwg > 1) {
+             ggml_metal_op_concurrency_reset(ctx);
+ 
+             ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = { (int32_t) (ne1*ne2*ne3) };
+ 
+             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, fa_amd_nwg);
+@@ -4552,17 +4614,19 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+             auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_idx(lib, op);
+ 
+             ggml_metal_encoder_set_pipeline(enc, pipeline0);
+             ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+             ggml_metal_encoder_set_buffer  (enc, bid_src3, 1);
+             ggml_metal_encoder_set_buffer  (enc, bid_idx,  2);
+ 
+             int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline0), 256);
+-            nth = std::max(32, (nth/32)*32);
++            // whole simdgroups only: a partial one loses its slice of the count
++            const int nw0 = props_dev->simd_width;
++            nth = std::max(nw0, (nth/nw0)*nw0);
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, ne31, ne32, ne33, nth, 1, 1);
+ 
+             need_sync = true;
+         }
+ 
+         if (has_kvpad) {
+             assert(ggml_metal_op_flash_attn_ext_extra_pad(op) != 0);
+diff --git a/ggml/src/ggml-metal/kernels/fa.metal b/ggml/src/ggml-metal/kernels/fa.metal
+index 1e1255daf..a38bfb471 100644
+--- a/ggml/src/ggml-metal/kernels/fa.metal
++++ b/ggml/src/ggml-metal/kernels/fa.metal
+@@ -1,26 +1,28 @@
+ #include "common.h"
+ #include "dequantize.h"
+ 
+ // AMD flash attention kernels; the upstream ones live in fa_*.metal
+ // vec kernel above miscompiles. Generalized over the K/V element type via the
++
+ template<
+     short DK, short NSG,
+     typename k_t, short NKK, void (*deq_k)(device const k_t *, short, thread float4 &),
+     typename v_t, short NKV, void (*deq_v)(device const v_t *, short, thread float4 &),
+ kernel void kernel_flash_attn_ext_vec_amd(
+         constant ggml_metal_kargs_flash_attn_ext_amd & args [[buffer(0)]],
+         device const char * q     [[buffer(1)]],
+         device const char * k     [[buffer(2)]],
+         device const char * v     [[buffer(3)]],
+         device const char * mask  [[buffer(4)]],
+         device const char * sinks [[buffer(5)]],
+         device const char * pad   [[buffer(6)]],
+         device       char * dst   [[buffer(7)]],
++        device const int  * idx   [[buffer(8)]],
+         uint3  tgpig [[threadgroup_position_in_grid]],
+         ushort tiisg [[thread_index_in_simdgroup]],
+         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+     // chunks per lane scale with the simd width; on wave64 with DK=128 the upper
+     // lanes own no chunk (guarded below) but still join the simd_sum reductions.
+     // heads narrower than the simd width would leave the upper lanes idle, so the
+     // simdgroup splits into RPS sub-groups that each take their own cache row
+     constexpr short SUBW = SUBWP ? SUBWP : (DV4 < NW ? DV4 : NW);
+@@ -54,34 +56,60 @@ kernel void kernel_flash_attn_ext_vec_amd(
+     device const char * kp = k + ikv2*args.nb12 + ikv3*args.nb13;
+     device const char * vp = v + ikv2*args.nb22 + ikv3*args.nb23;
+ 
+     // Without a mask ne32/ne33 are 0, so the index math would divide by zero.
+     device const half * pm = (device const half *) mask;
+     if (args.has_mask) {
+         pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+     }
++
++    // sparse: the index list is laid out per (row, head, batch), same as the mask
++    // sparse when the host filled the index list; uniform across the threadgroup
++    const bool has_sparse = args.n_kv_max_padded > 0;
++
++    device const int * pidx = nullptr;
++    if (has_sparse) {
++        pidx = idx +
++            ((int64_t)(iq3%args.ne33)*args.ne32 + (iq2%args.ne32))*args.ne31*args.n_kv_max_padded +
++            (iq1%args.ne31)*args.n_kv_max_padded;
++    }
++
+     const short sub  = tiisg/SUBW;
+     const short lch  = tiisg%SUBW;
+     const short gidx = sgitg*RPS + sub;
+ 
+         const short ch = lch + c*SUBW;
+         myq[c] = ch < DK4 ? q4[ch] : float4(0.0f);
+     }
+         acc[c] = float4(0.0f);
+     }
+     float m = -FLT_MAX/2;
+     float s = 0.0f;
+ 
++    // sparse walks the compacted index list instead of the whole cache; a padded slot is -1
++    const int n_kv = has_sparse ? args.n_kv_max_padded : args.ne11;
++
++    for (int j = (iwg*NSG + sgitg)*RPS + sub; j < n_kv; j += NWG*NG) {
++        const int i11 = has_sparse ? pidx[j] : j;
++
+         // no early-out: the sub-groups of a simdgroup sit on different rows, so the
+         // skip is not uniform and the shuffle reduction below would diverge
++        const float mv = (has_sparse && i11 < 0) ? -MAXHALF
++                       : (args.has_mask ? (float) pm[i11] : 0.0f);
+         const bool  msk = mv <= -1e30f;
+         if (RPS == 1 && msk) {
+             continue;
+         }
++
++        // a padded slot keeps running through the body to hold the reduction uniform, and its
++        // weight ends up zero, but the address is still formed: read row 0 instead of -1
++        const int i11a = i11 < 0 ? 0 : i11;
++
++        device const k_t * kb = (device const k_t *) (kp + (uint64_t) i11a*args.nb11);
+         float pl = 0.0f;
+             const short ch = lch + c*SUBW;
+             if (ch < DK4) {
+                 float4 kreg;
+                 deq_k(kb + ch/NKK, ch%NKK, kreg);
+                 pl += dot(myq[c], kreg);
+             }
+         }
+@@ -94,16 +122,17 @@ kernel void kernel_flash_attn_ext_vec_amd(
+         }
+         const float p = pl; // full DK-dim Q.K
+ 
+         const float pp   = p*args.scale + mv;
+         const float nm   = msk ? m : max(m, pp);
+         const float corr = exp(m  - nm);
+         const float w    = msk ? 0.0f : exp(pp - nm);
+ 
++        device const v_t * vb = (device const v_t *) (vp + (uint64_t) i11a*args.nb21);
+             const short ch = lch + c*SUBW;
+             if (ch < DV4) {
+                 float4 vreg;
+                 deq_v(vb + ch/NKV, ch%NKV, vreg);
+                 acc[c] = acc[c]*corr + w*vreg;
+             }
+         }
+         s = s*corr + w;
+@@ -849,8 +878,128 @@ FA_AMD_PF_INST_DV(320, 256, 16, 32, "kf16_vf16",   half4,      1, dequantize_f16
+ FA_AMD_PF_INST_DV(320, 256, 16, 32, "kq8_0_vq8_0", block_q8_0, 8, dequantize_q8_0_t4_h2, block_q8_0, 8, dequantize_q8_0_t4_h2)
+ #undef FA_AMD_PF_512
+ #undef FA_AMD_PF_PAIR
+ #undef FA_AMD_PF_INST
+ 
+ // note: I think the s_t can be half instead of float, because the Q*K scaling is done before storing to shared mem
+ //       in the other (non-vec) kernel, we need s_t to also be float because we scale during the soft_max
+ //
++
++constant short FC_lightning_indexer_amd_nh [[function_constant(FC_LIGHTNING_INDEXER + 0)]];
++
++// Lightning indexer for GPUs without simdgroup matrices: one thread per key and query row, with
++// the key tile and a few heads of the queries in threadgroup memory. It stays under 32 KB of it.
++template<
++    typename kd4x4_t,
++    short nl_k,
++    void (*deq_k)(device const kd4x4_t *, short, thread half4x4 &)>
++kernel void kernel_lightning_indexer_amd(
++        constant ggml_metal_kargs_lightning_indexer & args,
++        device const char * q,
++        device const char * k,
++        device const char * w,
++        device const char * m,
++        device       char * dst,
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]]) {
++    constexpr short DK   = OP_LIGHTNING_INDEXER_DK;
++    constexpr short DK4  = DK/4;
++    constexpr short DK16 = DK/16;
++    constexpr short NK   = OP_LIGHTNING_INDEXER_AMD_NK;
++    constexpr short NB   = OP_LIGHTNING_INDEXER_AMD_NB;
++    constexpr short NT   = NK*NB;
++    constexpr short NHC  = 8;
++    // a padded row puts the keys a simdgroup reads at the same step in different banks
++    constexpr short SKS  = DK4 + 1;
++
++    const short NH = FC_lightning_indexer_amd_nh;
++
++    threadgroup half4 sk[NK*SKS];
++    threadgroup half4 sq[NB*NHC*DK4];
++    threadgroup float sw[NB*NHC];
++
++    const int i_stream = tgpig.z;
++    const int i_kv_0   = tgpig.x*NK;
++    const int i_b_0    = tgpig.y*NB;
++
++    for (short i = tiitg; i < NK*DK16; i += NT) {
++        const short ik  = i/DK16;
++        const short i16 = i%DK16;
++
++        half4x4 tmp;
++        if (i_kv_0 + ik < args.n_kv) {
++            device const kd4x4_t * kr = (device const kd4x4_t *) (k + (uint64_t) (i_kv_0 + ik)*args.nbk2 + (uint64_t) i_stream*args.nbk3);
++            deq_k(kr + i16/nl_k, i16%nl_k, tmp);
++        } else {
++            for (short j = 0; j < 4; ++j) {
++                tmp[j] = half4(0.0h);
++            }
++        }
++        for (short j = 0; j < 4; ++j) {
++            sk[ik*SKS + i16*4 + j] = tmp[j];
++        }
++    }
++
++    const short ik = tiitg%NK;
++    const short ib = tiitg/NK;
++
++    float score = 0.0f;
++
++    for (short h0 = 0; h0 < NH; h0 += NHC) {
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        for (short i = tiitg; i < NB*NHC*DK4; i += NT) {
++            const short b  = i/(NHC*DK4);
++            const short h  = (i/DK4)%NHC;
++            const short i4 = i%DK4;
++            const int   bb = i_b_0 + b;
++
++            half4 v = half4(0.0h);
++            if (bb < args.n_batch && h0 + h < NH) {
++                device const float4 * q4 = (device const float4 *) (q + (uint64_t) bb*args.nbq2 + (uint64_t) i_stream*args.nbq3 + (uint64_t) (h0 + h)*args.nbq1);
++                v = half4(q4[i4]);
++            }
++            sq[i] = v;
++        }
++        for (short i = tiitg; i < NB*NHC; i += NT) {
++            const short b  = i/NHC;
++            const short h  = i%NHC;
++            const int   bb = i_b_0 + b;
++
++            sw[i] = bb < args.n_batch && h0 + h < NH
++                ? ((device const float *) (w + (uint64_t) bb*args.nbw1 + (uint64_t) i_stream*args.nbw3))[h0 + h]
++                : 0.0f;
++        }
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        threadgroup const half4 * kr = sk + ik*SKS;
++        for (short h = 0; h < NHC; ++h) {
++            threadgroup const half4 * qr = sq + (ib*NHC + h)*DK4;
++
++            float4 acc = 0.0f;
++            for (short i4 = 0; i4 < DK4; ++i4) {
++                acc += float4(kr[i4])*float4(qr[i4]);
++            }
++            score += max(acc[0] + acc[1] + acc[2] + acc[3], 0.0f)*sw[ib*NHC + h];
++        }
++    }
++
++    const int i_kv    = i_kv_0 + ik;
++    const int i_batch = i_b_0 + ib;
++    if (i_kv < args.n_kv && i_batch < args.n_batch) {
++        device const half  * pm = (device const half  *) (m   + (uint64_t) i_batch*args.nbm1 + (uint64_t) (i_stream % args.mask_ne3)*args.nbm3);
++        device       float * pd = (device       float *) (dst + (uint64_t) i_batch*args.nb1  + (uint64_t) i_stream*args.nb3);
++
++        pd[i_kv] = score + (float) pm[i_kv];
++    }
++}
++
++typedef decltype(kernel_lightning_indexer_amd<half4x4, 1, dequantize_f16>) kernel_lightning_indexer_amd_t;
++
++template [[host_name("kernel_lightning_indexer_amd_f32")]]  kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<float4x4,   1, dequantize_f32>;
++template [[host_name("kernel_lightning_indexer_amd_f16")]]  kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<half4x4,    1, dequantize_f16>;
++template [[host_name("kernel_lightning_indexer_amd_q4_0")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q4_0, 2, dequantize_q4_0>;
++template [[host_name("kernel_lightning_indexer_amd_q4_1")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q4_1, 2, dequantize_q4_1>;
++template [[host_name("kernel_lightning_indexer_amd_q5_0")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q5_0, 2, dequantize_q5_0>;
++template [[host_name("kernel_lightning_indexer_amd_q5_1")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q5_1, 2, dequantize_q5_1>;
++template [[host_name("kernel_lightning_indexer_amd_q8_0")]] kernel kernel_lightning_indexer_amd_t kernel_lightning_indexer_amd<block_q8_0, 2, dequantize_q8_0>;
+diff --git a/ggml/src/ggml-metal/kernels/fa_aux.metal b/ggml/src/ggml-metal/kernels/fa_aux.metal
+index ebee1becd..222545763 100644
+--- a/ggml/src/ggml-metal/kernels/fa_aux.metal
++++ b/ggml/src/ggml-metal/kernels/fa_aux.metal
+@@ -177,24 +177,24 @@ kernel void kernel_flash_attn_ext_blk(
+ 
+     if (tiisg == 0) {
+         dst[((i3*args.ne32 + i2)*nblk1 + i1)*nblk0 + i0] = res;
+     }
+ }
+ // compress the finite entries of each KQ mask row into a list of KV indices (ascending order),
+ // padded with -1 up to n_kv_max_padded (a multiple of OP_FLASH_ATTN_EXT_VEC_NCPSG)
+ // one threadgroup per mask row; the mask remains the single source of truth for the values
+-kernel void kernel_flash_attn_ext_vec_idx(
++template<short NW>
++kernel void kernel_flash_attn_ext_vec_idx_t(
+         constant ggml_metal_kargs_flash_attn_ext_vec_idx & args,
+         device const half * mask,
+         device       int  * idx,
+         uint3   tgpig[[threadgroup_position_in_grid]],
+         ushort  tiitg[[thread_index_in_threadgroup]],
+         ushort3 ntg[[threads_per_threadgroup]]) {
+-    constexpr short NW = N_SIMDWIDTH;
+     constexpr short NLOCAL = 32; // max finite positions kept in registers per thread
+ 
+     const int i1 = tgpig[0];
+     const int i2 = tgpig[1];
+     const int i3 = tgpig[2];
+ 
+     device const half * pm  = (device const half *) ((device const char *) mask + i1*args.nb31 + i2*args.nb32 + i3*args.nb33);
+     device int * pidx = idx + (((int64_t)i3*args.ne32 + i2)*args.ne31 + i1)*args.n_kv_max_padded;
+@@ -464,16 +464,25 @@ kernel void kernel_lightning_indexer(
+                 device       float * pd = (device       float *) (dst + i_batch*args.nb1  + i_stream*args.nb3);
+ 
+                 pd[ik] = score + (float) pm[ik];
+             }
+         }
+     }
+ }
+ 
++// the scan and the per-simdgroup counts are width-dependent, so the 64-lane cards need
++// their own instantiation instead of the 32-lane default
++typedef decltype(kernel_flash_attn_ext_vec_idx_t<N_SIMDWIDTH>) flash_attn_ext_vec_idx_t;
++
++template [[host_name("kernel_flash_attn_ext_vec_idx")]] kernel flash_attn_ext_vec_idx_t
++    kernel_flash_attn_ext_vec_idx_t<32>;
++template [[host_name("kernel_flash_attn_ext_vec_idx_w64")]] kernel flash_attn_ext_vec_idx_t
++    kernel_flash_attn_ext_vec_idx_t<64>;
++
+ typedef decltype(kernel_lightning_indexer<half4x4, 1, dequantize_f16>) kernel_lightning_indexer_t;
+ 
+ template [[host_name("kernel_lightning_indexer_f32")]]  kernel kernel_lightning_indexer_t kernel_lightning_indexer<float4x4, 1, dequantize_f32>;
+ template [[host_name("kernel_lightning_indexer_f16")]]  kernel kernel_lightning_indexer_t kernel_lightning_indexer<half4x4,  1, dequantize_f16>;
+ 
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_lightning_indexer_bf16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<bfloat4x4, 1, dequantize_bf16>;
+ #endif

@@ -1,0 +1,197 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -290,10 +290,15 @@ typedef struct {
+     uint64_t nb1;
+     uint64_t nb2;
+     uint64_t nb3;
+ } ggml_metal_kargs_cpy;
+ 
++typedef struct {
++    int64_t R; // product of the dims before the swap: the fast dim of dst
++    int64_t S; // product of the dims after it: the fast dim of src
++} ggml_metal_kargs_cpy_transpose;
++
+ typedef struct {
+     int64_t  ne10;
+     int64_t  ne11;
+     int64_t  ne12;
+     uint64_t nb10;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -107,10 +107,11 @@ ggml_metal_device_t ggml_metal_library_get_device(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_metal_library_t lib, const char * name);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
+ 
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst, bool contig);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_transpose     (ggml_metal_library_t lib, enum ggml_type type);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -93,10 +93,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy(ggml_metal_l
+     }
+ 
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy_transpose(ggml_metal_library_t lib, ggml_type type) {
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_cpy_transpose_%s", ggml_type_name(type));
++    snprintf(name, 256, "%s", base);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pool_1d(ggml_metal_library_t lib, const ggml_tensor * op, ggml_op_pool op_pool) {
+     GGML_ASSERT(ggml_is_contiguous(op->src[0]));
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 && op->src[0]->type == op->type);
+ 
+     const char * pool_str = "undefined";
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2095,10 +2095,47 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_dispatch_threadgroups(enc, nw0*(ne11 + nrptg - 1)/nrptg, ne12, ne13, nth, nrptg, 1);
+ 
+     return 1;
+ }
+ 
++// A view that swaps two contiguous blocks of dims (dims [0, k) after [k, 4) in memory) copies
++// as a transpose of an R x S matrix; dims of size 1 have no stride to check.
++static bool tosh_cpy_as_transpose(const ggml_tensor * src, const ggml_tensor * dst, int64_t & R, int64_t & S) {
++    if (src->type != dst->type || (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) ||
++        !ggml_is_contiguous(dst) || ggml_is_contiguous(src)) {
++        return false;
++    }
++    const size_t es = ggml_type_size(src->type);
++    for (int k = 1; k < 4; ++k) {
++        int64_t r = 1, s = 1;
++        for (int i = 0; i < k; ++i) r *= src->ne[i];
++        for (int i = k; i < 4; ++i) s *= src->ne[i];
++        if (r == 1 || s == 1) {
++            continue;
++        }
++        bool ok = true;
++        size_t expect = es;
++        for (int i = k; i < 4 && ok; ++i) {
++            if (src->ne[i] == 1) continue;
++            ok = src->nb[i] == expect;
++            expect *= src->ne[i];
++        }
++        expect = es*s;
++        for (int i = 0; i < k && ok; ++i) {
++            if (src->ne[i] == 1) continue;
++            ok = src->nb[i] == expect;
++            expect *= src->ne[i];
++        }
++        if (ok) {
++            R = r;
++            S = s;
++            return true;
++        }
++    }
++    return false;
++}
++
+ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+@@ -2106,10 +2143,27 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+ 
++    static const bool transpose_off = getenv("TOSH_CPY_TRANSPOSE_DISABLE") != nullptr;
++    int64_t tR = 0, tS = 0;
++    if (!transpose_off && tosh_cpy_as_transpose(op->src[0], op, tR, tS)) {
++        ggml_metal_kargs_cpy_transpose args_t = { /*.R =*/ tR, /*.S =*/ tS };
++
++        auto pipeline_t = ggml_metal_library_get_pipeline_cpy_transpose(lib, op->type);
++
++        ggml_metal_encoder_set_pipeline(enc, pipeline_t);
++        ggml_metal_encoder_set_bytes   (enc, &args_t, sizeof(args_t), 0);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         2);
++
++        ggml_metal_encoder_dispatch_threadgroups(enc, (tS + 31)/32, (tR + 31)/32, 1, 32, 8, 1);
++
++        return 1;
++    }
++
+     // a fully contiguous copy is one flat range: the generic kernel spends its instructions
+     // recomputing 4-D indices for every element instead
+     const bool contig = ggml_blck_size(op->src[0]->type) == 1 && ggml_blck_size(op->type) == 1 &&
+                         ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+                         getenv("TOSH_CPY_CONTIG_DISABLE") == nullptr;
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -9210,10 +9210,51 @@ kernel void kernel_cpy_contig_t_t(
+     }
+ 
+     ((device T1 *) dst)[i] = cpy_cast<T1>(((device const T0 *) src0)[i]);
+ }
+ 
++// a copy that swaps two contiguous blocks of dims is a transpose of an R x S matrix: go through
++// 32x32 tiles so that both the reads and the writes are contiguous
++template<typename T>
++kernel void kernel_cpy_transpose(
++        constant ggml_metal_kargs_cpy_transpose & args,
++        device  const char * src0,
++        device        char * dst,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]]) {
++    threadgroup T tile[32][33];
++
++    const int64_t s0 = (int64_t) tgpig.x*32;
++    const int64_t r0 = (int64_t) tgpig.y*32;
++
++    device const T * src = (device const T *) src0;
++    device       T * out = (device       T *) dst;
++
++    for (int k = 0; k < 32; k += 8) {
++        const int64_t r = r0 + tpitg.y + k;
++        const int64_t s = s0 + tpitg.x;
++        if (r < args.R && s < args.S) {
++            tile[tpitg.y + k][tpitg.x] = src[r*args.S + s];
++        }
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (int k = 0; k < 32; k += 8) {
++        const int64_t s = s0 + tpitg.y + k;
++        const int64_t r = r0 + tpitg.x;
++        if (r < args.R && s < args.S) {
++            out[s*args.R + r] = tile[tpitg.x][tpitg.y + k];
++        }
++    }
++}
++
++typedef decltype(kernel_cpy_transpose<float>) kernel_cpy_transpose_t;
++
++template [[host_name("kernel_cpy_transpose_f32")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose<float>;
++template [[host_name("kernel_cpy_transpose_f16")]] kernel kernel_cpy_transpose_t kernel_cpy_transpose<half>;
++
+ typedef decltype(kernel_cpy_t_t<float, float>) kernel_cpy_t;
+ 
+ template [[host_name("kernel_cpy_contig_f32_f32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   float>;
+ template [[host_name("kernel_cpy_contig_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   half>;
+ template [[host_name("kernel_cpy_contig_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_contig_t_t<float,   int32_t>;

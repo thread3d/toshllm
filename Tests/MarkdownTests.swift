@@ -45,6 +45,14 @@ final class InlineMathDetectionTests: XCTestCase {
         XCTAssertEqual(RichText.symbolizingMath("**Paso 1 $\\rightarrow$ Paso 2**"), "**Paso 1 → Paso 2**")
         XCTAssertEqual(RichText.symbolizingMath("si $x \\leq y$ y $\\alpha$"), "si x ≤ y y α")
         XCTAssertFalse(RichText.containsInlineMath(RichText.symbolizingMath("Entonces $a \\neq b$.")))
+        XCTAssertEqual(RichText.symbolizingMath("$x \\to \\infty$"), "x → ∞")
+    }
+
+    func testArithmeticWithSymbolsStaysMath() {
+        for text in ["* $|4/3 - 1.33333333333| \\approx 0$", "$a = b \\cdot c$", "$x \\leq y + 1$", "$|x| \\neq 0$"] {
+            XCTAssertEqual(RichText.symbolizingMath(text), text, text)
+            XCTAssertTrue(RichText.containsInlineMath(text), text)
+        }
     }
 
     func testRealFormulasAndCodeAreLeftAlone() {

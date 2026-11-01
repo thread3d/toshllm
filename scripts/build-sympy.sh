@@ -170,4 +170,6 @@ fi
 find "$LIB" -name '*.py' -delete
 
 echo "$STAMP" > "$OUT/VERSION"
+# which helper modules this runtime carries, for anyone who runs it to check
+(cd "$OUT" && shasum -a 256 tosh_sympy/*.py tosh_scientific/*.py) > "$OUT/HELPERS.sha256"
 echo "math runtime ready at $OUT ($(du -sh "$OUT" | cut -f1), $STAMP)"

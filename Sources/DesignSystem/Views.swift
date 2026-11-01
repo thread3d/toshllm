@@ -101,7 +101,7 @@ struct ControlPanelView: View {
         }
         .tint(AppTheme.accent(accentRaw))
         .id(accentRaw)
-        .navigationTitle("ToshLLM")
+        .navigationTitle(AppInfo.name)
     }
 
     private var selectedServer: ServerController? {

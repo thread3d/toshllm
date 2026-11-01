@@ -1,0 +1,366 @@
+diff --git a/src/llama-tosh-dmoe.cpp b/src/llama-tosh-dmoe.cpp
+index 0680c8a0e..56f85f742 100644
+--- a/src/llama-tosh-dmoe.cpp
++++ b/src/llama-tosh-dmoe.cpp
+@@ -79,19 +79,21 @@ struct host_bank {
+     const ggml_tensor * up   = nullptr;
+     const ggml_tensor * down = nullptr;
+     bool fused = false;             // gate holds gate and up, one after the other, and up is null
+     // per-expert gate/up biases, copied at load; the down bias is added on the GPU after the join
+     std::vector<float> gate_b, up_b;
+     // activation the graph registered for this layer: -1 none yet, 0 silu, 1 swiglu_oai, 2 gelu
+     std::atomic<int> act{-1};
+     float alpha = 0.0f, limit = 0.0f;
++    // the router as floats, kept only when a bounded cache reads experts ahead of the layer
++    std::vector<float> router, router_b;
+     host_bank() = default;
+     host_bank(const host_bank & o) : gate(o.gate), up(o.up), down(o.down), fused(o.fused), gate_b(o.gate_b), up_b(o.up_b),
+-        act(o.act.load()), alpha(o.alpha), limit(o.limit) {}
++        act(o.act.load()), alpha(o.alpha), limit(o.limit), router(o.router), router_b(o.router_b) {}
+ };
+ 
+ // A layer's gate bank holds gate and up together when the model fuses them.
+ static ggml_tensor * dmoe_gate(const llama_layer & L) { return L.ffn_gate_exps ? L.ffn_gate_exps : L.ffn_gate_up_exps; }
+ static bool dmoe_has_bank(const llama_layer & L) {
+     return dmoe_gate(L) && L.ffn_down_exps && (L.ffn_gate_exps ? L.ffn_up_exps != nullptr : L.ffn_up_exps == nullptr);
+ }
+ 
+@@ -441,16 +443,53 @@ struct executor {
+         us_wide += (uint64_t) ((t1 - t0)*1e6);
+         tosh_dmoe_timeline(1, il, t0, t1);
+         tosh_dmoe_rare_host_done(il, t0, t1, tosh_dmoe_reach_get() >= jb.value);
+         return true;
+     }
+     std::vector<uint8_t> wide_seen;
+     int wide_first_il = 1 << 30;
+ 
++    // the next layer's input differs from this one's by this layer's update alone, so its router
++    // applied here picks most of the experts it will ask for: read the ones neither VRAM nor RAM holds
++    std::vector<float> ahead_score;
++    std::vector<int>   ahead_order;
++    uint64_t n_ahead = 0;
++    void read_ahead(int nl) {
++        const host_bank & nb = banks[nl];
++        size_t tb_bytes = 0;
++        int tb_layers = 0, tb_expert = 0;
++        const int32_t * tb = tosh_dmoe_tables(&tb_bytes, &tb_layers, &tb_expert);
++        const int ne = nb.router.empty() ? 0 : (int) (nb.router.size()/n_embd);
++        if (tb == nullptr || ne == 0 || ne != tb_expert) return;
++        const int32_t * vram = tb + ((size_t) tosh_dmoe_published_version()*TOSH_DMOE_MAX_LAYERS + nl)*ne;
++        const int k = std::min(ne, n_used + n_used/2);
++        ahead_score.resize(ne);
++        ahead_order.resize(ne);
++        for (int e = 0; e < ne; ++e) {
++            const float * w = nb.router.data() + (size_t) e*n_embd;
++            float acc[8] = {};
++            int i = 0;
++            for (; i + 8 <= n_embd; i += 8) for (int l = 0; l < 8; ++l) acc[l] += w[i + l]*act[i + l];
++            float sum = 0.0f;
++            for (; i < n_embd; ++i) sum += w[i]*act[i];
++            for (int l = 0; l < 8; ++l) sum += acc[l];
++            ahead_score[e] = nb.router_b.empty() ? sum : 1.0f/(1.0f + expf(-sum)) + nb.router_b[e];
++            ahead_order[e] = e;
++        }
++        std::partial_sort(ahead_order.begin(), ahead_order.begin() + k, ahead_order.end(),
++                          [this](int a, int b) { return ahead_score[a] > ahead_score[b]; });
++        for (int j = 0; j < k; ++j) {
++            if (vram[ahead_order[j]] < 0) {
++                tosh_hostcache_prefetch(nl, ahead_order[j]);
++                n_ahead++;
++            }
++        }
++    }
++
+     // one layer: find the non-resident experts, compute them, answer the GPU
+     bool job(int il, const tosh_dmoe_job & jb) {
+         const clk::time_point t0 = clk::now();
+ 
+         char * stage = (char *) tosh_dmoe_stage_layer(il);
+         if (stage == nullptr || il >= (int) banks.size() || banks[il].gate == nullptr) {
+             tosh_dmoe_fail("a mixed layer has no host bank or stage");
+             return false;
+@@ -523,18 +562,22 @@ struct executor {
+             us_quant += (uint64_t) us_since(tq);
+ 
+             if (!pin_misses(il, TOSH_HC_DECODE)) {
+                 return false;
+             }
+             next1.store(0, std::memory_order_relaxed);
+             next2.store(0, std::memory_order_relaxed);
+             kick();
++            // the workers start on this layer's experts while the leader looks one layer ahead
++            if (il + 1 < (int) banks.size()) read_ahead(il + 1);
+             run(0);
+             unpin_misses();
++        } else if (il + 1 < (int) banks.size()) {
++            read_ahead(il + 1);
+         }
+ 
+         n_jobs++;
+         us_job += (uint64_t) us_since(t0);
+         return true;
+     }
+ 
+     void leader_main() {
+@@ -639,19 +682,19 @@ struct executor {
+                     (double) n_wide_miss.load()/n_wide.load(), (double) n_wide_experts.load()/n_wide.load(),
+                     us_wide.load()/1e3, (double) us_wide.load()/n_wide.load());
+         }
+         const uint64_t routed = n_routed.load();
+         if (routed == 0) {
+             return;
+         }
+         const uint64_t m = n_miss.load();
+-        fprintf(stderr, "tosh_dmoe: jobs %llu, routed %llu, host %llu, hit rate %.2f%%\n",
++        fprintf(stderr, "tosh_dmoe: jobs %llu, routed %llu, host %llu, hit rate %.2f%%, read ahead %llu\n",
+                 (unsigned long long) n_jobs.load(), (unsigned long long) routed, (unsigned long long) m,
+-                100.0*(double) (routed - m)/(double) routed);
++                100.0*(double) (routed - m)/(double) routed, (unsigned long long) n_ahead);
+         fprintf(stderr, "tosh_dmoe: host time per job %.1f us (quantize %.1f, gate/up %.1f, down %.1f)\n",
+                 (double) us_job.load()/n_jobs.load(), (double) us_quant.load()/n_jobs.load(),
+                 (double) us_p1.load()/n_jobs.load(), (double) us_p2.load()/n_jobs.load());
+         fprintf(stderr, "tosh_dmoe: host expert time %.3f ms total over %llu host experts (%.1f us each)\n",
+                 us_job.load()/1e3, (unsigned long long) m, m ? (double) us_job.load()/m : 0.0);
+         static const int edges[] = { 1, 9, 17, 33, 65, 129, 257, 513, 1 << 16 };
+         std::string line = "tosh_dmoe: hit rate by graph";
+         for (int b = 0; b + 1 < (int) (sizeof(edges)/sizeof(edges[0])); ++b) {
+@@ -1855,16 +1898,32 @@ static void dmoe_init(std::vector<llama_layer> & layers, const llama_hparams & h
+         hb.up    = L.ffn_up_exps;
+         hb.fused = L.ffn_gate_exps == nullptr;
+         hb.down = L.ffn_down_exps;
+         ex->n_embd = (int) hb.gate->ne[0];
+         ex->n_ff   = (int) (hb.fused ? hb.gate->ne[1]/2 : hb.gate->ne[1]);
+         if (hb.fused && L.ffn_gate_up_exps_b != nullptr) {
+             throw std::runtime_error("TOSH_DMOE_CACHE_MIB: biases on a fused gate/up bank are not supported");
+         }
++        // with experts read from disk (TOSH_AUTO_DISK_EXPERTS) decode reads the next layer ahead; TOSH_HC_DECODE_AHEAD=0 turns it off
++        static const bool decode_ahead = getenv("TOSH_AUTO_DISK_EXPERTS") != nullptr && atoi(getenv("TOSH_AUTO_DISK_EXPERTS")) != 0 &&
++                                         (getenv("TOSH_HC_DECODE_AHEAD") == nullptr || atoi(getenv("TOSH_HC_DECODE_AHEAD")) != 0);
++        const ggml_tensor * rt = L.ffn_gate_inp;
++        if (decode_ahead && tosh_hostcache_on() && rt != nullptr && rt->ne[1] == n_expert && ggml_get_type_traits(rt->type)->to_float) {
++            std::vector<uint8_t> raw(ggml_nbytes(rt));
++            ggml_backend_tensor_get(rt, raw.data(), 0, raw.size());
++            hb.router.resize((size_t) rt->ne[0]*rt->ne[1]);
++            for (int64_t e = 0; e < rt->ne[1]; ++e) {
++                ggml_get_type_traits(rt->type)->to_float(raw.data() + e*rt->nb[1], hb.router.data() + e*rt->ne[0], rt->ne[0]);
++            }
++            if (L.ffn_exp_probs_b != nullptr && L.ffn_exp_probs_b->type == GGML_TYPE_F32) {
++                hb.router_b.resize(n_expert);
++                ggml_backend_tensor_get(L.ffn_exp_probs_b, hb.router_b.data(), 0, sizeof(float)*n_expert);
++            }
++        }
+         for (auto [b, dst] : { std::pair{ L.ffn_gate_exps_b, &hb.gate_b }, { L.ffn_up_exps_b, &hb.up_b } }) {
+             if (b == nullptr) {
+                 continue;
+             }
+             if (b->type != GGML_TYPE_F32 || b->ne[0] != ex->n_ff || b->ne[1] != n_expert) {
+                 throw std::runtime_error("TOSH_DMOE_CACHE_MIB: expert biases of an unexpected type or shape");
+             }
+             dst->resize(ggml_nelements(b));
+diff --git a/tosh-moe/tosh-hostcache.cpp b/tosh-moe/tosh-hostcache.cpp
+index e1957bc13..49adb07c4 100644
+--- a/tosh-moe/tosh-hostcache.cpp
++++ b/tosh-moe/tosh-hostcache.cpp
+@@ -24,16 +24,23 @@
+ #include <sys/sysctl.h>
+ #endif
+ #include <unistd.h>
+ 
+ namespace {
+ 
+ enum slot_state : uint8_t { EMPTY, LOADING, RESIDENT };
+ 
++// TOSH_HC_LOOKAHEAD=1 / TOSH_HC_PROMPT_LAST=1: prompt lookahead and prompt-first eviction, off by default
++static bool env_on(const char * name) {
++    const char * v = getenv(name);
++    return v != nullptr && strcmp(v, "0") != 0;
++}
++static constexpr int LOOKAHEAD_LAYERS = 2;
++
+ struct file_tensor {
+     size_t   nbytes;
+     uint64_t file_off;
+     int      file;
+     uint64_t file_off_up = UINT64_MAX;   // up half of a gate/up pair the loader fused
+ };
+ 
+ struct part_ref {
+@@ -75,16 +82,24 @@ struct cache {
+     std::vector<uint8_t>    reused;     // a warm-up or fill entry hit after ready
+     std::atomic<bool>       ready{false};
+     std::thread             locker;
+     double   t_start = 0, t_ready = 0, fill_stop_t = 0;
+     uint64_t fill_n = 0, fill_bytes = 0, fill_dup = 0, fill_skipped = 0;
+     uint64_t reuse_n[3] = {}, reuse_bytes[3] = {}, loaded_n[3] = {}, loaded_bytes[3] = {};
+     std::vector<int32_t>    key_of, ref, prev, next;
+     std::vector<uint8_t>    state;
++    // a slot only a prompt has used goes first on eviction, ahead of the experts decode keeps using
++    std::vector<uint8_t>    prompt_only;
++    // prompt lookahead: the experts each layer pinned in its latest chunk, read ahead for the next one
++    std::vector<std::vector<int32_t>> pf_set;
++    std::vector<uint32_t>   pf_chunk_of;
++    uint32_t pf_chunk = 0;
++    int      pf_il = -1;
++    uint64_t ahead_queued = 0;
+ 
+     std::string error;
+ 
+     // stats
+     uint64_t req[TOSH_HC_KINDS] = {}, hit[TOSH_HC_KINDS] = {}, cold[TOSH_HC_KINDS] = {}, coalesced = 0;
+     uint64_t evictions = 0, reloads = 0, reads = 0, read_bytes = 0, prefetches = 0, stored = 0;
+     double wait_us[TOSH_HC_KINDS] = {};
+     // queue and read time per class (0 demand, 1 read-back), where acquire waits, read-back reuse
+@@ -371,16 +386,19 @@ bool tosh_hostcache_start(int n_layer, int n_expert) {
+     g.prev.assign(g.n_slots, -1);
+     g.next.assign(g.n_slots, -1);
+     g.state.assign(g.n_slots, EMPTY);
+     g.enq_t.assign(g.n_slots, 0.0);
+     g.bg.assign(g.n_slots, 0);
+     g.bg_unused.assign(g.n_slots, 0);
+     g.origin.assign(g.n_slots, 0);
+     g.reused.assign(g.n_slots, 0);
++    g.prompt_only.assign(g.n_slots, 0);
++    g.pf_set.assign(n_layer, {});
++    g.pf_chunk_of.assign(n_layer, UINT32_MAX);
+     g.pool_of_slot.assign(g.n_slots, 0);
+     for (int k = 0; k < (int) g.pools.size(); ++k) {
+         auto & pl = g.pools[k];
+         for (int s = pl.first + pl.n - 1; s >= pl.first; --s) { pl.free_slots.push_back(s); g.pool_of_slot[s] = k; }
+     }
+ 
+     const int n_io = std::max(1, getenv("TOSH_DMOE_HOST_IO") ? atoi(getenv("TOSH_DMOE_HOST_IO")) : 4);
+     for (int i = 0; i < n_io; ++i) std::thread(reader_main).detach();
+@@ -594,29 +612,57 @@ static void prewarm(int n_io) {
+             slots.size(), bytes/1048576.0, strcmp(src, "seq") == 0 ? "layer order" : "a list", by_offset ? "file" : "list",
+             (unsigned long long) n_reads.load(), g.prewarm_us/1000, bytes/(g.prewarm_us*1e3));
+ }
+ 
+ bool tosh_mlock_paced(void * addr, size_t bytes, char * err, size_t err_len) {
+     return mlock_paced(addr, bytes, err, err_len);
+ }
+ 
++static int readback_slot(int il, int e);
++
+ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
+     const double t0 = now_us();
+     std::unique_lock<std::mutex> lock(g.m);
+     std::vector<int> wait;
+     std::vector<uint8_t> wait_cls;     // 0 own read, 1 another demand, 2 a read-back
+     bool queued = false;
++    const bool prompt = kind == TOSH_HC_PREFILL || kind == TOSH_HC_WIDE;
++    if (prompt && g.base != nullptr) {
++        static const bool lookahead = env_on("TOSH_HC_LOOKAHEAD");
++        // a chunk walks the layers in order; host rows may trail the uploads by a layer
++        if (il + 2 < g.pf_il) { g.pf_chunk++; g.pf_il = il; } else g.pf_il = std::max(g.pf_il, il);
++        if (g.pf_chunk_of[il] != g.pf_chunk) {
++            g.pf_chunk_of[il] = g.pf_chunk;
++            g.pf_set[il].clear();
++            // the next layers still hold the last chunk's experts: their reads go behind the demands
++            for (int d = 1; d <= LOOKAHEAD_LAYERS && lookahead && il + d < g.n_layer; ++d) {
++                auto & set = g.pf_set[il + d];
++                std::sort(set.begin(), set.end());
++                set.erase(std::unique(set.begin(), set.end()), set.end());
++                for (int32_t e : set) {
++                    const int sl = readback_slot(il + d, e);
++                    if (sl < 0) continue;
++                    g.prompt_only[sl] = 1;
++                    g.queue.push_back(sl);
++                    g.ahead_queued++;
++                    queued = true;
++                }
++            }
++        }
++        g.pf_set[il].insert(g.pf_set[il].end(), ids, ids + n);
++    }
+     for (int i = 0; i < n; ++i) {
+         const int e = ids[i];
+         if (e < 0 || e >= g.n_expert) continue;
+         const int key = il*g.n_expert + e;
+         g.req[kind]++;
+         int s = g.slot_of[key];
+         if (s >= 0) {
++            if (!prompt) g.prompt_only[s] = 0;
+             if (g.ref[s]++ == 0 && g.in_lru(s)) g.lru_unlink(s);
+             if (g.bg_unused[s]) {
+                 g.bg_unused[s] = 0;
+                 g.bg_used++;
+                 if (g.state[s] != RESIDENT) g.bg_used_loading++;
+             }
+             if (g.ready && g.origin[s] != 0 && !g.reused[s]) {
+                 g.reused[s] = 1;
+@@ -646,16 +692,17 @@ bool tosh_hostcache_acquire(int il, const int32_t * ids, int n, int kind) {
+         if (s < 0) {
+             if (g.error.empty()) g.error = "the expert cache is smaller than the experts pinned at once";
+             return false;
+         }
+         g.key_of[s] = key;
+         g.slot_of[key] = s;
+         g.state[s] = LOADING;
+         g.ref[s] = 1;
++        g.prompt_only[s] = prompt;
+         g.cold[kind]++;
+         g.cold_total++;
+         g.reloads += g.ever[key];
+         g.ever[key] = 1;
+         g.enq_t[s] = now_us();
+         g.bg[s] = 0;
+         g.bg_unused[s] = 0;
+         g.origin[s] = g.ready ? 0 : 1;
+@@ -687,17 +734,20 @@ const char * tosh_hostcache_part(int il, int e, int part) {
+ }
+ 
+ void tosh_hostcache_release(int il, const int32_t * ids, int n) {
+     std::lock_guard<std::mutex> lock(g.m);
+     for (int i = 0; i < n; ++i) {
+         const int e = ids[i];
+         if (e < 0 || e >= g.n_expert) continue;
+         const int s = g.slot_of[il*g.n_expert + e];
+-        if (s >= 0 && --g.ref[s] == 0) g.lru_push(s);
++        if (s >= 0 && --g.ref[s] == 0) {
++            static const bool prompt_last = env_on("TOSH_HC_PROMPT_LAST");
++            if (prompt_last && g.prompt_only[s]) g.lru_push_tail(s); else g.lru_push(s);
++        }
+     }
+ }
+ 
+ void tosh_hostcache_drop(int il, int e) {
+     std::lock_guard<std::mutex> lock(g.m);
+     if (g.base == nullptr) return;
+     const int key = il*g.n_expert + e;
+     const int s = g.slot_of[key];
+@@ -727,16 +777,17 @@ static int readback_slot(int il, int e) {
+     g.state[s] = LOADING;
+     g.ref[s] = 0;
+     g.ever[key] = 1;
+     g.enq_t[s] = now_us();
+     g.bg[s] = 1;
+     g.bg_unused[s] = 1;
+     g.origin[s] = g.ready ? 0 : 1;
+     g.reused[s] = 0;
++    g.prompt_only[s] = 0;
+     return s;
+ }
+ 
+ void tosh_hostcache_prefetch(int il, int e) {
+     {
+         std::lock_guard<std::mutex> lock(g.m);
+         const int s = readback_slot(il, e);
+         if (s < 0) return;
+@@ -849,16 +900,17 @@ void tosh_hostcache_report(void) {
+         if (g.req[k] == 0) continue;
+         fprintf(stderr, "tosh_hostcache: %-7s waits: own reads %.1f ms, another demand %.1f ms, a read-back %.1f ms\n", names[k],
+                 g.wait_own_us[k]/1000, g.wait_co_dem_us[k]/1000, g.wait_co_bg_us[k]/1000);
+     }
+     const uint64_t bg_left = [] { uint64_t n = 0; for (auto u : g.bg_unused) n += u; return n; }();
+     fprintf(stderr, "tosh_hostcache: read-backs used %llu (%llu while loading), evicted unused %llu, dropped unused %llu, still unused %llu\n",
+             (unsigned long long) g.bg_used, (unsigned long long) g.bg_used_loading, (unsigned long long) g.bg_wasted,
+             (unsigned long long) g.bg_dropped_unused, (unsigned long long) bg_left);
++    fprintf(stderr, "tosh_hostcache: prompt lookahead queued %llu reads\n", (unsigned long long) g.ahead_queued);
+     fprintf(stderr, "tosh_hostcache: file reads: first touch %llu, capacity miss %llu, read-back %llu\n",
+             (unsigned long long) (g.rd_n[0] > g.reloads ? g.rd_n[0] - g.reloads : 0), (unsigned long long) g.reloads, (unsigned long long) g.rd_n[1]);
+     fprintf(stderr, "tosh_hostcache: read-backs moved ahead for a waiting demand %llu | promoted copies kept %llu, refreshed on eviction %llu\n",
+             (unsigned long long) g.boosted, (unsigned long long) g.kept_on_promotion, (unsigned long long) g.refreshed);
+     std::vector<float> v = g.read_us;
+     std::sort(v.begin(), v.end());
+     auto q = [&](double f) { return v.empty() ? 0.0 : (double) v[std::min(v.size() - 1, (size_t) (f*v.size()))]; };
+     fprintf(stderr, "tosh_hostcache: read back on eviction %llu, copied back from VRAM %llu\n",

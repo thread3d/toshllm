@@ -6,7 +6,7 @@ import Foundation
 
 struct ToolCallPresentation: Equatable {
     enum Kind: Equatable {
-        case read, write, edit, shell, grep, glob, javaScript, dateTime, math, search, generic
+        case read, write, edit, shell, grep, glob, javaScript, dateTime, math, search, map, generic
     }
 
     struct Edit: Equatable, Identifiable {
@@ -79,6 +79,19 @@ struct ToolCallPresentation: Equatable {
             return ToolCallPresentation(kind: .javaScript, title: "JavaScript sandbox", path: nil,
                                         code: args["code"] as? String, language: "javascript",
                                         detail: timeout.map { "timeout \($0) ms" }, edits: [], result: result)
+        case ChatMapTool.toolName:
+            let features = args["features"] as? [[String: Any]] ?? []
+            let labels = features.compactMap { $0["label"] as? String }.filter { !$0.isEmpty }
+            return ToolCallPresentation(kind: .map, title: (args["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Map",
+                                        path: nil, code: labels.joined(separator: ", "), language: "text",
+                                        detail: "\(features.count) feature\(features.count == 1 ? "" : "s")",
+                                        edits: [], result: result)
+        case ChatRoadRoute.toolName:
+            let stops = (args["stops"] as? [[String: Any]] ?? []).map { $0["label"] as? String ?? "?" }
+            return ToolCallPresentation(kind: .map, title: (args["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Road route",
+                                        path: nil, code: stops.joined(separator: " → "), language: "text",
+                                        detail: (args["transport"] as? String) == "walking" ? "walking" : "by car",
+                                        edits: [], result: result)
         case "get_datetime":
             return ToolCallPresentation(kind: .dateTime, title: "Date and time", path: nil,
                                         code: nil, language: "text", detail: nil,
@@ -109,10 +122,21 @@ struct ToolCallPresentation: Equatable {
                                             path: nil, code: query, language: "text", detail: nil,
                                             edits: [], result: result)
             }
-            return ToolCallPresentation(kind: .generic, title: call.name, path: nil,
-                                        code: call.arguments, language: "json", detail: nil,
-                                        edits: [], result: result)
+            let operation = (args["operation"] as? String).map { " (\($0))" } ?? ""
+            return ToolCallPresentation(kind: .generic, title: call.name + operation, path: nil,
+                                        code: indented(call.arguments) ?? call.arguments, language: "json", detail: nil,
+                                        edits: [], result: result.map { indented($0) ?? $0 })
         }
+    }
+
+    /// JSON laid out one key per line, or nil for text that is not JSON or too long to lay out.
+    static func indented(_ text: String) -> String? {
+        guard text.utf8.count <= 16_000, let first = text.first(where: { !$0.isWhitespace }), first == "{" || first == "[",
+              let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
+              let data = try? JSONSerialization.data(withJSONObject: object,
+                                                     options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func arguments(_ json: String) -> [String: Any] {

@@ -1,0 +1,160 @@
+diff --git a/common/reasoning-budget.cpp b/common/reasoning-budget.cpp
+index 4884299f3..f8895b196 100644
+--- a/common/reasoning-budget.cpp
++++ b/common/reasoning-budget.cpp
+@@ -303,8 +303,29 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
+ 
+     ctx->state = REASONING_BUDGET_FORCING;
+     ctx->force_pos = 0;
+     ctx->end_matcher.reset();
+     COM_TRC("%s", "forced into forcing state (manual transition)\n");
+ 
+     return true;
+ }
++
++void common_reasoning_budget_accept_prompt(struct llama_sampler * smpl, llama_token token) {
++    if (!smpl) {
++        return;
++    }
++
++    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
++
++    if (ctx->state != REASONING_BUDGET_FORCING) {
++        common_reasoning_budget_accept(smpl, token);
++        return;
++    }
++
++    // counted as forced, a token after the start tag would use up the end tag before it is written
++    const int32_t match = ctx->end_matcher.advance(token);
++    if (match >= 0) {
++        ctx->state = REASONING_BUDGET_DONE;
++        ctx->end_match = match;
++        COM_TRC("%s", "deactivated (the prompt closes the block)\n");
++    }
++}
+diff --git a/common/reasoning-budget.h b/common/reasoning-budget.h
+index 1b89a04c4..0d1ff28a4 100644
+--- a/common/reasoning-budget.h
++++ b/common/reasoning-budget.h
+@@ -45,8 +45,12 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
+ 
+ // The end sequence that transitioned the sampler to DONE, or nullptr if none
+ // was recorded. Cleared when a new start sequence re-arms the sampler.
+ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sampler * smpl);
+ 
+ // Manually transition the reasoning budget sampler into the FORCING state.
+ // Returns true if the transition occurred.
+ bool common_reasoning_budget_force(struct llama_sampler * smpl);
++
++// Accept a token the prompt already holds. It can open or close a block like any other, but
++// while the end is being forced it is not one of the forced tokens.
++void common_reasoning_budget_accept_prompt(struct llama_sampler * smpl, llama_token token);
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index d9c508049..5d42a62a5 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -316,17 +316,17 @@ struct common_sampler * common_sampler_init(
+         rbudget = common_reasoning_budget_init(
+             vocab,
+             {params.reasoning_budget_start},
+             params.reasoning_budget_end,
+             params.reasoning_budget_forced,
+             params.reasoning_budget_tokens < 0 ? INT_MAX : params.reasoning_budget_tokens);
+ 
+         for (const auto & token : prefill_tokens) {
+-            llama_sampler_accept(rbudget, token);
++            common_reasoning_budget_accept_prompt(rbudget, token);
+             LOG_DBG("%s: reasoning-budget accepted prefill token (%d)\n", __func__, token);
+         }
+     }
+ 
+     // logit bias: user biases + model suppress tokens (-INFINITY)
+     {
+         std::vector<llama_logit_bias> merged = params.logit_bias;
+ 
+diff --git a/tests/test-reasoning-budget.cpp b/tests/test-reasoning-budget.cpp
+index 3bcc77e17..e4a0e3767 100644
+--- a/tests/test-reasoning-budget.cpp
++++ b/tests/test-reasoning-budget.cpp
+@@ -183,16 +183,63 @@ static void test_reasoning_budget_clone_mid_forcing() {
+     auto * clone = llama_sampler_clone(sampler);
+ 
+     GGML_ASSERT(get_forced_token(clone, 102) == 101 && "cloned forcing state lost force position");
+ 
+     llama_sampler_free(clone);
+     llama_sampler_free(sampler);
+ }
+ 
++static void test_reasoning_budget_prompt_tokens() {
++    const std::vector<llama_token> start  = {100};
++    const std::vector<llama_token> end    = {101};
++    const std::vector<llama_token> forced = {101};
++
++    // the prompt leaves the block open with a token after the start tag: the end is still forced
++    {
++        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
++
++        common_reasoning_budget_accept_prompt(sampler, 100);
++        common_reasoning_budget_accept_prompt(sampler, 50);
++
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
++        GGML_ASSERT(get_forced_token(sampler, 101) == 101 && "a prompt token used up the forced end tag");
++
++        llama_sampler_accept(sampler, 101);
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
++
++        llama_sampler_free(sampler);
++    }
++
++    // the prompt already closes the block: nothing is left to force
++    {
++        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 0, REASONING_BUDGET_IDLE);
++
++        for (llama_token token : {100, 50, 101, 50}) {
++            common_reasoning_budget_accept_prompt(sampler, token);
++        }
++
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
++
++        llama_sampler_free(sampler);
++    }
++
++    // with budget left the prompt counts like generated text
++    {
++        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 2, REASONING_BUDGET_IDLE);
++
++        common_reasoning_budget_accept_prompt(sampler, 100);
++        common_reasoning_budget_accept_prompt(sampler, 50);
++
++        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
++
++        llama_sampler_free(sampler);
++    }
++}
++
+ static void test_reasoning_budget_force_manual() {
+     const std::vector<llama_token> start  = {100};
+     const std::vector<llama_token> end    = {101};
+     const std::vector<llama_token> forced = {102, 101};
+ 
+     // if COUNTING, force() succeeds and begins forcing the end sequence from the start
+     {
+         auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, forced, 5, REASONING_BUDGET_IDLE);
+@@ -487,16 +534,17 @@ int main(void) {
+         test_reasoning_budget("multiple end sequences", sequence, start, end, forced,
+             5,      // budget of 5 tokens
+             REASONING_BUDGET_IDLE,
+             SIZE_MAX, SIZE_MAX); // no forcing expected (natural end)
+     }
+ 
+     test_reasoning_budget_clone_mid_counting();
+     test_reasoning_budget_clone_mid_forcing();
++    test_reasoning_budget_prompt_tokens();
+     test_reasoning_budget_force_manual();
+     test_reasoning_budget_end_match();
+ 
+     printf("OK (12 tests passed)\n");
+ 
+     printf("Testing UTF-8 boundary detection... ");
+     test_utf8_boundary_detection();
+     printf("OK\n");

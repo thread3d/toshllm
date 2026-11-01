@@ -1,0 +1,81 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 4804d838b..e65093e46 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -623,17 +623,18 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+ 
+ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+     }
+ 
+     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
++    // M-RoPE only needs the time component shifted; the per-cell 2D extras stay put
++    GGML_ASSERT(get_can_shift() && "seq_add() requires a shiftable cache");
+ 
+     auto & cells = v_cells[seq_to_stream[seq_id]];
+     auto & head  = v_heads[seq_to_stream[seq_id]];
+ 
+     if (shift == 0) {
+         return;
+     }
+ 
+@@ -1241,18 +1242,20 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+     }
+ }
+ 
+ bool llama_kv_cache::get_can_shift() const {
+     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
+     if (model.arch == LLM_ARCH_STEP35) {
+         return false;
+     }
++    // M-RoPE: a time shift rotates every section by the same delta, which build_rope_shift
++    // already does as a neox rope; the per-cell 2D extras are untouched. ref: PR #13870
+     if (hparams.n_pos_per_embd() > 1) {
+-        return false;
++        return getenv("TOSH_MROPE_SHIFT_DISABLE") == nullptr;
+     }
+     return true;
+ }
+ 
+ uint32_t llama_kv_cache::get_size() const {
+     const auto & cells = v_cells[seq_to_stream[0]];
+ 
+     return cells.size();
+diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
+index 33f679fc0..d5f359676 100644
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -203,22 +203,25 @@ struct clip_hparams {
+             image_min_pixels = custom_image_min_tokens * patch_area;
+         }
+         if (custom_image_max_tokens > 0) {
+             image_max_pixels = custom_image_max_tokens * patch_area;
+         }
+     }
+ 
+     void set_warmup_n_tokens(int n_tokens) {
+-        int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
+-        GGML_ASSERT(n_tok_per_side * n_tok_per_side == n_tokens && "n_tokens must be n*n");
+-        // do not warmup with more tokens than the max allowed
+-        if (custom_image_max_tokens > 0 && n_tokens > custom_image_max_tokens) {
+-            n_tok_per_side = std::max(1, static_cast<int>(std::sqrt(custom_image_max_tokens)));
++        // the cap has to shrink the warmup too: without flash attention this graph holds the
++        // whole score matrix, and on a small card it is the warmup that fails to allocate
++        const bool capped = custom_image_max_tokens > 0 && custom_image_max_tokens < n_tokens;
++        if (capped) {
++            n_tokens = custom_image_max_tokens;
+         }
++        int n_tok_per_side = static_cast<int>(std::sqrt(n_tokens));
++        GGML_ASSERT(n_tok_per_side > 0);
++        GGML_ASSERT((capped || n_tok_per_side * n_tok_per_side == n_tokens) && "n_tokens must be n*n");
+         warmup_image_size = n_tok_per_side * patch_size * n_merge;
+     }
+     // sam vit deepseek-ocr
+     std::vector<int32_t> global_attn_indices() const {
+         return {  2,  5,  8, 11 };
+     }
+     bool is_global_attn(int32_t layer) const {
+         const auto indices = global_attn_indices();

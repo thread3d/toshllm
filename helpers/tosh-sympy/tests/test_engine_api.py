@@ -265,6 +265,20 @@ def test_the_agent_streams_only_a_checked_answer():
     assert progress[0] == "intent" and "tool_call" in progress and progress.count("pass") % 2 == 0, progress
 
 
+def test_the_agent_streams_an_answer_that_needs_no_tools():
+    if not AGENT:
+        return print("      skipped: TOSH_ENGINE_AGENT is not set")
+    status, text = stream({"messages": [{"role": "user", "content": "What is an eigenvalue? Two sentences."}], "max_tokens": 300})
+    chunks = events(text)
+    contents = [c["choices"][0]["delta"]["content"] for c in chunks if c.get("choices") and c["choices"][0]["delta"].get("content")]
+    assert status == 200 and len(contents) > 1, contents
+    assert chunks[-1]["tosh"]["intent"] in ("conceptual", "no_math") and not chunks[-1]["tosh"]["calls"], chunks[-1]["tosh"]
+    assert len({c["id"] for c in chunks if "id" in c}) == 1, {c.get("id") for c in chunks}
+    starts = [c["tosh"]["event"] for c in chunks if c.get("tosh", {}).get("event", {}).get("type") == "pass"
+              and c["tosh"]["event"]["state"] == "start"]
+    assert starts and all(e["live"] for e in starts), starts
+
+
 def test_the_agent_refuses_forged_tool_state():
     if not AGENT:
         return print("      skipped: TOSH_ENGINE_AGENT is not set")

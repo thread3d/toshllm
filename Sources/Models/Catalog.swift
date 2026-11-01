@@ -116,6 +116,7 @@ enum Catalog {
         if let match = models.first(where: { $0.fileName == model.name }) {
             var spec = match.spec
             spec.kvBytesPerToken = kv
+            spec.apply(GGUFMetadataCache.weightSplit(at: model.url.path))
             return spec
         }
         return ModelSpec.estimated(fileBytes: model.sizeBytes, isMoE: model.isMoE,

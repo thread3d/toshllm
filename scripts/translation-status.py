@@ -34,6 +34,7 @@ FEATURED = [
     ("tr", "Turkish", "Türkçe"),
     ("nl", "Dutch", "Nederlands"),
     ("pl", "Polish", "Polski"),
+    ("uk", "Ukrainian", "Українська"),
 ]
 
 MARK_START = "<!-- STATUS:START -->"

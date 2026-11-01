@@ -1,0 +1,2566 @@
+diff --git a/ggml/include/ggml-alloc.h b/ggml/include/ggml-alloc.h
+index 81cce2e2a..97cc99026 100644
+--- a/ggml/include/ggml-alloc.h
++++ b/ggml/include/ggml-alloc.h
+@@ -42,16 +42,22 @@ GGML_API enum ggml_status    ggml_tallocr_alloc(struct ggml_tallocr * talloc, st
+ // special tensor flags for use with the graph allocator:
+ //   ggml_set_input(): all input tensors are allocated at the beginning of the graph in non-overlapping addresses
+ //   ggml_set_output(): output tensors are never freed and never overwritten
+ 
+ typedef struct ggml_gallocr * ggml_gallocr_t;
+ 
+ GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
+ GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
++
++// Plan into another allocator's buffers without owning them: the borrower never frees or grows
++// them, and a plan that needs more memory fails instead.
++GGML_API void           ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src);
++GGML_API void           ggml_gallocr_set_shape_slot(ggml_gallocr_t galloc, int slot);
++GGML_API void           ggml_gallocr_reset_shape_slot(ggml_gallocr_t galloc, int slot);
+ GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+ 
+ // pre-allocate buffers from a measure graph - does not allocate or modify the graph
+ // call with a worst-case graph to avoid buffer reallocations
+ // not strictly required for single buffer usage: ggml_gallocr_alloc_graph will reallocate the buffers automatically if needed
+ // returns false if the buffer allocation failed
+ // ggml_gallocr_resrve_n_size writes the buffer sizes per galloc buffer that would be allocated by ggml_gallocr_reserve_n to sizes
+ GGML_API bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 5ef80da30..0993fb253 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -316,16 +316,23 @@ extern "C" {
+     // if the user returns false, the scheduler will cancel the graph compute
+     //
+     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+ 
+     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
+     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+ 
++    // A second scheduler plans into this one's buffers; free the borrower before the owner.
++    GGML_API void                 ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src);
++    // Point the backends and the compute buffers at one of the two prepared shape slots.
++    GGML_API void                 ggml_backend_sched_set_shape_slot(ggml_backend_sched_t sched, int slot);
++    // Drop the state prepared for one slot, before building a different shape into it.
++    GGML_API void                 ggml_backend_sched_reset_shape_slot(ggml_backend_sched_t sched, int slot);
++
+     // Initialize backend buffers from a measure graph
+     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
+     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+ 
+     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
+ 
+     // Get the number of splits of the last graph
+@@ -399,16 +406,23 @@ extern "C" {
+     };
+ 
+     // function to assign split states for statically allocated tensors, compute tensor split states will be assigned to be compatible:
+     typedef struct ggml_backend_meta_split_state(*ggml_backend_meta_get_split_state_t)(const struct ggml_tensor * tensor, void * userdata);
+ 
+     // create a new meta device from "simple" devices, meta buffer type/buffer/backend is then derived from this:
+     // TODO: this looks a bit strange - a backend API creates a device. I think we should try
+     //       express this as a backend registry functionality instead
++    // Two prepared sets of per-device state, so alternating graph shapes costs no rebuild.
++    // -1 turns the slots off and restores the rotating containers.
++    GGML_API void ggml_backend_meta_set_shape_slot(ggml_backend_t meta_backend, int slot);
++    GGML_API void ggml_backend_meta_reset_shape_slot(ggml_backend_t meta_backend, int slot);
++    GGML_API void ggml_backend_meta_buffer_set_shape_slot(ggml_backend_buffer_t buffer, int slot);
++    GGML_API void ggml_backend_meta_buffer_reset_shape_slot(ggml_backend_buffer_t buffer, int slot);
++
+     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
+         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+ 
+     //
+     // Utils
+     //
+ 
+     struct ggml_backend_graph_copy {
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index b0c067b49..567020167 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -488,18 +488,58 @@ struct ggml_gallocr {
+     struct ggml_hash_set hash_set;
+     struct hash_node * hash_values; // [hash_set.size]
+ 
+     struct node_alloc * node_allocs; // [n_nodes]
+     int n_nodes;
+ 
+     struct leaf_alloc * leaf_allocs; // [n_leafs]
+     int n_leafs;
++
++    // set on an allocator that plans into another one's buffers
++    bool shared;
+ };
+ 
++void ggml_gallocr_share_buffers(ggml_gallocr_t dst, ggml_gallocr_t src) {
++    GGML_ASSERT(dst->n_buffers == src->n_buffers);
++    for (int i = 0; i < dst->n_buffers; i++) {
++        GGML_ASSERT(dst->buffers[i] == NULL);
++        dst->buffers[i] = src->buffers[i];
++    }
++    dst->shared = true;
++}
++
++// The per-shape state lives in the compute buffers, reachable only through their allocator.
++static void ggml_gallocr_shape_slot(ggml_gallocr_t galloc, int slot, bool reset) {
++    for (int i = 0; i < galloc->n_buffers; i++) {
++        if (galloc->buffers[i] == NULL) {
++            continue;
++        }
++        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; c++) {
++            ggml_backend_buffer_t chunk = galloc->buffers[i]->chunks[c];
++            if (chunk == NULL) {
++                continue;
++            }
++            if (reset) {
++                ggml_backend_meta_buffer_reset_shape_slot(chunk, slot);
++            } else {
++                ggml_backend_meta_buffer_set_shape_slot(chunk, slot);
++            }
++        }
++    }
++}
++
++void ggml_gallocr_set_shape_slot(ggml_gallocr_t galloc, int slot) {
++    ggml_gallocr_shape_slot(galloc, slot, false);
++}
++
++void ggml_gallocr_reset_shape_slot(ggml_gallocr_t galloc, int slot) {
++    ggml_gallocr_shape_slot(galloc, slot, true);
++}
++
+ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+     ggml_gallocr_t galloc = (ggml_gallocr_t)calloc(1, sizeof(struct ggml_gallocr));
+     GGML_ASSERT(galloc != NULL);
+ 
+     galloc->bufts = calloc(n_bufs, sizeof(ggml_backend_buffer_type_t));
+     GGML_ASSERT(galloc->bufts != NULL);
+ 
+     galloc->buffers = calloc(n_bufs, sizeof(struct vbuffer *));
+@@ -545,17 +585,17 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
+             // skip if already freed
+             bool freed = false;
+             for (int j = 0; j < i; j++) {
+                 if (galloc->buffers[j] == galloc->buffers[i]) {
+                     freed = true;
+                     break;
+                 }
+             }
+-            if (!freed) {
++            if (!freed && !galloc->shared) {
+                 ggml_vbuffer_free(galloc->buffers[i]);
+             }
+         }
+         if (galloc->buf_tallocs != NULL) {
+             // skip if already freed
+             bool freed = false;
+             for (int j = 0; j < i; j++) {
+                 if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+@@ -917,16 +957,22 @@ static bool ggml_gallocr_reserve_n_impl(
+         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+             size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+             new_size += new_chunk_size;
+             if (new_chunk_size > cur_chunk_size) {
+                 realloc = true;
+             }
+         }
++        if (realloc && galloc->shared) {
++            // too small for this plan: fail, rather than free memory this allocator does not own
++            GGML_LOG_DEBUG("%s: shared %s buffer would have to grow to %.02f MiB\n",
++                __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size / 1024.0 / 1024.0);
++            return false;
++        }
+         if (realloc) {
+ #ifndef NDEBUG
+             {
+                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                 if (cur_size > 0) {
+                     GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                         __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                 }
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 861a47c0c..9c08ea72f 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1,15 +1,17 @@
+ #include "ggml.h"
+ #include "ggml-impl.h"
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
+ #include "ggml-alloc.h"
+ #include "ggml-cpp.h"
+ 
++#include <atomic>
++#include <dispatch/dispatch.h>
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+@@ -126,17 +128,17 @@ static void ggml_backend_meta_device_get_props(ggml_backend_dev_t dev, ggml_back
+     props->device_id   = 0;
+ 
+     ggml_backend_meta_device_get_memory(dev, &props->memory_free, &props->memory_total);
+ 
+     props->caps = {
+         /* .async                 = */ true,
+         /* .host_buffer           = */ false, // Not implemented.
+         /* .buffer_from_host_ptr  = */ false, // Not implemented.
+-        /* .events                = */ false, // Not implemented.
++        /* .events                = */ true,
+         /* .mmap_support          = */ true,
+     };
+     for (ggml_backend_dev_t simple_dev : meta_dev_ctx->simple_devs) {
+         ggml_backend_dev_props tmp_props;
+         ggml_backend_dev_get_props(simple_dev, &tmp_props);
+         props->caps.async                = props->caps.async                && tmp_props.caps.async;
+         props->caps.host_buffer          = props->caps.host_buffer          && tmp_props.caps.host_buffer;
+         props->caps.buffer_from_host_ptr = props->caps.buffer_from_host_ptr && tmp_props.caps.buffer_from_host_ptr;
+@@ -172,32 +174,39 @@ static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_
+     for (size_t i = 0; i < meta_dev_ctx->simple_devs.size(); i++) {
+         if (meta_dev_ctx->simple_devs[i] != meta_buft_dev_ctx->simple_devs[i]) {
+             return false;
+         }
+     }
+     return true;
+ }
+ 
++// An event on a group of devices is one event per device: recording hits them all, and waiting
++// waits for all of them. Without this the group reports no event support and the scheduler falls
++// back to draining, which is what keeps groups from overlapping with each other.
++static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev);
++static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event);
++static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event);
++
+ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .get_name             = */ ggml_backend_meta_device_get_name,
+     /* .get_description      = */ ggml_backend_meta_device_get_description,
+     /* .get_memory           = */ ggml_backend_meta_device_get_memory,
+     /* .get_type             = */ ggml_backend_meta_device_get_type,
+     /* .get_props            = */ ggml_backend_meta_device_get_props,
+     /* .init_backend         = */ ggml_backend_meta_device_init_backend,
+     /* .get_buffer_type      = */ ggml_backend_meta_device_get_buffer_type,
+     /* .get_host_buffer_type = */ ggml_backend_meta_device_get_host_buffer_type,
+     /* .buffer_from_host_ptr = */ nullptr,
+     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
+     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
+     /* .offload_op           = */ nullptr,
+-    /* .event_new            = */ nullptr,
+-    /* .event_free           = */ nullptr,
+-    /* .event_synchronize    = */ nullptr,
++    /* .event_new            = */ ggml_backend_meta_device_event_new,
++    /* .event_free           = */ ggml_backend_meta_device_event_free,
++    /* .event_synchronize    = */ ggml_backend_meta_device_event_synchronize,
+ };
+ 
+ static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
+ }
+ 
+ static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+@@ -207,16 +216,60 @@ static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+ 
+ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
+     return meta_dev_ctx->simple_devs[index];
+ }
+ 
++struct ggml_backend_meta_event_context {
++    std::vector<ggml_backend_event_t> events;
++};
++
++static ggml_backend_event_t ggml_backend_meta_device_event_new(ggml_backend_dev_t dev) {
++    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
++    const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
++
++    auto * ev_ctx = new ggml_backend_meta_event_context;
++    ev_ctx->events.reserve(n_devs);
++    for (size_t i = 0; i < n_devs; i++) {
++        ggml_backend_event_t ev = ggml_backend_event_new(ggml_backend_meta_dev_simple_dev(dev, i));
++        if (ev == nullptr) {
++            for (ggml_backend_event_t e : ev_ctx->events) {
++                ggml_backend_event_free(e);
++            }
++            delete ev_ctx;
++            return nullptr;
++        }
++        ev_ctx->events.push_back(ev);
++    }
++
++    return new ggml_backend_event { /* .device = */ dev, /* .context = */ ev_ctx };
++}
++
++static void ggml_backend_meta_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
++    GGML_UNUSED(dev);
++    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
++    for (ggml_backend_event_t e : ev_ctx->events) {
++        ggml_backend_event_free(e);
++    }
++    delete ev_ctx;
++    delete event;
++}
++
++static void ggml_backend_meta_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
++    GGML_UNUSED(dev);
++    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
++    for (ggml_backend_event_t e : ev_ctx->events) {
++        ggml_backend_event_synchronize(e);
++    }
++}
++
++
+ ggml_backend_dev_t ggml_backend_meta_device(
+         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
+     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);
+     // TODO: this is not thread-safe - needs to be fixed
+     static std::vector<std::unique_ptr<ggml_backend_meta_device_context>>         ctxs;
+     static std::map<ggml_backend_meta_device_context, struct ggml_backend_device> meta_devs;
+ 
+     std::vector<ggml_backend_dev_t> simple_devs;
+@@ -420,50 +473,83 @@ struct ggml_backend_meta_buffer_context {
+     // Most tensors can simply be stored statically in their own buffer.
+     // Externally created views however also need a mapping to simple tensors but they use the buffer of the view source.
+     // If external views are simply using that buffer they will slowly deplete its memory.
+     // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
+     // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
+     //     currently not possible due to graph-external operations in the backend scheduler.
+     ggml_backend_meta_simple_tensor_container stc_static;
+     ggml_backend_meta_simple_tensor_container stc_compute[2];
++    // One container per prepared shape: while a slot is active the rotating ones stand still.
++    ggml_backend_meta_simple_tensor_container stc_slot[2];
++    int shape_slot             = -1;
+     int stc_compute_index      = 0;
+     int stc_compute_index_next = 0;
+     std::vector<ggml_backend_buffer_ptr> bufs;
+ 
+     // FIXME
+     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
+     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
+     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
+     std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+ 
+     int debug;
+ 
+     ggml_backend_meta_buffer_context(
+             ggml_backend_meta_simple_tensor_container & stc_static,
+             ggml_backend_meta_simple_tensor_container & stc_compute_0,
+             ggml_backend_meta_simple_tensor_container & stc_compute_1,
+-            const std::vector<ggml_backend_buffer_t> & bufs)
+-            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)} {
++            const std::vector<ggml_backend_buffer_t> & bufs,
++            ggml_backend_meta_simple_tensor_container & stc_slot_0,
++            ggml_backend_meta_simple_tensor_container & stc_slot_1)
++            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)},
++              stc_slot{std::move(stc_slot_0), std::move(stc_slot_1)} {
+         this->bufs.reserve(bufs.size());
+         for (ggml_backend_buffer_t buf : bufs) {
+             this->bufs.emplace_back(buf);
+         }
+         const char * GGML_META_DEBUG = getenv("GGML_META_DEBUG");
+         debug = GGML_META_DEBUG ? atoi(GGML_META_DEBUG) : 0;
+     }
+ 
+     ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
+         if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
+             return stc_static;
+         }
++        if (shape_slot >= 0) {
++            return stc_slot[shape_slot];
++        }
+         return stc_compute[stc_compute_index];
+     }
+ };
+ 
++// The slot belongs to these buffers, not to the process: two contexts never touch each other's.
++extern "C" void ggml_backend_meta_buffer_set_shape_slot(ggml_backend_buffer_t buffer, int slot) {
++    if (buffer == nullptr || !ggml_backend_buffer_is_meta(buffer)) {
++        return;
++    }
++    GGML_ASSERT(slot < 2);
++    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
++    buf_ctx->shape_slot = slot;
++}
++
++// The graph that owned this slot is gone, so its per-device tensor mappings go with it.
++extern "C" void ggml_backend_meta_buffer_reset_shape_slot(ggml_backend_buffer_t buffer, int slot) {
++    if (buffer == nullptr || !ggml_backend_buffer_is_meta(buffer) || slot < 0) {
++        return;
++    }
++    GGML_ASSERT(slot < 2);
++    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
++    ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_slot[slot];
++    for (ggml_context_ptr & ctx : stc.ctxs) {
++        ggml_reset(ctx.get());
++    }
++    stc.simple_tensors.clear();
++}
++
+ static void ggml_backend_meta_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+     delete buf_ctx;
+ }
+ 
+ static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
+     GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
+@@ -1312,16 +1398,18 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
+                     && t_ij->view_src->buffer != nullptr) {
+                 t_ij->buffer = t_ij->view_src->buffer;
+                 init_buf     = t_ij->view_src->buffer;
+             }
+         } else if (simple_buf != nullptr) {
+             // Only this branch needs a single base, and views never reach it, so a model whose
+             // per-device weights outgrow one Metal buffer still splits by tensors.
+             // ref: https://github.com/ggml-org/llama.cpp/issues/22197
++            if (ggml_backend_buffer_is_multi_buffer(simple_buf) ||
++                ggml_backend_buffer_is_multi_buffer(tensor->buffer)) {
+                 GGML_ABORT("multi buffers are not supported by the meta backend");
+             }
+             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
+                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
+         }
+ 
+         if (init_buf) {
+             // the backend that owns the buffer will set .extra
+@@ -1700,16 +1788,54 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
+             ggml_backend_tensor_get(simple_tensor, data, offset, size);
+         } break;
+         default: {
+             GGML_ABORT("fatal error");
+         }
+     }
+ }
+ 
++// Without this a copy between two meta buffers falls back to malloc + read out + write back,
++// which on a discrete GPU crosses the bus twice. When both sides are split the same way, each
++// slice can be copied where it already lives.
++static bool ggml_backend_meta_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
++    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
++
++    if (src->buffer == nullptr || !ggml_backend_buffer_is_meta(src->buffer)) {
++        return false;
++    }
++
++    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
++    if (ggml_backend_meta_buffer_n_bufs(src->buffer) != n_bufs) {
++        return false;
++    }
++
++    const ggml_backend_meta_split_state ss_src = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
++    const ggml_backend_meta_split_state ss_dst = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
++    if (ss_src.axis != ss_dst.axis || ss_src.n_segments != ss_dst.n_segments) {
++        return false;
++    }
++    for (size_t k = 0; k < ss_src.n_segments*n_bufs; k++) {
++        if (ss_src.ne[k] != ss_dst.ne[k]) {
++            return false;
++        }
++    }
++
++    for (size_t j = 0; j < n_bufs; j++) {
++        const ggml_tensor * s_j = ggml_backend_meta_buffer_simple_tensor(src, j);
++        ggml_tensor * d_j = ggml_backend_meta_buffer_simple_tensor(dst, j);
++        if (s_j == nullptr || d_j == nullptr || ggml_nbytes(s_j) != ggml_nbytes(d_j)) {
++            return false;
++        }
++        ggml_backend_tensor_copy(s_j, d_j);
++    }
++
++    return true;
++}
++
+ static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+     const size_t n_buffers = ggml_backend_meta_buffer_n_bufs(buffer);
+     for (size_t i = 0; i < n_buffers; i++) {
+         ggml_backend_buffer_clear(ggml_backend_meta_buffer_simple_buffer(buffer, i), value);
+     }
+ }
+ 
+ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
+@@ -1724,17 +1850,17 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+     /* .free_buffer     = */ ggml_backend_meta_buffer_free_buffer,
+     /* .get_base        = */ ggml_backend_meta_buffer_get_base,
+     /* .init_tensor     = */ ggml_backend_meta_buffer_init_tensor,
+     /* .memset_tensor   = */ ggml_backend_meta_buffer_memset_tensor,
+     /* .set_tensor      = */ ggml_backend_meta_buffer_set_tensor,
+     /* .get_tensor      = */ ggml_backend_meta_buffer_get_tensor,
+     /* .set_tensor_2d   = */ nullptr,
+     /* .get_tensor_2d   = */ nullptr,
+-    /* .cpy_tensor      = */ nullptr,
++    /* .cpy_tensor      = */ ggml_backend_meta_buffer_cpy_tensor,
+     /* .clear           = */ ggml_backend_meta_buffer_clear,
+     /* .reset           = */ ggml_backend_meta_buffer_reset,
+ };
+ 
+ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
+     return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
+ }
+ 
+@@ -1754,26 +1880,28 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+     const ggml_init_params params = {
+         /*.mem_size   =*/ 1024*1024*ggml_tensor_overhead(), // FIXME
+         /*.mem_buffer =*/ nullptr,
+         /*.no_alloc   =*/ true,
+     };
+     ggml_backend_meta_simple_tensor_container stc_static;
+     ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
+     ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
++    ggml_backend_meta_simple_tensor_container stc_slot_0(params, n_simple_bufts);
++    ggml_backend_meta_simple_tensor_container stc_slot_1(params, n_simple_bufts);
+ 
+     size_t max_size = 0;
+     std::vector<ggml_backend_buffer_t> bufs;
+     bufs.reserve(n_simple_bufts);
+     for (size_t i = 0; i < n_simple_bufts; i++) {
+         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
+         GGML_ASSERT(bufs.back() != nullptr);
+         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
+     }
+-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
++    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs, stc_slot_0, stc_slot_1);
+ 
+     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
+ }
+ 
+ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+ 
+     constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+@@ -1785,19 +1913,21 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
+     const ggml_init_params params_compute = {
+         /*.mem_size   =*/ compute_headroom * n_tensors * ggml_tensor_overhead(),
+         /*.mem_buffer =*/ nullptr,
+         /*.no_alloc   =*/ true,
+     };
+     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
+     ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
+     ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
++    ggml_backend_meta_simple_tensor_container stc_slot_0(params_compute, n_simple_bufts);
++    ggml_backend_meta_simple_tensor_container stc_slot_1(params_compute, n_simple_bufts);
+ 
+     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
+-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
++    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs, stc_slot_0, stc_slot_1);
+ 
+     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
+     for (int i = 0; i < n_tensors; i++) {
+         ggml_tensor * t = tensors[i];
+         t->buffer = meta_buf;
+         ggml_backend_meta_buffer_init_tensor_impl(meta_buf_ctx->stc_static, t);
+         t->data = (void *) 0x2000000000000000; // FIXME
+     }
+@@ -1865,21 +1995,95 @@ struct ggml_backend_meta_context {
+     size_t                      max_tmp_size  = 0;
+     size_t                      max_subgraphs = 0;
+     size_t                      n_subgraphs   = 0;
+     uint64_t                    uid           = 0;
+ 
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+ 
++    // Each slot holds what only depends on the graph's shape: the per-device subgraphs and the
++    // sizes derived from them. Swapping moves that state in and out of the live members.
++    struct shape_slot_state {
++        std::vector<backend_config> backend_configs;
++        ggml_context_ptr            ctx;
++        std::vector<ggml_cgraph *>  cgraphs_aux;
++        std::vector<ggml_tensor *>  nodes_aux;
++        int      max_nnodes    = 0;
++        size_t   max_tmp_size  = 0;
++        size_t   max_subgraphs = 0;
++        size_t   n_subgraphs   = 0;
++        uint64_t uid           = 0;
++    };
++    shape_slot_state            shape_slots[2];
++    int                         shape_active = -1;
++    std::vector<ggml_backend_t> simple_backends;
++
++    void shape_swap(shape_slot_state & s) {
++        std::swap(backend_configs, s.backend_configs);
++        std::swap(ctx,             s.ctx);
++        std::swap(cgraphs_aux,     s.cgraphs_aux);
++        std::swap(nodes_aux,       s.nodes_aux);
++        std::swap(max_nnodes,      s.max_nnodes);
++        std::swap(max_tmp_size,    s.max_tmp_size);
++        std::swap(max_subgraphs,   s.max_subgraphs);
++        std::swap(n_subgraphs,     s.n_subgraphs);
++        std::swap(uid,             s.uid);
++    }
++
++    // An empty slot has never been prepared: hand it the same simple backends and let the
++    // rebuild path fill the rest.
++    void shape_prepare() {
++        if (!backend_configs.empty()) {
++            return;
++        }
++        for (ggml_backend_t b : simple_backends) {
++            backend_configs.emplace_back(b, n_reduce_steps);
++        }
++        max_nnodes    = 0;
++        max_subgraphs = 0;
++        max_tmp_size  = 0;
++        n_subgraphs   = 0;
++        uid           = 0;
++    }
++
++    static void shape_clear(shape_slot_state & s) {
++        s.backend_configs.clear();
++        s.ctx.reset();
++        s.cgraphs_aux.clear();
++        s.nodes_aux.clear();
++        s.max_nnodes    = 0;
++        s.max_tmp_size  = 0;
++        s.max_subgraphs = 0;
++        s.n_subgraphs   = 0;
++        s.uid           = 0;
++    }
++
++    void shape_reset(int slot) {
++        GGML_ASSERT(slot >= 0 && slot < 2);
++        if (shape_active == slot) {
++            backend_configs.clear();
++            ctx.reset();
++            cgraphs_aux.clear();
++            nodes_aux.clear();
++            max_nnodes    = 0;
++            max_tmp_size  = 0;
++            max_subgraphs = 0;
++            n_subgraphs   = 0;
++            uid           = 0;
++            shape_prepare();
++        } else {
++            shape_clear(shape_slots[slot]);
++        }
++    }
++
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+         n_reduce_steps = std::ceil(std::log2(n_devs));
+         name = "Meta(";
+-        std::vector<ggml_backend_t> simple_backends;
+         backend_configs.reserve(n_devs);
+         simple_backends.reserve(n_devs);
+         for (size_t i = 0; i < n_devs; i++) {
+             ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
+             if (i > 0) {
+                 name += ",";
+             }
+             name += ggml_backend_dev_name(simple_dev);
+@@ -1905,22 +2109,63 @@ struct ggml_backend_meta_context {
+ 
+     ~ggml_backend_meta_context() {
+         if (comm_ctx != nullptr) {
+             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
+                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
+             GGML_ASSERT(comm_free != nullptr);
+             comm_free(comm_ctx);
+         }
+-        for (auto & bc : backend_configs) {
+-            ggml_backend_free(bc.backend);
++        // the slots only borrow the simple backends, so they are freed once, here
++        for (int i = 0; i < 2; i++) {
++            shape_slots[i].backend_configs.clear();
++            shape_slots[i].cgraphs_aux.clear();
++            shape_slots[i].nodes_aux.clear();
++            shape_slots[i].ctx.reset();
++        }
++        backend_configs.clear();
++        for (ggml_backend_t b : simple_backends) {
++            ggml_backend_free(b);
+         }
+     }
+ };
+ 
++extern "C" void ggml_backend_meta_set_shape_slot(ggml_backend_t meta_backend, int slot) {
++    if (meta_backend == nullptr || !ggml_backend_is_meta(meta_backend)) {
++        return;
++    }
++    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
++    if (slot < 0) {
++        if (backend_ctx->shape_active >= 0) {
++            backend_ctx->shape_swap(backend_ctx->shape_slots[backend_ctx->shape_active]);
++            backend_ctx->shape_active = -1;
++            backend_ctx->shape_prepare();
++        }
++        return;
++    }
++    GGML_ASSERT(slot < 2);
++    if (backend_ctx->shape_active == slot) {
++        return;
++    }
++    if (backend_ctx->shape_active >= 0) {
++        backend_ctx->shape_swap(backend_ctx->shape_slots[backend_ctx->shape_active]);
++    }
++    backend_ctx->shape_swap(backend_ctx->shape_slots[slot]);
++    backend_ctx->shape_prepare();
++    backend_ctx->shape_active = slot;
++}
++
++extern "C" void ggml_backend_meta_reset_shape_slot(ggml_backend_t meta_backend, int slot) {
++    if (meta_backend == nullptr || !ggml_backend_is_meta(meta_backend)) {
++        return;
++    }
++    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) meta_backend->context;
++    backend_ctx->shape_reset(slot);
++}
++
+ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
+     GGML_ASSERT(ggml_backend_is_meta(backend));
+     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) backend->context;
+     return backend_ctx->name.c_str();
+ }
+ 
+ static void ggml_backend_meta_free(ggml_backend_t backend) {
+     GGML_ASSERT(ggml_backend_is_meta(backend));
+@@ -2021,17 +2266,25 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
+ 
+ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     for (size_t i = 0; i < n_backends; i++) {
+         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
+     }
+ }
+ 
++// One forward pass per call, which in decode is one token. The Metal tracer divides by this
++// instead of by a token count guessed from the benchmark.
++extern "C" std::atomic<uint64_t> * ggml_backend_meta_pass_counter(void) {
++    static std::atomic<uint64_t> passes{0};
++    return &passes;
++}
++
+ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
++    ggml_backend_meta_pass_counter()->fetch_add(1, std::memory_order_relaxed);
+     GGML_ASSERT(cgraph->grads == nullptr);
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+ 
+     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+ 
+     bool max_nnodes_raised = false;
+@@ -2055,16 +2308,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+         }
+         for (int i = 0; i < cgraph->n_nodes; i++) {
+             if (ggml_backend_buffer_is_meta(cgraph->nodes[i]->buffer)) {
+                 used_buffers.emplace(cgraph->nodes[i]->buffer);
+             }
+         }
+         for (ggml_backend_buffer_t buf : used_buffers) {
+             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
++            if (buf_ctx->shape_slot >= 0) {
++                // the slot's container is cleared by whoever schedules a rebuild into it
++                continue;
++            }
+             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
+             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
+             for (ggml_context_ptr & ctx : stc.ctxs) {
+                 ggml_reset(ctx.get());
+             }
+             stc.simple_tensors.clear();
+         }
+         size_t n_subgraphs  = 0;
+@@ -2271,16 +2528,62 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                         if ((bcj.nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                             for (int ii = i + 1; ii <= i_delayed; ii++) {
+                                 bcj.nodes[ii]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+                             }
+                         }
+                     }
+                 }
+ 
++                // TOSH_TP_ANATOMY=1 lists every cut, which is one collective each: the partial
++                // node that forced it, where the delay moved it to, and what consumes the result.
++                static int anatomy = -1;
++                if (anatomy < 0) {
++                    anatomy = getenv("TOSH_TP_ANATOMY") != nullptr;
++                }
++                if (anatomy) {
++                    ggml_tensor * part = cgraph->nodes[i];
++                    ggml_tensor * cut  = cgraph->nodes[i_delayed];
++                    ggml_tensor * next = i_delayed + 1 < cgraph->n_nodes ? cgraph->nodes[i_delayed + 1] : nullptr;
++
++                    // The node that follows in topological order is not evidence of anything.
++                    // Walk forward for nodes that really take the reduced tensor as an input,
++                    // following view chains, and report the first one plus how many there are.
++                    auto roots_at = [](ggml_tensor * t) {
++                        while (t != nullptr && t->view_src != nullptr) {
++                            t = t->view_src;
++                        }
++                        return t;
++                    };
++                    ggml_tensor * cut_root = roots_at(cut);
++                    ggml_tensor * user = nullptr;
++                    int n_users = 0, i_user = -1;
++                    for (int id = i_delayed + 1; id < cgraph->n_nodes; id++) {
++                        ggml_tensor * cand = cgraph->nodes[id];
++                        bool uses = roots_at(cand->view_src) == cut_root && cand->view_src != nullptr;
++                        for (int sx = 0; sx < GGML_MAX_SRC && !uses; sx++) {
++                            uses = cand->src[sx] != nullptr && roots_at(cand->src[sx]) == cut_root;
++                        }
++                        if (uses) {
++                            if (user == nullptr) { user = cand; i_user = id; }
++                            n_users++;
++                        }
++                    }
++
++                    fprintf(stderr,
++                        "TP_CUT %3zu  node %5d  partial=%-22s %-13s  cut@%-5d %-22s %-13s  "
++                        "ne=[%lld,%lld,%lld,%lld] %zuB  next=%s/%s  consumer@%d=%s/%s  n_users=%d\n",
++                        n_subgraphs, i, part->name, ggml_op_name(part->op),
++                        i_delayed, cut->name, ggml_op_name(cut->op),
++                        (long long) cut->ne[0], (long long) cut->ne[1],
++                        (long long) cut->ne[2], (long long) cut->ne[3], ggml_nbytes(cut),
++                        next ? next->name : "-", next ? ggml_op_name(next->op) : "-",
++                        i_user, user ? user->name : "-", user ? ggml_op_name(user->op) : "-", n_users);
++                }
++
+                 i = i_delayed;
+ 
+                 for (size_t j = 0; j < n_backends; j++) {
+                     auto & bcj = backend_ctx->backend_configs[j];
+                     bcj.cgraphs[n_subgraphs].offset = i_start;
+                 }
+                 n_subgraphs++;
+                 i_start = i + 1;
+@@ -2311,18 +2614,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             const ggml_init_params params = {
+                 /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                 /*.mem_buffer =*/ nullptr,
+                 /*.no_alloc   =*/ true,
+             };
+             backend_ctx->ctx.reset(ggml_init(params));
+             for (size_t j = 0; j < n_backends; j++) {
+                 auto & bcj = backend_ctx->backend_configs[j];
+-                for (size_t i = 0; i < n_subgraphs; i++) {
+-                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
++                // the reset above freed every subgraph, including those a later graph with more of them reuses
++                for (size_t i = 0; i < backend_ctx->max_subgraphs; i++) {
++                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
+                 }
+             }
+             backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);
+             for (size_t k = 0; k < backend_ctx->cgraphs_aux.size(); k++) {
+                 backend_ctx->cgraphs_aux[k] = ggml_new_graph_custom(backend_ctx->ctx.get(), 1, cgraph->grads);
+             }
+             backend_ctx->nodes_aux.resize(n_backends*n_nodes_per_device*backend_ctx->max_subgraphs);
+             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
+@@ -2493,17 +2797,40 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+             ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+         }
+ 
+         return GGML_STATUS_SUCCESS;
+     };
+ 
+ 
++    // One device per token is the shape this loop was written for, so it encodes
++    // them one after another; with four cards that is four full encodes in series.
++    // They only meet at the AllReduce below, so encode them at once.
++    static int serial_encode = -1;
++    if (serial_encode < 0) {
++        const char * s_se = getenv("TOSH_MGPU_SERIAL_ENCODE");
++        serial_encode = s_se ? atoi(s_se) : 0;
++    }
++
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
++        if (!serial_encode && n_backends > 1) {
++            std::atomic<int> failed{(int) GGML_STATUS_SUCCESS};
++            std::atomic<int> * p_failed = &failed;
++            dispatch_apply(n_backends, DISPATCH_APPLY_AUTO, ^(size_t j) {
++                auto & bcj = backend_ctx->backend_configs[j];
++                const ggml_status st = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
++                if (st != GGML_STATUS_SUCCESS) {
++                    p_failed->store((int) st);
++                }
++            });
++            if (failed.load() != (int) GGML_STATUS_SUCCESS) {
++                return (ggml_status) failed.load();
++            }
++        } else
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+             }
+         }
+ 
+@@ -2526,33 +2853,118 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                     return status;
+                 }
+             }
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++static void ggml_backend_meta_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
++    auto * backend_ctx = (ggml_backend_meta_context *) backend->context;
++    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
++    GGML_ASSERT(ev_ctx->events.size() == backend_ctx->backend_configs.size());
++    for (size_t j = 0; j < backend_ctx->backend_configs.size(); j++) {
++        ggml_backend_event_record(ev_ctx->events[j], backend_ctx->backend_configs[j].backend);
++    }
++}
++
++static void ggml_backend_meta_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
++    auto * backend_ctx = (ggml_backend_meta_context *) backend->context;
++    auto * ev_ctx = (ggml_backend_meta_event_context *) event->context;
++    for (size_t j = 0; j < backend_ctx->backend_configs.size(); j++) {
++        ggml_backend_event_wait(backend_ctx->backend_configs[j].backend, ev_ctx->events[j]);
++    }
++}
++
++// The devices underneath know how to batch their reads into one round-trip, which is what keeps
++// a discrete GPU from paying a blit and a wait per input. Pass it through to all of them.
++// The scheduler hands tensors between groups with this. Left unset it falls back to a synchronous
++// copy through host memory; when both groups split the tensor the same way, each device can take
++// its own slice from its counterpart directly.
++static bool ggml_backend_meta_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
++        const ggml_tensor * src, ggml_tensor * dst) {
++    if (!ggml_backend_is_meta(backend_src) || !ggml_backend_is_meta(backend_dst)) {
++        return false;
++    }
++    if (src->buffer == nullptr || dst->buffer == nullptr ||
++            !ggml_backend_buffer_is_meta(src->buffer) || !ggml_backend_buffer_is_meta(dst->buffer)) {
++        return false;
++    }
++
++    auto * ctx_src = (ggml_backend_meta_context *) backend_src->context;
++    auto * ctx_dst = (ggml_backend_meta_context *) backend_dst->context;
++    const size_t n_bufs = ctx_src->backend_configs.size();
++    if (ctx_dst->backend_configs.size() != n_bufs ||
++            ggml_backend_meta_buffer_n_bufs(src->buffer) != n_bufs ||
++            ggml_backend_meta_buffer_n_bufs(dst->buffer) != n_bufs) {
++        return false;
++    }
++
++    const ggml_backend_meta_split_state ss_src = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
++    const ggml_backend_meta_split_state ss_dst = ggml_backend_meta_get_split_state(dst, /*assume_sync =*/ false);
++    if (ss_src.axis != ss_dst.axis || ss_src.n_segments != ss_dst.n_segments) {
++        return false;
++    }
++    for (size_t k = 0; k < ss_src.n_segments*n_bufs; k++) {
++        if (ss_src.ne[k] != ss_dst.ne[k]) {
++            return false;
++        }
++    }
++
++    for (size_t j = 0; j < n_bufs; j++) {
++        const ggml_tensor * s_j = ggml_backend_meta_buffer_simple_tensor(src, j);
++        ggml_tensor * d_j = ggml_backend_meta_buffer_simple_tensor(dst, j);
++        if (s_j == nullptr || d_j == nullptr || ggml_nbytes(s_j) != ggml_nbytes(d_j)) {
++            return false;
++        }
++        ggml_backend_tensor_copy_async(ctx_src->backend_configs[j].backend,
++                ctx_dst->backend_configs[j].backend, s_j, d_j);
++    }
++
++    return true;
++}
++
++static void ggml_backend_meta_read_batch_begin(ggml_backend_t backend) {
++    auto * backend_ctx = (ggml_backend_meta_context *) backend->context;
++    for (auto & bc : backend_ctx->backend_configs) {
++        if (bc.backend->iface.read_batch_begin) {
++            bc.backend->iface.read_batch_begin(bc.backend);
++        }
++    }
++}
++
++static void ggml_backend_meta_read_batch_end(ggml_backend_t backend) {
++    auto * backend_ctx = (ggml_backend_meta_context *) backend->context;
++    for (auto & bc : backend_ctx->backend_configs) {
++        if (bc.backend->iface.read_batch_end) {
++            bc.backend->iface.read_batch_end(bc.backend);
++        }
++    }
++}
++
+ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .get_name                = */ ggml_backend_meta_get_name,
+     /* .free                    = */ ggml_backend_meta_free,
+     /* .set_tensor_async        = */ ggml_backend_meta_set_tensor_async,
+     /* .get_tensor_async        = */ ggml_backend_meta_get_tensor_async,
+     /* .set_tensor_2d_async     = */ nullptr,
+     /* .get_tensor_2d_async     = */ nullptr,
+-    /* .cpy_tensor_async        = */ nullptr,
++    /* .cpy_tensor_async        = */ ggml_backend_meta_cpy_tensor_async,
+     /* .synchronize             = */ ggml_backend_meta_synchronize,
+     /* .graph_plan_create       = */ nullptr,
+     /* .graph_plan_free         = */ nullptr,
+     /* .graph_plan_update       = */ nullptr,
+     /* .graph_plan_compute      = */ nullptr,
+     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
+-    /* .event_record            = */ nullptr,
+-    /* .event_wait              = */ nullptr,
++    /* .event_record            = */ ggml_backend_meta_event_record,
++    /* .event_wait              = */ ggml_backend_meta_event_wait,
+     /* .graph_optimize          = */ nullptr,
++    /* .read_batch_begin        = */ ggml_backend_meta_read_batch_begin,
++    /* .read_batch_end          = */ ggml_backend_meta_read_batch_end,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
+     return backend != nullptr && backend->iface.get_name == ggml_backend_meta_i.get_name;
+ }
+ 
+ static ggml_backend_t ggml_backend_meta_device_init_backend(ggml_backend_dev_t dev, const char * params) {
+     ggml_backend_meta_context * backend_ctx = new ggml_backend_meta_context(dev, params);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bdade6de..02a6cefba 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2068,16 +2068,37 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+     sched->op_offload = op_offload;
+ 
+     ggml_backend_sched_reset(sched);
+ 
+     return sched;
+ }
+ 
++void ggml_backend_sched_share_compute_buffers(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
++    GGML_ASSERT(dst && src);
++    ggml_gallocr_share_buffers(dst->galloc, src->galloc);
++}
++
++void ggml_backend_sched_set_shape_slot(ggml_backend_sched_t sched, int slot) {
++    GGML_ASSERT(sched);
++    for (int i = 0; i < sched->n_backends; i++) {
++        ggml_backend_meta_set_shape_slot(sched->backends[i], slot);
++    }
++    ggml_gallocr_set_shape_slot(sched->galloc, slot);
++}
++
++void ggml_backend_sched_reset_shape_slot(ggml_backend_sched_t sched, int slot) {
++    GGML_ASSERT(sched);
++    for (int i = 0; i < sched->n_backends; i++) {
++        ggml_backend_meta_reset_shape_slot(sched->backends[i], slot);
++    }
++    ggml_gallocr_reset_shape_slot(sched->galloc, slot);
++}
++
+ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
+     if (sched == NULL) {
+         return;
+     }
+     for (int b = 0; b < sched->n_backends; b++) {
+         for (int c = 0; c < sched->n_copies; c++) {
+             ggml_backend_event_free(sched->events[b][c]);
+         }
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 8e9c1f827..7e6cc66bc 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -238,18 +238,23 @@ struct ggml_metal {
+ 
+     // Bounded host-visible source ring for expert uploads. Keeping one no-copy
+     // MTLBuffer per CPU tensor can pin many GiB of host pages on discrete GPUs.
+     id<MTLBuffer>        prefetch_stages[GGML_METAL_MAX_PREFETCH_STAGES];
+     id<MTLCommandBuffer> prefetch_stage_cmds[GGML_METAL_MAX_PREFETCH_STAGES];
+     int prefetch_stage_count;
+     int prefetch_stage_cur;
+ 
++    ggml_metal_event_t ev_cpy; // for async copies
+     ggml_metal_event_t ev_sync; // destination completion signal
+ 
++    id<MTLCounterSampleBuffer> ct_buf;   // trace only, TOSH_MGPU_CTIME
++    id<MTLSharedEvent>         ev_wait_dummy;   // benchmark only, TOSH_MGPU_WAIT_SATISFIED
++    _Atomic uint64_t           ct_idx;
++
+     // Synchronization and resources shared by both cross-device copy paths.
+     struct ggml_metal_xdev_link {
+         ggml_metal_device_t  src_dev;
+         void *               host;
+         size_t               cap;
+         id<MTLBuffer>        wrap_src, wrap_dst;
+         // Retaining the source keeps its cached remote view valid.
+         id<MTLBuffer>        peer_src, peer_view;
+@@ -320,41 +325,505 @@ struct ggml_metal {
+     } peer_waits[GGML_METAL_MAX_PENDING_WAITS];
+     int n_peer_waits;
+ 
+     // destination command buffer a cross-device copy left open, so the reduction that follows
+     // it is encoded into the same one instead of opening another
+     id<MTLCommandBuffer> cmd_buf_hold;
+ };
+ 
+-ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+ // TOSH_MGPU_DEFER_WAITS folds a cross-device wait into the next command buffer this context
+ // submits instead of spending a whole one on it. Opt-in: on a single card both contexts share
+ // the device queue, so it measures slightly negative there and only 2 real GPUs can settle it.
+ static bool ggml_metal_defer_waits(void) {
+     static int val = -1;
+     if (val < 0) {
+         const char * v = TOSH_ENV("TOSH_MGPU_DEFER_WAITS");
+         val = (v && v[0] == '1') ? 1 : 0;
+     }
+     return val;
+ }
++
++static _Atomic uint64_t g_tr_cmd_all     = 0; // command buffers created through the tracked paths
++static _Atomic uint64_t g_tr_graphs      = 0; // graph submissions, one per subgraph per card
++static _Atomic uint64_t g_tr_merge_reuse = 0; // subgraphs that continued the collective's buffer
++static _Atomic uint64_t g_tr_merge_waits = 0; // waits that had queued in between, and would have
++                                              // been dropped before this was fixed
++static _Atomic uint64_t g_tr_signals     = 0; // cross-device event signals encoded
++static _Atomic uint64_t g_tr_waits       = 0; // cross-device event waits encoded
++
++
++// TOSH_MGPU_TRACE: where the collective's time and bytes go. The counters are only touched
++// when it is on, so a release run pays one cached branch per crossing.
++static _Atomic uint64_t g_tr_reduce      = 0; // exchange_reduce calls
++static _Atomic uint64_t g_tr_copy        = 0; // plain cross-device copies
++static _Atomic uint64_t g_tr_bytes_peer  = 0; // crossed through a remote buffer view
++static _Atomic uint64_t g_tr_bytes_host  = 0; // crossed through the shared host block
++static _Atomic uint64_t g_tr_cmd_bufs    = 0; // command buffers the collective created
++static _Atomic uint64_t g_tr_rv_new      = 0; // remote views built
++static _Atomic uint64_t g_tr_rv_hit      = 0; // remote views reused
++static _Atomic uint64_t g_tr_encode_ns   = 0; // CPU time inside the collective
++static _Atomic uint64_t g_tr_gpu_ns      = 0; // GPU execution of the collective's buffers
++static _Atomic uint64_t g_tr_sched_ns    = 0; // committed to running: queueing plus event waits
++
++static bool tosh_mgpu_trace(void) {
++    static int on = -1;
++    if (on < 0) {
+         const char * v = TOSH_ENV("TOSH_MGPU_TRACE");
++        on = (v && v[0] == '1') ? 1 : 0;
++    }
++    return on == 1;
++}
++
++static uint64_t tosh_now_ns(void) {
++    return clock_gettime_nsec_np(CLOCK_MONOTONIC);
++}
++
++// Separates three things the old instrumentation conflated: when the host committed each
++// side, when each GPU started the collective, and the signed order of both. The collective
++// loop is serial on the CPU, so a GPU-start difference is not evidence of compute imbalance
++// until the commit difference is subtracted from it.
++#define TOSH_SKEW_SLOTS 8192
++static struct {
++    _Atomic uint64_t seq[2];
++    _Atomic uint64_t commit_ns[2];
++    _Atomic uint64_t gpu_ns[2];
++} g_skew[TOSH_SKEW_SLOTS];
++
++static _Atomic uint64_t g_sk_n;
++static _Atomic uint64_t g_sk_gpu_hist[8], g_sk_com_hist[8];
++static _Atomic uint64_t g_sk_gpu_sum, g_sk_com_sum, g_sk_gpu_max;
++static _Atomic uint64_t g_sk_gpu_first0, g_sk_com_first0;   // how often peerIndex 0 leads
++
++static int tosh_skew_bucket(double us) {
++    return us < 1 ? 0 : us < 2 ? 1 : us < 5 ? 2 : us < 10 ? 3 :
++           us < 20 ? 4 : us < 50 ? 5 : us < 200 ? 6 : 7;
++}
++
++static void tosh_skew_commit(uint64_t seq, int side, uint64_t t_ns) {
++    const int slot = (int) (seq % TOSH_SKEW_SLOTS);
++    atomic_store(&g_skew[slot].gpu_ns[side], 0);
++    atomic_store(&g_skew[slot].commit_ns[side], t_ns);
++    atomic_store(&g_skew[slot].seq[side], seq);
++}
++
++static void tosh_skew_started(uint64_t seq, int side, double gpu_start) {
++    const int slot = (int) (seq % TOSH_SKEW_SLOTS);
++    atomic_store(&g_skew[slot].gpu_ns[side], (uint64_t) (gpu_start*1e9));
++
++    const int other = side ^ 1;
++    if (atomic_load(&g_skew[slot].seq[other]) != seq) {
++        return;
++    }
++    const uint64_t g0 = atomic_load(&g_skew[slot].gpu_ns[0]);
++    const uint64_t g1 = atomic_load(&g_skew[slot].gpu_ns[1]);
++    const uint64_t c0 = atomic_load(&g_skew[slot].commit_ns[0]);
++    const uint64_t c1 = atomic_load(&g_skew[slot].commit_ns[1]);
++    if (g0 == 0 || g1 == 0 || c0 == 0 || c1 == 0) {
++        return;                                  // the other side has not started yet
++    }
++    // only the side that completes second gets here with both present
++    if (side != 1 && atomic_load(&g_skew[slot].gpu_ns[other]) == 0) {
++        return;
++    }
++    static _Atomic uint64_t claimed[TOSH_SKEW_SLOTS];
++    uint64_t was = atomic_exchange(&claimed[slot], seq);
++    if (was == seq) {
++        return;                                  // already accounted
++    }
++
++    const uint64_t dg = g0 > g1 ? g0 - g1 : g1 - g0;
++    const uint64_t dc = c0 > c1 ? c0 - c1 : c1 - c0;
++    atomic_fetch_add(&g_sk_n, 1);
++    atomic_fetch_add(&g_sk_gpu_sum, dg);
++    atomic_fetch_add(&g_sk_com_sum, dc);
++    if (g0 <= g1) { atomic_fetch_add(&g_sk_gpu_first0, 1); }
++    if (c0 <= c1) { atomic_fetch_add(&g_sk_com_first0, 1); }
++    uint64_t m = atomic_load(&g_sk_gpu_max);
++    while (dg > m && !atomic_compare_exchange_weak(&g_sk_gpu_max, &m, dg)) { }
++    atomic_fetch_add(&g_sk_gpu_hist[tosh_skew_bucket(dg/1000.0)], 1);
++    atomic_fetch_add(&g_sk_com_hist[tosh_skew_bucket(dc/1000.0)], 1);
++}
++
++static void tosh_mgpu_trace_report(void);
++static bool ggml_metal_collective_nowait(void);
++
++// The subgraph command buffer is timed start and end separately, because a difference in
++// completion can come from starting late or from running longer and those need different
++// answers. Note what this buffer contains: ggml_metal_encode_pending_waits runs at its top,
++// so its duration is graph compute plus any event wait encoded there, not pure compute.
++static _Atomic uint64_t g_gr_ord[2];
++static struct {
++    _Atomic uint64_t ord[2];
++    _Atomic uint64_t start_ns[2];
++    _Atomic uint64_t end_ns[2];
++} g_gr[TOSH_SKEW_SLOTS];
++
++static _Atomic uint64_t g_gr_n;
++static _Atomic uint64_t g_gr_hs[8], g_gr_hd[8], g_gr_he[8];      // |start|, |duration|, |end| deltas
++static _Atomic uint64_t g_gr_ss, g_gr_sd, g_gr_se;               // their sums, ns
++static _Atomic uint64_t g_gr_sign_start, g_gr_sign_dur;          // sign agreement with end delta
++static _Atomic uint64_t g_gr_start0_first, g_gr_dur0_less;       // is either side systematically ahead
++static _Atomic uint64_t g_gr_resid;                              // |end - (start + dur)| residual
++static _Atomic uint64_t g_dur_n[2], g_dur_sum[2], g_dur_h[2][8]; // per-side duration
++
++static int tosh_dur_bucket(double us) {
++    return us <  40 ? 0 : us <  80 ? 1 : us < 120 ? 2 : us < 160 ? 3 :
++           us < 200 ? 4 : us < 300 ? 5 : us < 500 ? 6 : 7;
++}
++
++static void tosh_trace_graph_end(id<MTLCommandBuffer> cmd_buf, int side) {
++    if (!tosh_mgpu_trace()) {
++        return;
++    }
++    static _Atomic int reg = 0;                              // a single GPU runs no collective
++    int exp = 0;
++    if (atomic_compare_exchange_strong(&reg, &exp, 1)) { atexit(tosh_mgpu_trace_report); }
++    const uint64_t ord = atomic_fetch_add(&g_gr_ord[side], 1);
++    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++        if (cb.GPUStartTime <= 0 || cb.GPUEndTime <= 0) {
++            return;
++        }
++        const int slot = (int) (ord % TOSH_SKEW_SLOTS);
++        const uint64_t st = (uint64_t) (cb.GPUStartTime*1e9);
++        const uint64_t en = (uint64_t) (cb.GPUEndTime*1e9);
++
++        atomic_fetch_add(&g_dur_n[side], 1);
++        atomic_fetch_add(&g_dur_sum[side], en - st);
++        atomic_fetch_add(&g_dur_h[side][tosh_dur_bucket((en - st)/1000.0)], 1);
++
++        atomic_store(&g_gr[slot].start_ns[side], st);
++        atomic_store(&g_gr[slot].end_ns[side], en);
++        atomic_store(&g_gr[slot].ord[side], ord + 1);
++        if (atomic_load(&g_gr[slot].ord[side ^ 1]) != ord + 1) {
++            return;
++        }
++        const int64_t s0 = (int64_t) atomic_load(&g_gr[slot].start_ns[0]);
++        const int64_t s1 = (int64_t) atomic_load(&g_gr[slot].start_ns[1]);
++        const int64_t e0 = (int64_t) atomic_load(&g_gr[slot].end_ns[0]);
++        const int64_t e1 = (int64_t) atomic_load(&g_gr[slot].end_ns[1]);
++        if (s0 == 0 || s1 == 0 || e0 == 0 || e1 == 0) {
++            return;
++        }
++        static _Atomic uint64_t claimed[TOSH_SKEW_SLOTS];
++        uint64_t was = atomic_exchange(&claimed[slot], ord + 1);
++        if (was == ord + 1) {
++            return;
++        }
++
++        const int64_t ds = s0 - s1;
++        const int64_t dd = (e0 - s0) - (e1 - s1);
++        const int64_t de = e0 - e1;
++        const uint64_t as = ds < 0 ? -ds : ds, ad = dd < 0 ? -dd : dd, ae = de < 0 ? -de : de;
++        const int64_t r = de - (ds + dd);
++
++        atomic_fetch_add(&g_gr_n, 1);
++        atomic_fetch_add(&g_gr_ss, as);
++        atomic_fetch_add(&g_gr_sd, ad);
++        atomic_fetch_add(&g_gr_se, ae);
++        atomic_fetch_add(&g_gr_resid, (uint64_t) (r < 0 ? -r : r));
++        if (ds <= 0) { atomic_fetch_add(&g_gr_start0_first, 1); }
++        if (dd <= 0) { atomic_fetch_add(&g_gr_dur0_less, 1); }
++        if ((ds >= 0) == (de >= 0)) { atomic_fetch_add(&g_gr_sign_start, 1); }
++        if ((dd >= 0) == (de >= 0)) { atomic_fetch_add(&g_gr_sign_dur, 1); }
++        atomic_fetch_add(&g_gr_hs[tosh_skew_bucket(as/1000.0)], 1);
++        atomic_fetch_add(&g_gr_hd[tosh_skew_bucket(ad/1000.0)], 1);
++        atomic_fetch_add(&g_gr_he[tosh_skew_bucket(ae/1000.0)], 1);
++    }];
++}
++
++static void tosh_trace_exchange(id<MTLCommandBuffer> cmd_buf, uint64_t seq, int side) {
++    if (!tosh_mgpu_trace()) {
++        return;
++    }
++    tosh_skew_commit(seq, side, clock_gettime_nsec_np(CLOCK_MONOTONIC));
++    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++        if (cb.GPUStartTime > 0) {
++            tosh_skew_started(seq, side, cb.GPUStartTime);
++        }
++    }];
++}
++
++// Steady-state decode only. Every counter is snapshotted the first time a collective runs on a
++// single-row batch, which is the first generated token, so nothing from load, warm-up or the
++// prompt is amortised into the per-token figures.
++extern _Atomic uint64_t * ggml_backend_meta_pass_counter(void);
++
++static _Atomic int      g_snap_taken = 0;
++static uint64_t g_snap_reduce, g_snap_cmd, g_snap_graphs, g_snap_sig, g_snap_wait,
++                g_snap_peer_b, g_snap_host_b, g_snap_passes;
++
++static void tosh_decode_snapshot(int64_t batch) {
++    if (batch != 1 || atomic_load(&g_snap_taken)) {
++        return;
++    }
++    int expected = 0;
++    if (!atomic_compare_exchange_strong(&g_snap_taken, &expected, 1)) {
++        return;
++    }
++    g_snap_reduce = atomic_load(&g_tr_reduce);
++    g_snap_cmd    = atomic_load(&g_tr_cmd_all);
++    g_snap_graphs = atomic_load(&g_tr_graphs);
++    g_snap_sig    = atomic_load(&g_tr_signals);
++    g_snap_wait   = atomic_load(&g_tr_waits);
++    g_snap_peer_b = atomic_load(&g_tr_bytes_peer);
++    g_snap_host_b = atomic_load(&g_tr_bytes_host);
++    g_snap_passes = atomic_load(ggml_backend_meta_pass_counter());
++}
++
++// TOSH_MGPU_CTIME=1, trace only. GPU timestamps inside the staged exchange, the path batch-1
++// decode actually takes. Four samples, all from one device, so no cross-GPU clock correlation
++// is involved: S0/S1 bracket the publish blit, S2/S3 the staging read. S1 to S2 is a
++// WAIT-WINDOW, not a pure event wait: it spans the signal, the peer wait and the encoder switch.
++#define TOSH_CT_SLOTS 4096
++#define TOSH_CT_PER   4
++
++static bool ggml_metal_ctime(void) {
++    static int v = -1;
+     if (v < 0) { const char * s = TOSH_ENV("TOSH_MGPU_CTIME"); v = (s && s[0] == '1') ? 1 : 0; }
++    return v == 1;
++}
++
++static bool ggml_metal_ctime_barrier(void) {
++    static int v = -1;
+     if (v < 0) { const char * s = TOSH_ENV("TOSH_MGPU_CTIME_BARRIER"); v = (s && s[0] == '1') ? 1 : 0; }
++    return v == 1;
++}
++
++static _Atomic uint64_t g_ct_n, g_ct_pub, g_ct_wait, g_ct_read, g_ct_fail;
++static _Atomic uint64_t g_ct_hw[8], g_ct_hp[8], g_ct_hr[8];
++static double g_ct_ns_per_tick = 0.0;
++
++static int tosh_ct_bucket(double us) {
++    return us < 1 ? 0 : us < 5 ? 1 : us < 10 ? 2 : us < 20 ? 3 :
++           us < 50 ? 4 : us < 100 ? 5 : us < 200 ? 6 : 7;
++}
++
++static id<MTLCounterSampleBuffer> tosh_ct_buffer(ggml_metal_t ctx) {
++    if (!ggml_metal_ctime()) { return nil; }
++    if (ctx->ct_buf != nil)  { return ctx->ct_buf; }
++    if (@available(macOS 10.15, *)) {
++        id<MTLDevice> dev = ggml_metal_device_get_obj(ctx->dev);
++        id<MTLCounterSet> ts = nil;
++        for (id<MTLCounterSet> cs in dev.counterSets) {
++            if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) { ts = cs; break; }
++        }
++        if (ts == nil) { return nil; }
++        MTLCounterSampleBufferDescriptor * d = [MTLCounterSampleBufferDescriptor new];
++        d.counterSet = ts; d.sampleCount = TOSH_CT_SLOTS*TOSH_CT_PER; d.storageMode = MTLStorageModeShared;
++        NSError * err = nil;
++        ctx->ct_buf = [dev newCounterSampleBufferWithDescriptor:d error:&err];
++        if (ctx->ct_buf == nil) {
++            GGML_LOG_WARN("%s: counter sample buffer unavailable\n", __func__);
++            return nil;
++        }
++        if (g_ct_ns_per_tick == 0.0) {
++            g_ct_ns_per_tick = 1.0;
++            MTLTimestamp c0 = 0, g0 = 0, c1 = 0, g1 = 0;
++            [dev sampleTimestamps:&c0 gpuTimestamp:&g0];
++            usleep(20000);
++            [dev sampleTimestamps:&c1 gpuTimestamp:&g1];
++            if (g1 > g0) { g_ct_ns_per_tick = (double) (c1 - c0)/(double) (g1 - g0); }
++            GGML_LOG_INFO("%s: GPU timestamp sampling on, %.4f ns per tick\n", __func__, g_ct_ns_per_tick);
++        }
++    }
++    return ctx->ct_buf;
++}
++
++static void tosh_ct_record(id<MTLCounterSampleBuffer> cs, uint64_t base) {
++    if (@available(macOS 10.15, *)) {
++        NSData * d = [cs resolveCounterRange:NSMakeRange(base, TOSH_CT_PER)];
++        if (d == nil || d.length < TOSH_CT_PER*sizeof(MTLCounterResultTimestamp)) {
++            atomic_fetch_add(&g_ct_fail, 1); return;
++        }
++        const MTLCounterResultTimestamp * t = (const MTLCounterResultTimestamp *) d.bytes;
++        for (int i = 0; i < TOSH_CT_PER; i++) {
++            if (t[i].timestamp == MTLCounterErrorValue) { atomic_fetch_add(&g_ct_fail, 1); return; }
++        }
++        const double k = g_ct_ns_per_tick;
++        const double pub  = (double) (t[1].timestamp - t[0].timestamp)*k;
++        const double wait = (double) (t[2].timestamp - t[1].timestamp)*k;
++        const double read = (double) (t[3].timestamp - t[2].timestamp)*k;
++        if (pub < 0 || wait < 0 || read < 0) { atomic_fetch_add(&g_ct_fail, 1); return; }
++        atomic_fetch_add(&g_ct_n, 1);
++        atomic_fetch_add(&g_ct_pub,  (uint64_t) pub);
++        atomic_fetch_add(&g_ct_wait, (uint64_t) wait);
++        atomic_fetch_add(&g_ct_read, (uint64_t) read);
++        atomic_fetch_add(&g_ct_hp[tosh_ct_bucket(pub /1000.0)], 1);
++        atomic_fetch_add(&g_ct_hw[tosh_ct_bucket(wait/1000.0)], 1);
++        atomic_fetch_add(&g_ct_hr[tosh_ct_bucket(read/1000.0)], 1);
++    }
++}
++
++// TOSH_MGPU_WAIT_SATISFIED=1, benchmark only. The staged collective keeps every encoder, every
++// signal, the same command buffer and the same sampling points; the only change is that the
++// peer-ready wait names a private event that is already signalled, so it can never stall. The
++// read then observes whatever the partner left behind and the output is wrong by construction.
++// Subtracting this run's central window from the normal one isolates the real peer stall
++// without adding an encoder to the interval being measured.
++// The same trick for the other wait in the path, the one guarding reuse of the shared host
++// block. TOSH_MGPU_BP_SATISFIED=1, benchmark only, same warning applies.
++static bool ggml_metal_bp_satisfied(void) {
++    static int v = -1;
++    if (v < 0) {
+         const char * s = TOSH_ENV("TOSH_MGPU_BP_SATISFIED");
++        v = (s && s[0] == '1') ? 1 : 0;
++        if (v) {
++            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_BP_SATISFIED=1, the collective does not "
++                            "wait before reusing the staging block. Benchmark only.\n");
++        }
++    }
++    return v == 1;
++}
++
+         const char * s = TOSH_ENV("TOSH_MGPU_TP2_FUSED_BOUNDARY");
++static bool ggml_metal_wait_satisfied(void) {
++    static int v = -1;
++    if (v < 0) {
+         const char * s = TOSH_ENV("TOSH_MGPU_WAIT_SATISFIED");
++        v = (s && s[0] == '1') ? 1 : 0;
++        if (v) {
++            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_WAIT_SATISFIED=1, the collective never "
++                            "waits for the peer and the output is meaningless. Benchmark only.\n");
++        }
++    }
++    return v == 1;
++}
++
++static id<MTLSharedEvent> tosh_wait_dummy(ggml_metal_t ctx) {
++    if (ctx->ev_wait_dummy == nil) {
++        ctx->ev_wait_dummy = [ggml_metal_device_get_obj(ctx->dev) newSharedEvent];
++        ctx->ev_wait_dummy.signaledValue = 1;   // satisfied before anything is encoded
++    }
++    return ctx->ev_wait_dummy;
++}
++
++static void tosh_mgpu_trace_report(void) {
++    const uint64_t reduce = atomic_load(&g_tr_reduce);
++    const uint64_t peer   = atomic_load(&g_tr_bytes_peer);
++    const uint64_t host   = atomic_load(&g_tr_bytes_host);
++
++    fprintf(stderr, "TOSH_MGPU_TRACE\n");
++    fprintf(stderr, "  allreduce exchanges   %llu\n", (unsigned long long) reduce);
++    fprintf(stderr, "  plain xdev copies     %llu\n", (unsigned long long) atomic_load(&g_tr_copy));
++    fprintf(stderr, "  peer-direct bytes     %llu\n", (unsigned long long) peer);
++    fprintf(stderr, "  host-staged bytes     %llu\n", (unsigned long long) host);
++    fprintf(stderr, "  peer share            %.1f%%\n",
++            peer + host ? 100.0*(double) peer/(double)(peer + host) : 0.0);
++    fprintf(stderr, "  collective cmd bufs   %llu\n", (unsigned long long) atomic_load(&g_tr_cmd_bufs));
++    fprintf(stderr, "  tracked cmd bufs      %llu\n", (unsigned long long) atomic_load(&g_tr_cmd_all));
++    fprintf(stderr, "  merge reuse / waits   %llu/%llu\n",
++            (unsigned long long) atomic_load(&g_tr_merge_reuse),
++            (unsigned long long) atomic_load(&g_tr_merge_waits));
++    fprintf(stderr, "  graph submissions     %llu\n", (unsigned long long) atomic_load(&g_tr_graphs));
++    {
++        const uint64_t n = atomic_load(&g_sk_n);
++        if (n > 0) {
++            static const char * lbl[8] = {"<1","<2","<5","<10","<20","<50","<200",">=200"};
++            const double nn = (double) n;
++            fprintf(stderr, "  skew n=%llu   commit mean %.1f us   GPU-start mean %.1f us   GPU max %.1f us\n",
++                    (unsigned long long) n, atomic_load(&g_sk_com_sum)/1000.0/nn,
++                    atomic_load(&g_sk_gpu_sum)/1000.0/nn, atomic_load(&g_sk_gpu_max)/1000.0);
++            fprintf(stderr, "    side0 leads: commit %.1f%%   GPU %.1f%%\n",
++                    100.0*atomic_load(&g_sk_com_first0)/nn, 100.0*atomic_load(&g_sk_gpu_first0)/nn);
++            fprintf(stderr, "    commit us   ");
++            for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&g_sk_com_hist[i])/nn); }
++            fprintf(stderr, "\n    GPUstart us ");
++            for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&g_sk_gpu_hist[i])/nn); }
++            fprintf(stderr, "\n");
++        }
++    }
++    {
++        const uint64_t n = atomic_load(&g_gr_n);
++        if (n > 0) {
++            static const char * lbl[8] = {"<1","<2","<5","<10","<20","<50","<200",">=200"};
++            const double nn = (double) n;
++            fprintf(stderr, "  subgraph deltas n=%llu  |start| %.1f us  |duration| %.1f us  |end| %.1f us  residual %.3f us\n",
++                    (unsigned long long) n, atomic_load(&g_gr_ss)/1000.0/nn,
++                    atomic_load(&g_gr_sd)/1000.0/nn, atomic_load(&g_gr_se)/1000.0/nn,
++                    atomic_load(&g_gr_resid)/1000.0/nn);
++            fprintf(stderr, "    sign of end delta agrees with start %.1f%%, with duration %.1f%%\n",
++                    100.0*atomic_load(&g_gr_sign_start)/nn, 100.0*atomic_load(&g_gr_sign_dur)/nn);
++            fprintf(stderr, "    side0 starts first %.1f%%   side0 shorter %.1f%%\n",
++                    100.0*atomic_load(&g_gr_start0_first)/nn, 100.0*atomic_load(&g_gr_dur0_less)/nn);
++            const char * nm[3] = {"|start|  ", "|duration|", "|end|    "};
++            _Atomic uint64_t * hh[3] = {g_gr_hs, g_gr_hd, g_gr_he};
++            for (int k = 0; k < 3; k++) {
++                fprintf(stderr, "    %s us ", nm[k]);
++                for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&hh[k][i])/nn); }
++                fprintf(stderr, "\n");
++            }
++        }
++        static const char * dlb2[8] = {"<40","<80","<120","<160","<200","<300","<500",">=500"};
++        for (int sd = 0; sd < 2; sd++) {
++            const uint64_t dn = atomic_load(&g_dur_n[sd]);
++            if (!dn) continue;
++            fprintf(stderr, "  side%d subgraph duration mean %.1f us  n=%llu  ", sd,
++                    atomic_load(&g_dur_sum[sd])/1000.0/(double) dn, (unsigned long long) dn);
++            for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", dlb2[i], 100.0*atomic_load(&g_dur_h[sd][i])/(double) dn); }
++            fprintf(stderr, "\n");
++        }
++    }
++    {
++        const uint64_t n = atomic_load(&g_ct_n);
++        if (n > 0 || atomic_load(&g_ct_fail) > 0) {
++            static const char * lbl[8] = {"<1","<5","<10","<20","<50","<100","<200",">=200"};
++            const double nn = (double) (n ? n : 1);
++            fprintf(stderr, "  staged timeline n=%llu (failed %llu)  publish %.1f us  WAIT-WINDOW %.1f us  read %.1f us\n",
++                    (unsigned long long) n, (unsigned long long) atomic_load(&g_ct_fail),
++                    atomic_load(&g_ct_pub)/1000.0/nn, atomic_load(&g_ct_wait)/1000.0/nn,
++                    atomic_load(&g_ct_read)/1000.0/nn);
++            const char * rn[3] = {"publish    ", "wait-window", "read       "};
++            _Atomic uint64_t * hh[3] = {g_ct_hp, g_ct_hw, g_ct_hr};
++            for (int k = 0; k < 3; k++) {
++                fprintf(stderr, "    %s us ", rn[k]);
++                for (int i = 0; i < 8; i++) { fprintf(stderr, "%s %.1f%%  ", lbl[i], 100.0*atomic_load(&hh[k][i])/nn); }
++                fprintf(stderr, "\n");
++            }
++        }
++    }
++    fprintf(stderr, "  remote views new/hit  %llu/%llu\n",
++            (unsigned long long) atomic_load(&g_tr_rv_new),
++            (unsigned long long) atomic_load(&g_tr_rv_hit));
++    fprintf(stderr, "  encode CPU            %.1f ms\n", atomic_load(&g_tr_encode_ns)/1e6);
++    fprintf(stderr, "  collective GPU        %.1f ms\n", atomic_load(&g_tr_gpu_ns)/1e6);
++    fprintf(stderr, "  commit to GPU start   %.1f ms\n", atomic_load(&g_tr_sched_ns)/1e6);
++    // decode-only, per card per token
++    if (atomic_load(&g_snap_taken)) {
++        const double t = (double) (atomic_load(ggml_backend_meta_pass_counter()) - g_snap_passes);
++        if (t > 0) {
++            fprintf(stderr, "  --- steady-state decode, per card per token (%.0f passes) ---\n", t);
++            fprintf(stderr, "    collectives         %.2f\n", (atomic_load(&g_tr_reduce) - g_snap_reduce)/t);
++            fprintf(stderr, "    tracked cmd bufs    %.2f\n", (atomic_load(&g_tr_cmd_all) - g_snap_cmd)/t);
++            fprintf(stderr, "    graph submissions   %.2f\n", (atomic_load(&g_tr_graphs) - g_snap_graphs)/t);
++            fprintf(stderr, "    event signals       %.2f\n", (atomic_load(&g_tr_signals) - g_snap_sig)/t);
++            fprintf(stderr, "    event waits         %.2f\n", (atomic_load(&g_tr_waits) - g_snap_wait)/t);
++            fprintf(stderr, "    peer bytes          %.0f\n", (atomic_load(&g_tr_bytes_peer) - g_snap_peer_b)/t);
++            fprintf(stderr, "    host-staged bytes   %.0f\n", (atomic_load(&g_tr_bytes_host) - g_snap_host_b)/t);
++        }
++    }
++
++    if (reduce) {
++        fprintf(stderr, "  per exchange          %.1f us GPU, %.1f us to start, %llu B\n",
++                atomic_load(&g_tr_gpu_ns)/1e3/(double) reduce,
++                atomic_load(&g_tr_sched_ns)/1e3/(double) reduce,
++                (unsigned long long) ((peer + host)/reduce));
++    }
++}
++
++// Metal reports both when the buffer was handed over and when the GPU actually ran it; the
++// gap is the queueing and the event waits, which is the number the collective is judged on.
+ static void ggml_metal_encode_pending_waits(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+     for (int i = 0; i < ctx->n_ev_wait_pending; ++i) {
+         ggml_metal_event_encode_wait(ctx->ev_wait_pending[i], (ggml_metal_cmd_buf_t) cmd_buf);
+     }
+     ctx->n_ev_wait_pending = 0;
+ 
+     for (int i = 0; i < ctx->n_peer_waits; ++i) {
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+         [cmd_buf encodeWaitForEvent:ctx->peer_waits[i].ev value:ctx->peer_waits[i].val];
+     }
+     ctx->n_peer_waits = 0;
+ }
+ 
+ static void ggml_metal_cmd_buf_submit(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf) {
+     [cmd_buf commit];
+     [ctx->cmd_bufs_ext addObject:cmd_buf];
+@@ -368,16 +837,17 @@ static void ggml_metal_cmd_buf_hold_flush(ggml_metal_t ctx) {
+ 
+     id<MTLCommandBuffer> cmd_buf = ctx->cmd_buf_hold;
+     ctx->cmd_buf_hold = nil;
+     ggml_metal_cmd_buf_submit(ctx, cmd_buf);
+     [cmd_buf release];
+ }
+ 
+ static id<MTLCommandBuffer> ggml_metal_cmd_buf_new(ggml_metal_t ctx) {
++    if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+     id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+     ggml_metal_encode_pending_waits(ctx, cmd_buf);
+ 
+     return cmd_buf;
+ }
+ 
+ // Continues the buffer a copy left open, if there is one. Only the reduction that follows the
+ // copy may do this: a buffer that stays open is a buffer that has not started running.
+@@ -410,18 +880,22 @@ static void ggml_metal_peer_wait_add(ggml_metal_t ctx, id<MTLSharedEvent> ev, ui
+     }
+ 
+     if (ctx->n_peer_waits < GGML_METAL_MAX_PENDING_WAITS) {
+         ctx->peer_waits[ctx->n_peer_waits].ev  = ev;
+         ctx->peer_waits[ctx->n_peer_waits].val = val;
+         ctx->n_peer_waits++;
+         return;
+     }
++
++    @autoreleasepool {
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+         id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+         [cmd_buf encodeWaitForEvent:ev value:val];
+         ggml_metal_cmd_buf_submit(ctx, cmd_buf);
+     }
+ }
+ 
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev, bool prefetch) {
+     GGML_LOG_INFO("%s: allocating\n", __func__);
+ 
+@@ -627,16 +1101,17 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
+ 
+ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     // nothing completes while a command buffer is still held open
+     ggml_metal_cmd_buf_hold_flush(ctx);
+ 
+     // pending waits guard memory a peer blit can still be reading, so they must run and complete before synchronize returns
+     if (ctx->n_ev_wait_pending > 0 || ctx->n_peer_waits > 0) {
+         @autoreleasepool {
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+             id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+             ggml_metal_cmd_buf_submit(ctx, cmd_buf);
+         }
+     }
+ 
+     // wait for any backend operations to finish
+     const bool cbp_on = tosh_cbp_on();
+@@ -780,16 +1255,17 @@ void ggml_metal_read_batch_end(ggml_metal_t ctx) {
+ 
+                 if (buf_src != nil) {
+                     memcpy(buf_src.contents, data, size);
+                     offs_src = 0;
+                 }
+             }
+ 
+             if (buf_src != nil) {
++                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+                 id<MTLCommandBuffer> cmd_buf = [ctx->queue commandBuffer];
+                 ggml_metal_encode_pending_waits(ctx, cmd_buf);
+                 id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+                 [encoder copyFromBuffer:buf_src
+                            sourceOffset:offs_src
+                                toBuffer:bid_dst.metal
+                       destinationOffset:bid_dst.offs
+@@ -823,16 +1299,18 @@ void ggml_metal_read_batch_end(ggml_metal_t ctx) {
+                                                     length:size
+                                                    options:MTLResourceStorageModeShared];
+ 
+         GGML_ASSERT(buf_src);
+ 
+         // queue the copy operation into the queue of the Metal context
+         // this will be queued at the end, after any currently ongoing GPU operations
+         id<MTLCommandQueue> queue = ctx->queue;
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
++        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+         [encoder copyFromBuffer:buf_src
+                    sourceOffset:0
+                        toBuffer:bid_dst.metal
+               destinationOffset:bid_dst.offs
+                            size:size];
+@@ -883,16 +1361,17 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
+                                                           length:size
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+ 
+         if (buf_dst != nil) {
+             // queue the copy operation into the queue of the Metal context
+             // this will be queued at the end, after any currently ongoing GPU operations
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+             id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+             id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+             [encoder copyFromBuffer:bid_src.metal
+                        sourceOffset:bid_src.offs
+                            toBuffer:buf_dst
+                   destinationOffset:0
+@@ -932,16 +1411,17 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+         if (buf_stage == nil) {
+             GGML_LOG_ERROR("%s: failed to allocate staging buffer, size = %zu\n", __func__, size);
+         }
+         GGML_ASSERT(buf_stage);
+ 
+         for (size_t done = 0; done < size;) {
+             const size_t n = MIN(stage_size, size - done);
+ 
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+             id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+ 
+             {
+                 id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+                 [encoder copyFromBuffer:bid_src.metal
+                            sourceOffset:bid_src.offs + done
+@@ -1023,17 +1503,33 @@ static bool ggml_metal_xdev_link_reserve(ggml_metal_t ctx_src, ggml_metal_t ctx_
+             link->wrap_dst = nil;
+             free(link->host);
+             link->host = NULL;
+             link->cap  = 0;
+             return false;
+         }
+     }
+     return true;
++// TOSH_MGPU_NOWAIT=1, benchmark only: the collective still publishes, still signals and still
++// reduces, but never waits for the partner. The output is wrong by construction. Subtracting
++// this from the normal run measures the stall at the wait inside the real collective, instead
++// of inferring it from whole-command-buffer completion timestamps.
++static bool ggml_metal_collective_nowait(void) {
++    static int v = -1;
++    if (v < 0) {
+         const char * s = TOSH_ENV("TOSH_MGPU_NOWAIT");
++        v = (s && s[0] == '1') ? 1 : 0;
++        if (v) {
++            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_NOWAIT=1, the collective does not wait "
++                            "for the peer and the output is meaningless. Benchmark only.\n");
++        }
++    }
++    return v == 1;
++}
++
+ // TOSH_MGPU_PEER_SELF runs the peer hand-off between two logical devices backed by the
+ // same GPU (GGML_METAL_DEVICE_LIST=0,0), which needs no bridge: the queues are still
+ // separate, so the cross-device ordering is testable on a single card.
+ static bool ggml_metal_peer_self(void) {
+     static int val = -1;
+     if (val < 0) {
+         const char * v = TOSH_ENV("TOSH_MGPU_PEER_SELF");
+         val = (v && v[0] == '1') ? 1 : 0;
+@@ -1084,29 +1580,37 @@ static bool ggml_metal_cpy_xdev_peer(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+             link->peer_view = same_dev ? [metal_src retain]
+                                        : [metal_src newRemoteBufferViewForDevice:dev_dst];
+             link->peer_src  = link->peer_view != nil ? [metal_src retain] : nil;
+             if (link->peer_view == nil) {
+                 return false;
+ 
+         const uint64_t seq = ++link->seq;
+         @autoreleasepool {
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+             id<MTLCommandBuffer> cmd_src = [ctx_src->queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx_src, cmd_src);
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        [cmd_src encodeSignalEvent:link->ev_ready value:seq];
+             [cmd_src commit];
+             [ctx_src->cmd_bufs_ext addObject:cmd_src];
+             ctx_src->cmd_buf_last = cmd_src;
+             [cmd_src retain];
+ 
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+             id<MTLCommandBuffer> cmd_dst = [ctx_dst->queue commandBuffer];
+             ggml_metal_encode_pending_waits(ctx_dst, cmd_dst);
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
+             id<MTLBlitCommandEncoder> encoder = [cmd_dst blitCommandEncoder];
+             [encoder copyFromBuffer:link->peer_view sourceOffset:bid_src.offs
+                            toBuffer:metal_dst destinationOffset:bid_dst.offs size:size];
+             [encoder endEncoding];
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        [cmd_dst encodeSignalEvent:link->ev_done value:seq];
+             [cmd_dst commit];
+             [ctx_dst->cmd_bufs_ext addObject:cmd_dst];
+             ctx_dst->cmd_buf_last = cmd_dst;
+             [cmd_dst retain];
+         }
+ 
+         ggml_metal_peer_wait_add(ctx_src, link->ev_done, seq);
+ 
+@@ -1174,29 +1678,35 @@ static bool ggml_metal_cpy_xdev_events(ggml_metal_t ctx_src, ggml_metal_t ctx_ds
+     }
+     if (!ggml_metal_xdev_link_reserve(ctx_src, ctx_dst, link, size)) {
+     const uint64_t seq = ++link->seq;
+ 
+     @autoreleasepool {
+         // reuse the host block only after the destination consumed the last hand-off
+         id<MTLCommandBuffer> cmd_src = ggml_metal_cmd_buf_continue(ctx_src);
+         if (seq > 1) {
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        [cmd_src encodeWaitForEvent:link->ev_done value:seq - 1];
++        }
+         id<MTLBlitCommandEncoder> enc_src = [cmd_src blitCommandEncoder];
+         [enc_src copyFromBuffer:bid_src.metal sourceOffset:bid_src.offs
+                        toBuffer:link->wrap_src destinationOffset:0 size:size];
+         [enc_src endEncoding];
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+         [cmd_src encodeSignalEvent:link->ev_ready value:seq];
+         ggml_metal_cmd_buf_end(ctx_src, cmd_src, false);
+ 
+         id<MTLCommandBuffer> cmd_dst = ggml_metal_cmd_buf_new(ctx_dst);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+         [cmd_dst encodeWaitForEvent:link->ev_ready value:seq];
+         id<MTLBlitCommandEncoder> enc_dst = [cmd_dst blitCommandEncoder];
+         [enc_dst copyFromBuffer:link->wrap_dst sourceOffset:0
+                        toBuffer:bid_dst.metal destinationOffset:bid_dst.offs size:size];
+         [enc_dst endEncoding];
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+         [cmd_dst encodeSignalEvent:link->ev_done value:seq];
+         // the signal lands when the blit does, so holding the buffer open does not keep the
+         // source waiting on whatever gets encoded into it afterwards
+         ggml_metal_cmd_buf_end(ctx_dst, cmd_dst, hold_dst);
+     }
+ 
+     return true;
+ }
+@@ -1293,16 +1803,18 @@ bool ggml_metal_cpy_tensor_async_ex(ggml_metal_t ctx_src, ggml_metal_t ctx_dst,
+         [ctx_dst->cmd_bufs_ext addObject:sync_cmd_buf];
+         ctx_dst->cmd_buf_last = sync_cmd_buf;
+ 
+         [sync_cmd_buf retain];
+ 
+         // queue the copy operation into the Metal context
+         // this will be queued at the end, after any currently ongoing GPU operations
+         id<MTLCommandQueue> queue = ctx_src->queue;
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
++        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx_src, cmd_buf);
+         ggml_metal_event_encode_wait(ctx_dst->ev_sync, cmd_buf);
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+         [encoder copyFromBuffer:bid_src.metal
+                    sourceOffset:bid_src.offs
+                        toBuffer:bid_dst.metal
+               destinationOffset:bid_dst.offs
+@@ -1418,39 +1930,79 @@ bool ggml_metal_add_inplace_supported(ggml_metal_t ctx, const struct ggml_tensor
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, args.ne01, args.ne02, args.ne03, nth, 1, 1);
+         }
+ 
+         ggml_metal_encoder_end_encoding(enc);
+         ggml_metal_encoder_free(enc);
+ 
+     if (v < 0) { const char * s = TOSH_ENV("TOSH_MGPU_FB_ADD_RB"); v = (s && s[0] == '0') ? 0 : 1; }
++// rows in the exchanged tensor: one for a generated token, the whole prompt for a prefill
++static int64_t tosh_batch_of(const struct ggml_tensor * t) {
++    if (t == NULL || t->ne[0] <= 0) { return 1; }
++    return ggml_nelements(t)/t->ne[0];
++}
++
+         const char * s = TOSH_ENV("TOSH_MGPU_PEER_MIN_BATCH");
++// Leaves the exchange's command buffer open so whatever the graph encodes next lands in it,
++// one submission fewer. On its own this is neutral, which is what the first measurement said;
++// it only pays together with the merge that makes the next subgraph continue the held buffer,
++// and then only when the batch is small. A token of one row crosses 72 times and each crossing
++// carries its own pair of command buffers, so halving them is worth ~3% of decode; a prompt
++// amortises the submissions over the whole batch and loses ~2% instead, hence the batch gate.
++// TOSH_MGPU_HOLD=1 forces it on, =0 off, unset follows the batch.
++static bool ggml_metal_collective_hold_batch(int64_t batch) {
++    static int v = -2;
++    if (v == -2) {
+         const char * s = TOSH_ENV("TOSH_MGPU_HOLD");
++        v = s ? (s[0] == '1' ? 1 : 0) : -1;
++    if (v >= 0) {
++        return v == 1;
++    }
++    return batch < ggml_metal_peer_min_batch();
+         const char * v = TOSH_ENV("TOSH_MGPU_PEER");
++        if (seq > 2 && !ggml_metal_collective_nowait()) {
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        if (!ggml_metal_collective_nowait()) {
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        }
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        [cmd_buf encodeSignalEvent:link_in->ev_x_done value:seq];
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
++        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
++        if (seq > 2 && !ggml_metal_collective_nowait()) {
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
++        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+ 
+             MTLCommandBufferStatus status = [cmd_buf status];
+             if (status != MTLCommandBufferStatusCompleted) {
+                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
+                 if (status == MTLCommandBufferStatusError) {
+                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                 }
+ 
+-                // release this and all remaining command buffers before returning
+-                for (size_t j = i; j < ctx->cmd_bufs_ext.count; ++j) {
+-                    [ctx->cmd_bufs_ext[j] release];
+-                }
+-                [ctx->cmd_bufs_ext removeAllObjects];
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
+ 
+                 ctx->has_error = true;
+                 return;
+             }
+ 
+             [cmd_buf release];
+         }
++        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
++        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
+ 
+         [ctx->cmd_bufs_ext removeAllObjects];
+         const char * s = TOSH_ENV("TOSH_MGPU_ONESHOT");
+     }
+ 
+     @autoreleasepool {
+         [ctx->buf_refs removeAllObjects];
+     }
+@@ -1560,16 +2112,20 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
+ 
+ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+     @autoreleasepool {
+         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(src);
+         struct ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+ 
+         if (bid_src.metal == nil || bid_dst.metal == nil) {
+             return false;
++    if (tosh_mgpu_trace()) {
++        tosh_decode_snapshot(t_self->ne[0] > 0 ? ggml_nelements(t_self)/t_self->ne[0] : 1);
++    }
++
+         const char * v = TOSH_ENV("TOSH_MGPU_PEER_FUSED");
+         }
+ 
+         id<MTLCommandQueue> dst_queue = ggml_metal_device_get_queue(ctx_dst->dev);
+         id<MTLCommandBuffer> sync_cmd_buf = [dst_queue commandBuffer];
+ 
+         ggml_metal_event_encode_signal(ctx_dst->ev_sync, sync_cmd_buf);
+ 
+@@ -1582,47 +2138,79 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
+ 
+         // queue the copy operation into the Metal context
+         // this will be queued at the end, after any currently ongoing GPU operations
+         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
+         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_event_encode_wait(ctx_dst->ev_sync, cmd_buf);
+         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+ 
+-        [encoder copyFromBuffer:bid_src.metal
+-                   sourceOffset:bid_src.offs
+-                       toBuffer:bid_dst.metal
+-              destinationOffset:bid_dst.offs
+-                           size:ggml_nbytes(src)];
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++            if (ggml_metal_bp_satisfied()) {
++                [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_self) value:1];
++            } else {
++            }
++        }
+ 
+-        [encoder endEncoding];
++        id<MTLCounterSampleBuffer> cts = tosh_ct_buffer(ctx_self);
++        uint64_t cbase = 0;
++        const bool cbar = ggml_metal_ctime_barrier();
++        if (cts != nil) {
++            cbase = (atomic_fetch_add(&ctx_self->ct_idx, 1) % TOSH_CT_SLOTS)*TOSH_CT_PER;
+ 
+         ggml_metal_event_t ev_cpy = ggml_metal_get_ev_cpy(ctx_src);
+         ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_signals, 1);
+ 
+         [cmd_buf commit];
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_waits, 1);
++        if (ggml_metal_wait_satisfied()) {
++            [cmd_buf encodeWaitForEvent:tosh_wait_dummy(ctx_self) value:1];
++        } else {
++            [cmd_buf encodeWaitForEvent:link_in->ev_x_ready value:seq_in];
++        }
+ 
+-        // do not wait here for completion
+-        //[cmd_buf waitUntilCompleted];
++        if (cts != nil) {
++            id<MTLCounterSampleBuffer> csr = cts;
++            const uint64_t cb2 = cbase;
++            [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) { (void) cb; tosh_ct_record(csr, cb2); }];
++        }
+ 
+         // instead, remember a reference to the command buffer and wait for it later if needed
+         [ctx_src->cmd_bufs_ext addObject:cmd_buf];
+         ctx_src->cmd_buf_last = cmd_buf;
++        tosh_trace_exchange(cmd_buf, seq, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx_self->dev) peerIndex]) & 1));
++        ggml_metal_cmd_buf_end(ctx_self, cmd_buf, ggml_metal_collective_hold_batch(tosh_batch_of(t_self)));
+ 
+         [cmd_buf retain];
+ 
+         ggml_metal_event_wait(ctx_dst, ev_cpy);
+ 
+-        return true;
++// TOSH_MGPU_MERGE=1: a tensor split cuts the graph at every partial node, so a token costs one
++// command buffer for each collective plus one for each subgraph that follows it. With this on,
++// the collective leaves its buffer open and the next subgraph encodes into it instead of
++// submitting its own, which halves the command buffers a split token creates.
++static bool ggml_metal_merge_graph(void) {
++    static int v = -1;
++    if (v < 0) {
+         const char * s = TOSH_ENV("TOSH_MGPU_MERGE");
++        // on by default: it is inert unless a collective left a buffer held, which only the
++        // batch gate above does, so a prompt never sees it
++        v = s ? (s[0] == '1' ? 1 : 0) : 1;
+     }
++    return v == 1;
+ }
+ 
+ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
++    if (tosh_mgpu_trace()) { atomic_fetch_add(&g_tr_graphs, 1); }
+     // command buffers run in commit order, so a held one has to go in before this graph
++    if (!ggml_metal_merge_graph()) {
++        ggml_metal_cmd_buf_hold_flush(ctx);
++    }
++
+     if (ctx->has_error) {
+         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
+         return GGML_STATUS_FAILED;
+     }
+ 
+     if (gf->n_nodes == 0) {
+         return GGML_STATUS_SUCCESS;
+     }
+@@ -1718,42 +2306,61 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+         // short-hand
+         id<MTLCommandQueue> queue = ctx->queue;
+ 
+         const uint64_t cbp_tc = cbp != NULL ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
+ 
+         // the main thread commits the first few commands immediately
+         // cmd_buf[n_cb]
+         {
+-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+-            [cmd_buf retain];
++            // continue the collective's buffer when it left one open, otherwise start a new one
++            id<MTLCommandBuffer> cmd_buf = nil;
++            if (ggml_metal_merge_graph() && ctx->cmd_buf_hold != nil) {
++                cmd_buf = ctx->cmd_buf_hold;
++                ctx->cmd_buf_hold = nil;
++                // the collective is already encoded in here; anything that queued a wait since
++                // then has to land between it and this subgraph, not be dropped
++                if (tosh_mgpu_trace()) {
++                    if (ctx->n_ev_wait_pending > 0 || ctx->n_peer_waits > 0) {
++                        atomic_fetch_add(&g_tr_merge_waits, ctx->n_ev_wait_pending + ctx->n_peer_waits);
++                    }
++                    atomic_fetch_add(&g_tr_merge_reuse, 1);
++                }
++            } else {
++                if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
++                cmd_buf = [queue commandBufferWithUnretainedReferences];
++                [cmd_buf retain];
++            }
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+             tosh_cbp_attach(cmd_buf, cbp);
+ 
+             if (ctx->cmd_bufs[n_cb].obj) {
+                 [ctx->cmd_bufs[n_cb].obj release];
+             }
+             ctx->cmd_bufs[n_cb].obj = cmd_buf;
+ 
++            tosh_trace_graph_end(cmd_buf, (int) (([(id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev) peerIndex]) & 1));
++
+             [cmd_buf enqueue];
+ 
+             ctx->encode_async(n_cb);
+         }
+ 
+         // remember the command buffer for the next iteration
+         ctx->cmd_buf_last = ctx->cmd_bufs[n_cb].obj;
+ 
+         // the main thread already encoded every node: the remaining command buffers would be
+         // created, dispatched and committed empty. Tensor split hits this on every subgraph.
+         const bool encoded_by_main = ctx->n_nodes_1 == 0 && !use_capture;
+ 
+         if (!encoded_by_main) {
+         // prepare the rest of the command buffers asynchronously (optional)
+         // cmd_buf[0.. n_cb)
+         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
++            if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+             ggml_metal_encode_pending_waits(ctx, cmd_buf);
+             tosh_cbp_attach(cmd_buf, cbp);
+             [cmd_buf retain];
+ 
+             if (ctx->cmd_bufs[cb_idx].obj) {
+                 [ctx->cmd_bufs[cb_idx].obj release];
+             }
+@@ -1891,16 +2498,17 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+     }
+ 
+     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
+ }
+ 
+ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+     @autoreleasepool {
+         id<MTLCommandQueue> queue = ctx->queue;
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+ 
+         ggml_metal_event_encode_signal(ev, cmd_buf);
+ 
+         [cmd_buf commit];
+ 
+         [ctx->cmd_bufs_ext addObject:cmd_buf];
+@@ -1913,16 +2521,17 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
+ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+     if (ggml_metal_defer_waits() && ctx->n_ev_wait_pending < GGML_METAL_MAX_PENDING_WAITS) {
+         ctx->ev_wait_pending[ctx->n_ev_wait_pending++] = ev;
+         return;
+     }
+ 
+     @autoreleasepool {
+         id<MTLCommandQueue> queue = ctx->queue;
++        if (tosh_mgpu_trace()) atomic_fetch_add(&g_tr_cmd_all, 1);
+         id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+         ggml_metal_encode_pending_waits(ctx, cmd_buf);
+ 
+         ggml_metal_event_encode_wait(ev, cmd_buf);
+ 
+         [cmd_buf commit];
+ 
+         [ctx->cmd_bufs_ext addObject:cmd_buf];
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index fd508bab5..5cca6596b 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -1052,17 +1052,38 @@ static void * ggml_backend_metal_comm_init(ggml_backend_t * backends, size_t n_b
+ static void ggml_backend_metal_comm_free(void * comm_ctx_v) {
+     auto * comm_ctx = (ggml_backend_metal_comm_context *) comm_ctx_v;
+     for (auto & buf : comm_ctx->tmp) {
+         if (buf != nullptr) {
+             ggml_backend_buffer_free(buf);
+         }
+     delete comm_ctx;
+ }
++
++// TOSH_MGPU_ALLREDUCE_NOOP=1 keeps the split graph and every subgraph submission but performs
++// no reduction and no cross-device synchronisation at all. The output is wrong by construction.
++// It exists for one measurement: what tensor-split decode would cost if communication were free.
++static bool ggml_backend_metal_comm_allreduce_noop(void) {
++    static int v = -1;
++    if (v < 0) {
++        const char * s = getenv("TOSH_MGPU_ALLREDUCE_NOOP");
++        v = (s && s[0] == '1') ? 1 : 0;
++        if (v) {
++            fprintf(stderr, "ggml_metal: WARNING TOSH_MGPU_ALLREDUCE_NOOP=1, the reduction is "
++                            "skipped and the output is meaningless. Benchmark only.\n");
++        }
++    }
++    return v == 1;
++}
++
+ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_tensor ** tensors) {
++    if (ggml_backend_metal_comm_allreduce_noop()) {
++        return true;
++    }
++
+     auto * comm_ctx = (ggml_backend_metal_comm_context *) comm_ctx_v;
+ 
+     const size_t n_backends = comm_ctx->backends.size();
+ 
+     if (tensors[0] == nullptr || tensors[0]->type != GGML_TYPE_F32) {
+ 
+     const int64_t ne = ggml_nelements(tensors[0]);
+     if (ne == 0) {
+@@ -1142,16 +1163,25 @@ static bool ggml_backend_metal_comm_allreduce_tensor(void * comm_ctx_v, ggml_ten
+         }
+         for (size_t j_src = 2*offset_max; j_src < n_backends; j_src++) {
+         step++;
+     }
+ 
+     // Every exchange of a step must read the partner's tensor before its own add rewrites it,
+     // so the copies all go out before any of the adds.
+     for (size_t offset = offset_max; offset >= 1; offset /= 2) {
++            // TOSH_MGPU_SUBMIT_ORDER, benchmark only: 0 normal, 1 reversed, 2 alternating.
++            static int order = -1;
++            if (order < 0) {
++                const char * v = getenv("TOSH_MGPU_SUBMIT_ORDER");
++                order = v ? atoi(v) : 0;
++            }
++            const bool flip = order == 1 || (order == 2 && (seq_round & 1));
++            for (size_t jj = 0; jj < 2*offset_max && ok; jj++) {
++                const size_t j = flip ? (2*offset_max - 1 - jj) : jj;
+         for (size_t j = 0; j < 2*offset_max; j++) {
+         }
+         for (size_t j = 0; j < 2*offset_max; j++) {
+         step++;
+     }
+ 
+     for (size_t j = 2*offset_max; j < n_backends; j++) {
+         const size_t j_src = j - 2*offset_max;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4ed373def..432136163 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -480,29 +480,32 @@ llama_context::llama_context(
+             backend_ptrs.push_back(backend.get());
+             backend_buf_exp_size.push_back(0);
+         }
+ 
+         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+ 
+         // TODO: move these checks to ggml_backend_sched
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
++        // No device-count check: the scheduler only creates its events when this is on, and
++        // without them every crossing to the CPU drains the GPU instead of waiting on one. That
++        // costs nothing on unified memory, so upstream only asks for it when there are several
++        // devices to overlap.
+         bool pipeline_parallel =
+-            model.n_devices() > 1 &&
+             model.n_gpu_layers() > model.hparams.n_layer_all &&
+-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides();
+ 
+         // pipeline parallelism requires support for async compute and events in all devices
+         if (pipeline_parallel) {
+             for (auto & backend : backends) {
+                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+                 if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                     // ignore CPU and ACCEL backends: BLAS is always present on macOS and reports
++                    // no async/events, which disabled pipeline parallelism for every GPU
+                     continue;
+                 }
+                 auto * dev = ggml_backend_get_device(backend.get());
+                 ggml_backend_dev_props props;
+                 ggml_backend_dev_get_props(dev, &props);
+                 if (!props.caps.async || !props.caps.events) {
+                     // device does not support async compute or events
+                     pipeline_parallel = false;
+@@ -674,16 +677,17 @@ void llama_context::sched_reserve() {
+         return;
+     }
+ 
+     sched_need_reserve = false;
+ 
+     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+ 
+     synchronize();
++    shape_cache_disable();
+ 
+     const int64_t t_start_us = ggml_time_us();
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -814,20 +818,82 @@ void llama_context::sched_reserve() {
+                 val(n_nodes_pp, n_nodes_tg).c_str(),
+                 val(n_splits_pp, n_splits_tg).c_str(),
+                 val(n_inputs_pp, n_inputs_tg).c_str(),
+                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
+     }
+ 
+     const int64_t t_end_us = ggml_time_us();
+ 
++    // The second scheduler plans into the buffers just reserved, so the pair costs graph
++    // metadata and no device memory. Only a session that alternates between two shapes gains
++    // from it, so it is asked for: without alternation the swap below never hits.
++    {
++        const char * env = getenv("TOSH_MGPU_SHAPE_CACHE");
++        if (env != nullptr && atoi(env) != 0) {
++            gf_res_alt[0].reset(new llm_graph_result(max_nodes));
++            gf_res_alt[1].reset(new llm_graph_result(max_nodes));
++            gf_res_alt_active = nullptr;
++            sched_alt.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                        max_nodes, cparams.pipeline_parallel, cparams.op_offload));
++            ggml_backend_sched_share_compute_buffers(sched_alt.get(), sched.get());
++            sched_owner = sched.get();
++            shape_slot  = 0;
++            ggml_backend_sched_set_shape_slot(sched.get(), shape_slot);
++            LLAMA_LOG_INFO("%s: shape cache on, two prepared shapes share the compute buffers\n", __func__);
++            if (getenv("TOSH_MGPU_SHAPE_TRACE") != nullptr) {
++                fprintf(stderr, "SHAPE cache on\n");
++            }
++        }
++    }
++
+     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
+             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+ }
+ 
++void llama_context::shape_cache_disable() {
++    if (!sched_alt) {
++        return;
++    }
++    if (sched.get() != sched_owner) {
++        // the borrowed plan is the active one: put the owner back in place first
++        std::swap(gf_res_prev, gf_res_alt);
++        std::swap(gf_res_prev_active, gf_res_alt_active);
++        std::swap(sched, sched_alt);
++    }
++    ggml_backend_sched_set_shape_slot(sched.get(), -1);
++    sched_alt.reset();
++    for (auto & res : gf_res_alt) {
++        res.reset();
++    }
++    gf_res_alt_active = nullptr;
++    sched_owner = nullptr;
++    shape_slot = 0;
++    shape_slots_filled = 0;
++}
++
++void llama_context::shape_cache_invalidate() {
++    if (!sched_alt) {
++        return;
++    }
++    ggml_backend_sched_synchronize(sched.get());
++    for (auto * set : { &gf_res_prev, &gf_res_alt }) {
++        for (auto & res : *set) {
++            if (res) {
++                res->reset();
++            }
++        }
++    }
++    gf_res_prev_active = nullptr;
++    gf_res_alt_active  = nullptr;
++    ggml_backend_sched_reset_shape_slot(sched.get(), 0);
++    ggml_backend_sched_reset_shape_slot(sched.get(), 1);
++    shape_slots_filled = 0;
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+     }
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+@@ -929,16 +995,17 @@ bool llama_context::memory_update(bool optimize) {
+         // reset the previous graph results to make sure that they won't be reused
+         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
+         for (auto & res : gf_res_prev) {
+             if (res) {
+                 res->reset();
+             }
+         }
+         gf_res_prev_active = nullptr;
++        shape_cache_invalidate();
+ 
+         if (!mctx->apply()) {
+             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
+         }
+     }
+ 
+     // if the memory module did any computation, we have to reserve a new worst-case graph
+     {
+@@ -1459,52 +1526,111 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
++    auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    bool shape_reuse = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
++
++    if (!shape_reuse && sched_alt && !graph_reuse_disable) {
++        // the active shape does not fit this batch: try the other prepared one
++        auto & alt = gf_res_alt[n_outputs > 0];
++        if (!alt) {
++            alt.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
++        }
++        const bool hit = shape_slots_filled == 2 && gf_res_alt_active == alt.get() &&
++            alt->can_reuse(graph_params(alt.get(), ubatch, mctx, gtype));
++
++        // Fill the running slot first. Afterwards the inactive slot is the least recently used:
++        // swap to it both on a hit and when a new shape has to evict an old one.
++        if (shape_slots_filled > 0) {
++
++            // the shapes share their compute memory: nothing of the outgoing one may still be running
++            ggml_backend_sched_synchronize(sched.get());
++
++            std::swap(gf_res_prev, gf_res_alt);
++            std::swap(gf_res_prev_active, gf_res_alt_active);
++            std::swap(sched, sched_alt);
++            shape_slot ^= 1;
++            ggml_backend_sched_set_shape_slot(sched.get(), shape_slot);
++
++            res         = get_gf_res_prev();
++            gf          = res->get_gf();
++            gparams     = graph_params(res, ubatch, mctx, gtype);
++            shape_reuse = hit;
++        }
++
++        static const bool shape_trace = getenv("TOSH_MGPU_SHAPE_TRACE") != nullptr;
++        if (shape_trace) {
++            fprintf(stderr, "SHAPE %s slot=%d n_tokens=%u\n", hit ? "hit" : "miss", shape_slot, ubatch.n_tokens);
++        }
++    }
++
++    if (shape_reuse) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+         // that the previous compute is still reading.
+         if (cparams.pipeline_parallel) {
+             ggml_backend_sched_synchronize(sched.get());
+         }
+ 
+         n_reused++;
+     } else {
+         gf_res_prev_active = nullptr;
+         res->reset();
+ 
++        if (sched_alt) {
++            ggml_backend_sched_reset_shape_slot(sched.get(), shape_slot);
++        }
++
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+         gf = model.build_graph(gparams);
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+         if (!gf) {
+             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+             ret = GGML_STATUS_FAILED;
+             return nullptr;
+         }
+ 
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+-            ret = GGML_STATUS_ALLOC_FAILED;
+-            return nullptr;
++            if (sched_alt) {
++                // this shape needs more memory than the shared allocation holds: give up the
++                // second slot and let the owning scheduler grow for it
++                LLAMA_LOG_INFO("%s: shape cache off, this graph does not fit the shared buffers\n", __func__);
++                shape_cache_disable();
++
++                res = get_gf_res_prev();
++                res->reset();
++                ggml_backend_sched_reset(sched.get());
++                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++
++                gparams = graph_params(res, ubatch, mctx, gtype);
++                gf      = model.build_graph(gparams);
++            }
++            if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
++                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
++                ret = GGML_STATUS_ALLOC_FAILED;
++                return nullptr;
++            }
++        }
++        if (sched_alt && shape_slots_filled < 2) {
++            shape_slots_filled++;
+         }
+ 
+         gf_res_prev_active = res;
+     }
+ 
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -2592,16 +2718,17 @@ ggml_cgraph * llama_context::graph_reserve(
+ 
+     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+     for (auto & res : gf_res_prev) {
+         if (res) {
+             res->reset();
+         }
+     }
+     gf_res_prev_active = nullptr;
++    shape_cache_invalidate();
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+     const auto save_n_outputs = this->n_outputs;
+ 
+     this->n_outputs = n_outputs;
+ 
+     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+@@ -2705,16 +2832,17 @@ llm_graph_cb llama_context::graph_get_cb() const {
+         } else {
+             ggml_set_name(cur, name);
+         }
+ 
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
+         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
++
+         if (ubatch.n_tokens < 32 || full_offload) {
+             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+                 const auto & dev_layer = model.dev_layer(il);
+                 for (const auto & backend : backends) {
+                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                         if (ggml_backend_supports_op(backend.get(), cur)) {
+                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                         }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 951d49853..eb57695ab 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -379,16 +379,31 @@ private:
+     std::array<llm_graph_result_ptr, 2> gf_res_prev;
+     llm_graph_result_ptr gf_res_reserve;
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
+ 
+     // the Hadamard transform coverage is checked once, on the first reserved graph
+     bool hadamard_verified = false;
+ 
++    // A second prepared {graph, scheduler} pair, so a session alternating between two shapes
++    // rebuilds neither. It borrows the first one's buffers, and is declared after `sched` so it
++    // is destroyed before them.
++    std::array<llm_graph_result_ptr, 2> gf_res_alt;
++    llm_graph_result *     gf_res_alt_active = nullptr;
++    ggml_backend_sched_ptr sched_alt;
++    ggml_backend_sched_t   sched_owner = nullptr; // the scheduler that owns the compute buffers
++    int                    shape_slot  = 0;
++    int                    shape_slots_filled = 0;
++
++    // Drop the second prepared shape and go back to a single scheduler.
++    void shape_cache_disable();
++    // Both prepared shapes are stale: rebuild them on next use.
++    void shape_cache_invalidate();
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+     // keep copies of the per-sequence memory on the device
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
+     bool has_evaluated_once = false;
+ 

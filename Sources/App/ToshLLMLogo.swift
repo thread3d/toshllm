@@ -15,6 +15,6 @@ struct ToshLLMLogo: View {
             .resizable()
             .scaledToFit()
             .frame(width: size, height: size)
-            .accessibilityLabel("ToshLLM")
+            .accessibilityLabel(AppInfo.name)
     }
 }

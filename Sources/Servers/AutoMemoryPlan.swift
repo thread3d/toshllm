@@ -105,8 +105,7 @@ struct AutoMemoryPlan: Decodable, Equatable {
     }
 
     static func planURL(port: Int) -> URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ToshLLM/plans")
+        let dir = AppSupport.directory.appendingPathComponent("plans")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("plan-\(port).json")
     }

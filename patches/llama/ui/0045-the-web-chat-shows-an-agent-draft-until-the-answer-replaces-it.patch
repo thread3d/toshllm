@@ -1,0 +1,66 @@
+diff --git a/tools/ui/src/lib/services/chat.service.ts b/tools/ui/src/lib/services/chat.service.ts
+index 569a3e910..8bf7c2944 100644
+--- a/tools/ui/src/lib/services/chat.service.ts
++++ b/tools/ui/src/lib/services/chat.service.ts
+@@ -477,10 +477,12 @@ export class ChatService {
+ 
+ 		onConnectionState?.(StreamConnectionState.STREAMING);
+ 
+ 		let decoder = new TextDecoder();
+ 		let aggregatedContent = '';
++		// text of an agent pass that may still end in tool calls: shown, never kept as the answer
++		let drafted = false;
+ 		let fullReasoningContent = '';
+ 		let aggregatedToolCalls: ApiChatCompletionToolCall[] = [];
+ 		let lastTimings: ChatMessageTimings | undefined;
+ 		let streamFinished = false;
+ 		let modelEmitted = false;
+@@ -631,13 +633,28 @@ export class ChatService {
+ 							try {
+ 								const parsed: ApiChatCompletionStreamChunk = JSON.parse(data);
+ 
+ 								// the Tosh agent's progress and metadata; a retract drops the text streamed so far
+ 								if (parsed.tosh && typeof parsed.tosh === 'object') {
+-									if (parsed.tosh.event?.type === 'retract') aggregatedContent = '';
++									const event = parsed.tosh.event;
++
++									if (event?.type === 'retract') {
++										aggregatedContent = '';
++										drafted = false;
++									}
+ 
+ 									if (!abortSignal?.aborted) onTosh?.(parsed.tosh);
++
++									if (
++										event?.type === 'draft' &&
++										typeof event.content === 'string' &&
++										event.content
++									) {
++										drafted = true;
++
++										if (!abortSignal?.aborted) onChunk?.(event.content);
++									}
+ 								}
+ 
+ 								const choice = parsed.choices?.[0];
+ 								const content = choice?.delta?.content;
+ 								const reasoningContent = choice?.delta?.reasoning_content;
+@@ -665,10 +682,18 @@ export class ChatService {
+ 									lastTimings = timings;
+ 								}
+ 
+ 								if (content) {
+ 									finalizeOpenToolCallBatch();
++
++									// the answer replaces the draft shown before it
++									if (drafted) {
++										drafted = false;
++
++										if (!abortSignal?.aborted) onTosh?.({ event: { type: 'retract' } });
++									}
++
+ 									aggregatedContent += content;
+ 
+ 									if (!abortSignal?.aborted) {
+ 										onChunk?.(content);
+ 									}

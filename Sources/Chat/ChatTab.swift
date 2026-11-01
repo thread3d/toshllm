@@ -175,7 +175,7 @@ struct ChatMainView: View {
         HStack(spacing: 7) {
             Image(systemName: "bubble.left.and.bubble.right.fill")
                 .foregroundStyle(Color.appAccent)
-            Text("ToshLLM")
+            Text(AppInfo.name)
                 .font(.system(size: 12, weight: .semibold))
             Circle()
                 .fill(serverStateColor)

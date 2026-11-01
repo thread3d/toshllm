@@ -440,8 +440,11 @@ struct StreamingMessageBubble: View {
                         ProgressView().controlSize(.small)
                         // Label the prefill phase so the pre-first-token wait reads
                         // as work, not a hang. Reasoning/answer have their own labels.
-                        if !live.hasReasoning && visibleText.isEmpty {
-                            PrefillStatusLabel(progress: live.prefillProgress)
+                        if let status = live.agentStatus, visibleText.isEmpty {
+                            WorkStatusLabel(text: status, progress: nil, since: live.statusSince)
+                        } else if !live.hasReasoning && visibleText.isEmpty {
+                            WorkStatusLabel(text: loc.t("Procesando el prompt", "Processing the prompt"),
+                                            progress: live.prefillProgress, since: live.startedAt)
                         }
                         if let speed = live.speed {
                             Text(String(format: "%.1f t/s", speed))
@@ -498,46 +501,19 @@ struct StreamingRichText: View {
     }
 }
 
-/// Prefill status. Tracks the server's progress when it reports any, and cycles on
-/// a timer when it does not.
-struct PrefillStatusLabel: View {
+/// What the turn is doing and for how long: the server's own progress when it reports one, never a guess.
+struct WorkStatusLabel: View {
+    let text: String
     let progress: Double?
+    let since: Date
     @EnvironmentObject var loc: Localizer
 
-    // Ordered by the progress at which each takes over.
-    private let phrases: [(String, String)] = [
-        ("Procesando el prompt…", "Processing the prompt…"),
-        ("Leyendo el contexto…",  "Reading the context…"),
-        ("Repasando el historial…", "Going over the history…"),
-        ("Preparando la respuesta…", "Preparing the answer…"),
-        ("Casi listo…", "Almost there…"),
-    ]
-
-    private func phraseIndex(for p: Double) -> Int {
-        switch p {
-        case ..<0.25: return 0
-        case ..<0.50: return 1
-        case ..<0.70: return 2
-        case ..<0.90: return 3
-        default:      return 4
-        }
-    }
-
     var body: some View {
-        Group {
-            if let p = progress {
-                let i = phraseIndex(for: p)
-                Text(loc.t(phrases[i].0, phrases[i].1))
-                    .contentTransition(.opacity)
-                    .animation(.easeInOut(duration: 0.4), value: i)
-            } else {
-                TimelineView(.periodic(from: .now, by: 2.2)) { context in
-                    let i = Int(context.date.timeIntervalSinceReferenceDate / 2.2) % phrases.count
-                    Text(loc.t(phrases[i].0, phrases[i].1))
-                        .contentTransition(.opacity)
-                        .animation(.easeInOut(duration: 0.4), value: i)
-                }
-            }
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let seconds = String(max(0, Int(context.date.timeIntervalSince(since))))
+            Text(progress.map { loc.t("%@ · %@ % · %@ s", "%@ · %@% · %@ s", text, String(Int($0 * 100)), seconds) }
+                 ?? loc.t("%@ · %@ s", "%@ · %@ s", text, seconds))
+                .monospacedDigit()
         }
         .font(.caption)
         .foregroundStyle(.secondary)
